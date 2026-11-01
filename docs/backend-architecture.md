@@ -44,13 +44,13 @@ El frontend y el backend conservarán dependencias separadas. El backend no aña
 
 Cada servicio es dueño de su dominio y de sus colecciones. Ningún servicio puede leer o escribir directamente las colecciones de otro.
 
-| Componente | Datos de los que es propietario | Responsabilidad y límites |
-|---|---|---|
-| **Identity Service** | `User`, `Session`, `PasswordReset` | Registro, autenticación, sesiones, tokens y recuperación de cuentas. No administra vehículos, membresías ni permisos de módulos. |
-| **Vehicle Service** | `Vehicle`, `Membership`, `Invitation`, `AccessGrant` | Vehículos, propietario principal, invitaciones, miembros y permisos de acceso. Es dueño de la autorización por vehículo. |
-| **Device Service** | `Device`, `DeviceCredential`, `DeviceRevocation` | Identidad, registro, vinculación, credenciales, revocación y metadatos de dispositivos ESP32. No ejecuta comandos físicos. |
-| **Automation Service** | `VehicleModule`, `ModuleConfiguration`, `AutomationRule`, `ReportedState` | Módulos, configuraciones, reglas y estados reportados. El sunroof es el primer módulo previsto. |
-| **API Gateway** | Ninguna colección de dominio | Punto de entrada HTTP: enrutamiento, validación inicial, rate limiting, CORS, identificadores de petición y controles comunes. No contiene lógica de dominio ni es dueño de datos. |
+| Componente             | Datos de los que es propietario                                           | Responsabilidad y límites                                                                                                                                                          |
+| ---------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Identity Service**   | `User`, `Session`, `PasswordReset`                                        | Registro, autenticación, sesiones, tokens y recuperación de cuentas. No administra vehículos, membresías ni permisos de módulos.                                                   |
+| **Vehicle Service**    | `Vehicle`, `Membership`, `Invitation`, `AccessGrant`                      | Vehículos, propietario principal, invitaciones, miembros y permisos de acceso. Es dueño de la autorización por vehículo.                                                           |
+| **Device Service**     | `Device`, `DeviceCredential`, `DeviceRevocation`                          | Identidad, registro, vinculación, credenciales, revocación y metadatos de dispositivos ESP32. No ejecuta comandos físicos.                                                         |
+| **Automation Service** | `VehicleModule`, `ModuleConfiguration`, `AutomationRule`, `ReportedState` | Módulos, configuraciones, reglas y estados reportados. El sunroof es el primer módulo previsto.                                                                                    |
+| **API Gateway**        | Ninguna colección de dominio                                              | Punto de entrada HTTP: enrutamiento, validación inicial, rate limiting, CORS, identificadores de petición y controles comunes. No contiene lógica de dominio ni es dueño de datos. |
 
 El propietario principal de cada vehículo es único. Los invitados tienen permisos limitados; no pueden administrar miembros ni transferir la propiedad. Las operaciones administrativas del propietario deben distinguirse de las acciones concretas autorizadas para cada invitado.
 
@@ -60,22 +60,22 @@ Vehicle decide los permisos y es responsable de emitir las autorizaciones BLE of
 
 Los siguientes son conceptos y límites de propiedad, no modelos Mongoose ni esquemas implementados.
 
-| Entidad | Servicio propietario | Relaciones conceptuales |
-|---|---|---|
-| `User` | Identity | Identificador referenciado por propietario, membresías e invitaciones aceptadas. |
-| `Session` | Identity | Pertenece a un usuario; mantiene el hash del refresh token rotatorio y su estado de revocación. |
-| `PasswordReset` | Identity | Pertenece a un usuario; el token de recuperación es de un solo uso y con caducidad. |
-| `Vehicle` | Vehicle | Tiene un `ownerUserId` que referencia a Identity. |
-| `Membership` | Vehicle | Relaciona un `vehicleId` con un `userId`, un rol y permisos. |
-| `Invitation` | Vehicle | Invita a una identidad a un vehículo; tiene expiración y un estado de aceptación/revocación. |
-| `AccessGrant` | Vehicle | Concede permisos concretos para un vehículo, dispositivo o módulo, con vigencia limitada cuando se use para BLE offline. |
-| `Device` | Device | Se vincula a un `vehicleId` cuya asociación autoriza Vehicle; conserva metadatos e identidad criptográfica del ESP32. Vehicle inicia la vinculación mediante una llamada interna y Device no consulta las colecciones de Vehicle. |
-| `DeviceCredential` | Device | Credencial asociada a un dispositivo; su formato y método de protección se definirán en el diseño de protocolo. |
-| `DeviceRevocation` | Device | Marca una identidad o credencial de dispositivo como revocada. |
-| `VehicleModule` | Automation | Declara un módulo para un `vehicleId`, por ejemplo el sunroof. |
-| `ModuleConfiguration` | Automation | Guarda la configuración deseada de un módulo; no equivale al estado físico actual. |
-| `AutomationRule` | Automation | Define una regla asociada al vehículo o módulo y su configuración. |
-| `ReportedState` | Automation | Guarda un estado informado por el dispositivo, con su instante de reporte y procedencia. Puede estar obsoleto. |
+| Entidad               | Servicio propietario | Relaciones conceptuales                                                                                                                                                                                                           |
+| --------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `User`                | Identity             | Identificador referenciado por propietario, membresías e invitaciones aceptadas.                                                                                                                                                  |
+| `Session`             | Identity             | Pertenece a un usuario; mantiene el hash del refresh token rotatorio y su estado de revocación.                                                                                                                                   |
+| `PasswordReset`       | Identity             | Pertenece a un usuario; el token de recuperación es de un solo uso y con caducidad.                                                                                                                                               |
+| `Vehicle`             | Vehicle              | Tiene un `ownerUserId` que referencia a Identity.                                                                                                                                                                                 |
+| `Membership`          | Vehicle              | Relaciona un `vehicleId` con un `userId`, un rol y permisos.                                                                                                                                                                      |
+| `Invitation`          | Vehicle              | Invita a una identidad a un vehículo; tiene expiración y un estado de aceptación/revocación.                                                                                                                                      |
+| `AccessGrant`         | Vehicle              | Concede permisos concretos para un vehículo, dispositivo o módulo, con vigencia limitada cuando se use para BLE offline.                                                                                                          |
+| `Device`              | Device               | Se vincula a un `vehicleId` cuya asociación autoriza Vehicle; conserva metadatos e identidad criptográfica del ESP32. Vehicle inicia la vinculación mediante una llamada interna y Device no consulta las colecciones de Vehicle. |
+| `DeviceCredential`    | Device               | Credencial asociada a un dispositivo; su formato y método de protección se definirán en el diseño de protocolo.                                                                                                                   |
+| `DeviceRevocation`    | Device               | Marca una identidad o credencial de dispositivo como revocada.                                                                                                                                                                    |
+| `VehicleModule`       | Automation           | Declara un módulo para un `vehicleId`, por ejemplo el sunroof.                                                                                                                                                                    |
+| `ModuleConfiguration` | Automation           | Guarda la configuración deseada de un módulo; no equivale al estado físico actual.                                                                                                                                                |
+| `AutomationRule`      | Automation           | Define una regla asociada al vehículo o módulo y su configuración.                                                                                                                                                                |
+| `ReportedState`       | Automation           | Guarda un estado informado por el dispositivo, con su instante de reporte y procedencia. Puede estar obsoleto.                                                                                                                    |
 
 Las referencias entre servicios son identificadores, no relaciones de base de datos. No se replicarán documentos completos ni se importarán modelos Mongoose de otro servicio. El servicio propietario valida sus propios datos y expone la validación necesaria mediante HTTP interno autenticado.
 
@@ -118,14 +118,14 @@ Cuando la escritura del dato y la publicación de un evento deban ser consistent
 
 Se utilizará una instancia MongoDB con cuatro bases lógicas:
 
-| Servicio | Base |
-|---|---|
-| Identity | `identity_db` |
-| Vehicle | `vehicle_db` |
-| Device | `device_db` |
+| Servicio   | Base            |
+| ---------- | --------------- |
+| Identity   | `identity_db`   |
+| Vehicle    | `vehicle_db`    |
+| Device     | `device_db`     |
 | Automation | `automation_db` |
 
-Las cuatro bases lógicas compartirán una única instancia MongoDB en el entorno inicial. Cada servicio será propietario exclusivo de sus colecciones y usará credenciales MongoDB limitadas a su base. Mongoose se utilizará dentro del servicio propietario; no se compartirán conexiones, modelos ni permisos de escritura entre servicios. El entorno local se levantará mediante Docker Compose.
+Las cuatro bases lógicas comparten una única instancia MongoDB en el entorno inicial. La configuración local de Docker Compose está en [`infrastructure/docker/`](../infrastructure/docker/README.md); publica MongoDB solo en localhost, mantiene un volumen persistente y crea credenciales independientes limitadas a cada base. En producción, cada servicio seguirá siendo propietario exclusivo de sus colecciones y usará credenciales limitadas a su base. Mongoose se utilizará dentro del servicio propietario; no se compartirán conexiones, modelos ni permisos de escritura entre servicios.
 
 Este aislamiento es lógico y de credenciales, no de disponibilidad: una caída de la instancia compartida afecta a Identity, Vehicle, Device y Automation. La decisión acordada sigue siendo una instancia con cuatro bases lógicas; separar instancias, si alguna vez se requiere, sería una decisión operativa futura.
 

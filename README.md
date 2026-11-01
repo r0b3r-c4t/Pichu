@@ -6,4 +6,4 @@ Repositorio de PICHU. La aplicación web existente está en [`PICHU/`](./PICHU/)
 
 La arquitectura acordada para el backend —servicios, límites de datos, seguridad, comunicación HTTP interna, permisos BLE offline y despliegue— está documentada en [docs/backend-architecture.md](./docs/backend-architecture.md).
 
-Esta documentación es una especificación, no una implementación: todavía no hay servicios backend, API Gateway, modelos Mongoose ni infraestructura Docker en este repositorio.
+Esta documentación es una especificación para los servicios backend, el API Gateway y los modelos Mongoose, que todavía no están implementados. La configuración de MongoDB para desarrollo local con Docker Compose está en [infrastructure/docker/](./infrastructure/docker/README.md).
