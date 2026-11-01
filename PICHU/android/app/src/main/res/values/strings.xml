@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">PICHU</string>
+    <string name="title_activity_main">PICHU</string>
+    <string name="package_name">com.pichu.vehicle</string>
+    <string name="custom_url_scheme">com.pichu.vehicle</string>
+</resources>
