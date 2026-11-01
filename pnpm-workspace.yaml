@@ -1,0 +1,12 @@
+﻿packages:
+  - 'PICHU'
+  - 'apps/*'
+  - 'services/*'
+  - 'packages/*'
+
+minimumReleaseAgeExclude:
+  - lucide-react@1.66.0
+
+allowBuilds:
+  esbuild: true
+  unrs-resolver: true
