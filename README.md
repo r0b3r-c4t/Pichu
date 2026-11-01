@@ -1,6 +1,6 @@
 # PICHU
 
-Repositorio de PICHU. La aplicación web existente está en [`PICHU/`](./PICHU/); conserva su configuración y documentación independientes.
+Repositorio de PICHU. La aplicación web existente está en [`PICHU/`](./PICHU/) y se conserva temporalmente en esa ubicación, con su configuración y documentación independientes. Su traslado a `apps/web/` será una migración posterior.
 
 ## Arquitectura objetivo
 
