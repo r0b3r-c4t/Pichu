@@ -11,6 +11,16 @@ import {
   type EmailVerificationRepository,
 } from '../src/services/email-verification.service.js';
 import { RegistrationService } from '../src/services/registration.service.js';
+import { SessionServiceError } from '../src/services/session.service.js';
+import { LoginServiceOperationalError } from '../src/services/login.service.js';
+import { SessionModel } from '../src/models/session.model.js';
+import Fastify from 'fastify';
+import { createAuthenticationGuard } from '../src/security/authentication.js';
+import { DEFAULT_REFRESH_TOKEN_TTL_MS } from '../src/services/session.service.js';
+
+function getSetCookieHeader(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? value.join('\n') : (value ?? '');
+}
 
 test('rate limiter rejects a new IP at capacity without evicting an active IP', () => {
   const rateLimit = createIpRateLimiter(2, 60_000, 1);
@@ -86,6 +96,352 @@ function createEmailVerificationService(options: { verified?: boolean } = {}) {
 
   return { service, user, getResendCalls: () => resendCalls };
 }
+
+function createLoginRouteApp(
+  overrides: { login?: (input: unknown, userAgent?: string) => Promise<unknown> } = {},
+) {
+  let loginCalls = 0;
+  const loginService = {
+    login: async (input: unknown, userAgent?: string) => {
+      loginCalls += 1;
+      return (
+        overrides.login?.(input, userAgent) ?? {
+          accessToken: 'access-token',
+          refreshToken: 'a'.repeat(64),
+          sessionId: new Types.ObjectId().toHexString(),
+        }
+      );
+    },
+  };
+  const sessionService = {
+    refreshTokenTtlSeconds: 900,
+    isSessionActive: async () => true,
+    rotateRefreshToken: async () => {
+      throw new Error('not expected');
+    },
+  };
+  const jwtService = {
+    verifyAccessToken: async () => ({
+      userId: new Types.ObjectId().toHexString(),
+      sessionId: new Types.ObjectId().toHexString(),
+      issuedAt: 1,
+      expiresAt: 2,
+    }),
+  };
+  const app = createApp({
+    loginService: loginService as never,
+    sessionService: sessionService as never,
+    jwtService: jwtService as never,
+    cookieOrigin: 'https://app.example.test',
+    cookieSecure: true,
+  });
+  return { app, getLoginCalls: () => loginCalls };
+}
+
+test('cookie login requires the allowed Origin and does not expose refresh token', async (context) => {
+  const { app, getLoginCalls } = createLoginRouteApp();
+  context.after(async () => app.close());
+
+  const allowed = await app.inject({
+    method: 'POST',
+    url: '/auth/login',
+    headers: { origin: 'https://app.example.test' },
+    payload: { email: 'ada@example.com', password: 'correct password' },
+  });
+  assert.equal(allowed.statusCode, 200);
+  assert.deepEqual(allowed.json(), { accessToken: 'access-token' });
+  const loginCookie = getSetCookieHeader(allowed.headers['set-cookie']);
+  assert.match(loginCookie, /HttpOnly/);
+  assert.match(loginCookie, /Max-Age=900/);
+
+  const different = await app.inject({
+    method: 'POST',
+    url: '/auth/login',
+    headers: { origin: 'https://evil.example.test' },
+    payload: { email: 'ada@example.com', password: 'correct password' },
+  });
+  const missing = await app.inject({
+    method: 'POST',
+    url: '/auth/login',
+    payload: { email: 'ada@example.com', password: 'correct password' },
+  });
+  assert.equal(different.statusCode, 403);
+  assert.equal(missing.statusCode, 403);
+  assert.equal(getLoginCalls(), 1);
+});
+
+function createRefreshFailureApp() {
+  const sessionId = new Types.ObjectId();
+  const userId = new Types.ObjectId();
+  const revocations: Array<{ sessionId: Types.ObjectId; reason?: string }> = [];
+  const sessionService = {
+    refreshTokenTtlSeconds: DEFAULT_REFRESH_TOKEN_TTL_MS / 1000,
+    isSessionActive: async () => true,
+    rotateRefreshToken: async () => ({
+      session: { _id: sessionId, userId },
+      refreshToken: 'new-refresh-token',
+    }),
+    revokeSession: async (revokedSessionId: Types.ObjectId, reason?: string) => {
+      revocations.push({ sessionId: revokedSessionId, reason });
+    },
+  };
+  const jwtService = {
+    verifyAccessToken: async () => ({
+      userId: userId.toHexString(),
+      sessionId: sessionId.toHexString(),
+      issuedAt: 1,
+      expiresAt: 2,
+    }),
+    createAccessToken: async () => {
+      throw new Error('sensitive signing failure');
+    },
+  };
+  const app = createApp({
+    loginService: { login: async () => ({}) } as never,
+    sessionService: sessionService as never,
+    jwtService: jwtService as never,
+    cookieOrigin: 'https://app.example.test',
+    cookieSecure: true,
+  });
+
+  return { app, sessionId, revocations };
+}
+
+test('refresh revokes the rotated session and clears cookie if access token creation fails', async (context) => {
+  const { app, sessionId, revocations } = createRefreshFailureApp();
+  context.after(async () => app.close());
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/auth/refresh',
+    headers: {
+      origin: 'https://app.example.test',
+      cookie: 'pichu_refresh_token=old-refresh-token',
+    },
+  });
+
+  assert.equal(response.statusCode, 503);
+  assert.deepEqual(response.json(), { message: 'Request could not be completed' });
+  assert.equal(response.body.includes('sensitive signing failure'), false);
+  const clearedCookie = getSetCookieHeader(response.headers['set-cookie']);
+  assert.match(clearedCookie, /pichu_refresh_token=;/);
+  assert.match(clearedCookie, /Max-Age=0/);
+  assert.equal(revocations.length, 1);
+  assert.equal(revocations[0].sessionId.equals(sessionId), true);
+  assert.equal(revocations[0].reason, 'access-token-issuance-failed');
+});
+
+test('refresh revokes the rotated session after access token failure using body transport', async (context) => {
+  const { app, sessionId, revocations } = createRefreshFailureApp();
+  context.after(async () => app.close());
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/auth/refresh',
+    headers: { 'x-refresh-token-transport': 'body' },
+    payload: { refreshToken: 'a'.repeat(64) },
+  });
+
+  assert.equal(response.statusCode, 503);
+  assert.deepEqual(response.json(), { message: 'Request could not be completed' });
+  assert.equal(response.body.includes('sensitive signing failure'), false);
+  assert.equal(response.headers['set-cookie'], undefined);
+  assert.equal(revocations.length, 1);
+  assert.equal(revocations[0].sessionId.equals(sessionId), true);
+  assert.equal(revocations[0].reason, 'access-token-issuance-failed');
+});
+
+test('native body login is explicit and unknown transport is rejected', async (context) => {
+  const { app, getLoginCalls } = createLoginRouteApp();
+  context.after(async () => app.close());
+
+  const native = await app.inject({
+    method: 'POST',
+    url: '/auth/login',
+    headers: { 'x-refresh-token-transport': 'body' },
+    payload: { email: 'ada@example.com', password: 'correct password' },
+  });
+  assert.equal(native.statusCode, 200);
+  assert.equal(native.json().refreshToken, 'a'.repeat(64));
+
+  const unknown = await app.inject({
+    method: 'POST',
+    url: '/auth/login',
+    headers: { 'x-refresh-token-transport': 'header', origin: 'https://app.example.test' },
+    payload: { email: 'ada@example.com', password: 'correct password' },
+  });
+  assert.equal(unknown.statusCode, 400);
+  assert.equal(getLoginCalls(), 1);
+});
+
+test('login route maps operational login failures to generic 503', async (context) => {
+  const { app } = createLoginRouteApp({
+    login: async () => {
+      throw new LoginServiceOperationalError();
+    },
+  });
+  context.after(async () => app.close());
+  const response = await app.inject({
+    method: 'POST',
+    url: '/auth/login',
+    headers: { 'x-refresh-token-transport': 'body' },
+    payload: { email: 'ada@example.com', password: 'correct password' },
+  });
+  assert.equal(response.statusCode, 503);
+  assert.deepEqual(response.json(), { message: 'Login could not be completed' });
+});
+
+test('authentication guard rejects a JWT whose user does not own its session', async (context) => {
+  const claimedUserId = new Types.ObjectId();
+  const sessionOwnerId = new Types.ObjectId();
+  const sessionId = new Types.ObjectId();
+  let receivedUserId: Types.ObjectId | undefined;
+  let receivedSessionId: Types.ObjectId | undefined;
+  const app = Fastify();
+  const jwtService = {
+    verifyAccessToken: async () => ({
+      userId: claimedUserId.toHexString(),
+      sessionId: sessionId.toHexString(),
+      issuedAt: 1,
+      expiresAt: 2,
+    }),
+  };
+  const sessionService = {
+    isSessionActive: async (receivedId: Types.ObjectId, receivedOwnerId: Types.ObjectId) => {
+      receivedSessionId = receivedId;
+      receivedUserId = receivedOwnerId;
+      return receivedId.equals(sessionId) && receivedOwnerId.equals(sessionOwnerId);
+    },
+  };
+
+  await app.register(async (instance) => {
+    instance.get(
+      '/protected',
+      { preHandler: createAuthenticationGuard(jwtService as never, sessionService as never) },
+      async () => ({ ok: true }),
+    );
+  });
+  context.after(async () => app.close());
+
+  const response = await app.inject({
+    method: 'GET',
+    url: '/protected',
+    headers: { authorization: 'Bearer valid-access-token' },
+  });
+
+  assert.equal(response.statusCode, 401);
+  assert.deepEqual(response.json(), { message: 'Authentication required' });
+  assert.equal(receivedSessionId?.equals(sessionId), true);
+  assert.equal(receivedUserId?.equals(claimedUserId), true);
+});
+
+test('authentication guard distinguishes invalid identity from session storage failure', async (context) => {
+  const app = Fastify();
+  const jwtService = {
+    verifyAccessToken: async () => {
+      throw new Error('invalid');
+    },
+  };
+  const sessionService = { isSessionActive: async () => true };
+  await app.register(async (instance) => {
+    instance.get(
+      '/invalid',
+      { preHandler: createAuthenticationGuard(jwtService as never, sessionService as never) },
+      async () => ({ ok: true }),
+    );
+  });
+  context.after(async () => app.close());
+  assert.equal(
+    (
+      await app.inject({
+        method: 'GET',
+        url: '/invalid',
+        headers: { authorization: 'Bearer token' },
+      })
+    ).statusCode,
+    401,
+  );
+
+  const unavailable = Fastify();
+  const unavailableJwt = {
+    verifyAccessToken: async () => ({
+      userId: new Types.ObjectId().toHexString(),
+      sessionId: new Types.ObjectId().toHexString(),
+      issuedAt: 1,
+      expiresAt: 2,
+    }),
+  };
+  const unavailableSessions = {
+    isSessionActive: async () => {
+      throw new Error('database unavailable');
+    },
+  };
+  await unavailable.register(async (instance) => {
+    instance.get(
+      '/unavailable',
+      {
+        preHandler: createAuthenticationGuard(
+          unavailableJwt as never,
+          unavailableSessions as never,
+        ),
+      },
+      async () => ({ ok: true }),
+    );
+  });
+  context.after(async () => unavailable.close());
+  assert.equal(
+    (
+      await unavailable.inject({
+        method: 'GET',
+        url: '/unavailable',
+        headers: { authorization: 'Bearer token' },
+      })
+    ).statusCode,
+    503,
+  );
+});
+
+test('session routes return generic 503 responses for persistence failures', async (context) => {
+  const userId = new Types.ObjectId();
+  const sessionId = new Types.ObjectId();
+  const fail = async () => {
+    throw new SessionServiceError();
+  };
+  const app = createApp({
+    loginService: {
+      login: async () => ({ accessToken: 'a', refreshToken: 'b', sessionId: 'c' }),
+    } as never,
+    sessionService: {
+      isSessionActive: async () => true,
+      revokeSession: fail,
+      revokeAllSessions: fail,
+      listSessions: fail,
+      revokeOwnedSession: fail,
+    } as never,
+    jwtService: {
+      verifyAccessToken: async () => ({
+        userId: userId.toHexString(),
+        sessionId: sessionId.toHexString(),
+        issuedAt: 1,
+        expiresAt: 2,
+      }),
+    } as never,
+    cookieOrigin: 'https://app.example.test',
+  });
+  context.after(async () => app.close());
+  const headers = { authorization: 'Bearer access-token' };
+
+  for (const request of [
+    { method: 'POST' as const, url: '/auth/logout' },
+    { method: 'POST' as const, url: '/auth/logout-all' },
+    { method: 'GET' as const, url: '/sessions' },
+    { method: 'DELETE' as const, url: `/sessions/${sessionId.toHexString()}` },
+  ]) {
+    const response = await app.inject({ ...request, headers });
+    assert.equal(response.statusCode, 503);
+    assert.deepEqual(response.json(), { message: 'Session operation could not be completed' });
+  }
+});
 
 test('register route rejects invalid input without sensitive response fields', async (context) => {
   const service = new RegistrationService({

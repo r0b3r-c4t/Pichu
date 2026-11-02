@@ -12,7 +12,14 @@ const validEnvironment = {
   EMAIL_VERIFICATION_URL: 'http://localhost:3000/verify-email',
   EMAIL_VERIFICATION_TOKEN_TTL_SECONDS: '86400',
   NODE_ENV: 'test',
-  DATABASE_URL: 'mongodb://identity_user:local-password@localhost:27018/identity_db?authSource=identity_db',
+  JWT_SECRET: 'a'.repeat(32),
+  JWT_ISSUER: 'pichu-identity-service',
+  JWT_AUDIENCE: 'pichu-api',
+  ACCESS_TOKEN_TTL_SECONDS: '900',
+  REFRESH_TOKEN_TTL_SECONDS: '2592000',
+  AUTH_COOKIE_ORIGIN: 'http://localhost:3000',
+  DATABASE_URL:
+    'mongodb://identity_user:local-password@localhost:27018/identity_db?authSource=identity_db',
 };
 
 test('parses valid service environment variables', () => {
@@ -20,6 +27,8 @@ test('parses valid service environment variables', () => {
     ...validEnvironment,
     PORT: 3001,
     EMAIL_VERIFICATION_TOKEN_TTL_SECONDS: 86400,
+    ACCESS_TOKEN_TTL_SECONDS: 900,
+    REFRESH_TOKEN_TTL_SECONDS: 2592000,
   });
 });
 
@@ -45,6 +54,7 @@ test('allows HTTPS verification URLs in every environment', () => {
         ...validEnvironment,
         NODE_ENV: nodeEnv,
         EMAIL_VERIFICATION_URL: 'https://accounts.example.test/verify',
+        ...(nodeEnv === 'production' ? { AUTH_COOKIE_ORIGIN: 'https://app.example.test' } : {}),
       }),
     );
   }
@@ -90,6 +100,24 @@ test('rejects unsupported verification URL protocols', () => {
     parseEnvironment({
       ...validEnvironment,
       EMAIL_VERIFICATION_URL: 'ftp://localhost/verify',
+    }),
+  );
+});
+
+test('requires HTTPS for the cookie origin in production', () => {
+  assert.throws(() =>
+    parseEnvironment({
+      ...validEnvironment,
+      NODE_ENV: 'production',
+      EMAIL_VERIFICATION_URL: 'https://accounts.example.test/verify',
+    }),
+  );
+  assert.doesNotThrow(() =>
+    parseEnvironment({
+      ...validEnvironment,
+      NODE_ENV: 'production',
+      EMAIL_VERIFICATION_URL: 'https://accounts.example.test/verify',
+      AUTH_COOKIE_ORIGIN: 'https://app.example.test',
     }),
   );
 });

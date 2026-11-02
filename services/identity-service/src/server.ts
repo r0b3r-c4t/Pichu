@@ -3,6 +3,9 @@ import { loadEnvironment, type Environment } from './config/env.js';
 import { closeDatabase, connectDatabase } from './database/connection.js';
 import { ZodError } from 'zod';
 import { ResendEmailProvider } from './email/resend-email.provider.js';
+import { JwtService } from './security/jwt.js';
+import { LoginService } from './services/login.service.js';
+import { SessionService } from './services/session.service.js';
 
 let environment: Environment;
 try {
@@ -21,10 +24,25 @@ const emailProvider = new ResendEmailProvider({
   fromEmail: environment.RESEND_FROM_EMAIL,
   fromName: environment.RESEND_FROM_NAME,
 });
+const jwtService = new JwtService({
+  secret: environment.JWT_SECRET,
+  issuer: environment.JWT_ISSUER,
+  audience: environment.JWT_AUDIENCE,
+  accessTokenTtlSeconds: environment.ACCESS_TOKEN_TTL_SECONDS,
+});
+const sessionService = new SessionService({
+  refreshTokenTtlMs: environment.REFRESH_TOKEN_TTL_SECONDS * 1000,
+});
+const loginService = new LoginService({ sessionService, jwtService });
 const app = createApp({
   emailProvider,
   verificationUrl: environment.EMAIL_VERIFICATION_URL,
   tokenTtlMs: environment.EMAIL_VERIFICATION_TOKEN_TTL_SECONDS * 1000,
+  loginService,
+  sessionService,
+  jwtService,
+  cookieSecure: environment.NODE_ENV === 'production',
+  cookieOrigin: new URL(environment.AUTH_COOKIE_ORIGIN).origin,
 });
 
 let shutdownPromise: Promise<void> | undefined;
@@ -40,11 +58,15 @@ function safeErrorDetails(error: unknown): { errorType: string; code?: string | 
     'MongoServerError',
     'FastifyError',
   ]);
-  const errorType = error instanceof Error && knownErrorTypes.has(error.name) ? error.name : 'UnknownError';
+  const errorType =
+    error instanceof Error && knownErrorTypes.has(error.name) ? error.name : 'UnknownError';
 
   if (typeof error === 'object' && error !== null && 'code' in error) {
     const code = (error as { code: unknown }).code;
-    if (typeof code === 'number' || (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,31}$/.test(code))) {
+    if (
+      typeof code === 'number' ||
+      (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,31}$/.test(code))
+    ) {
       return { errorType, code };
     }
   }
