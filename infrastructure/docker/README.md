@@ -1,6 +1,6 @@
 # MongoDB local con Docker Compose
 
-Esta configuración levanta una sola instancia de MongoDB Community 8.0.17 para desarrollo local y crea las bases `identity_db`, `vehicle_db`, `device_db` y `automation_db`, con un usuario de aplicación independiente por base.
+Esta configuración levanta una sola instancia de MongoDB Community 8.0.17 para desarrollo local y crea las bases `identity_db`, `vehicle_db`, `device_db` y `automation_db`, con un usuario de aplicación independiente por base. MongoDB funciona como un replica set de un solo nodo (`pichu-rs`) para permitir transacciones multidocumento, requeridas por la verificación consistente del correo en Identity Service. El keyfile se genera automáticamente en el volumen dedicado `mongo_keyfile`, montado en `/run/mongo-keyfile/pichu-keyfile`, fuera del directorio de datos.
 
 Las contraseñas de `.env.example` son marcadores inseguros para desarrollo. Sustitúyelas por valores locales antes de iniciar MongoDB. No uses esas credenciales ni el usuario administrador en aplicaciones o entornos compartidos.
 
@@ -33,9 +33,27 @@ docker compose -f compose.yml ps
 docker compose -f compose.yml logs mongo
 ```
 
-Espera hasta que el servicio muestre `healthy`. El healthcheck ejecuta `mongosh` dentro del contenedor y autentica contra `admin` para hacer `ping` a MongoDB.
+Espera hasta que el servicio muestre `healthy`. El entrypoint oficial crea el usuario administrador y ejecuta los scripts de `/docker-entrypoint-initdb.d` en un `mongod` temporal sin `--replSet`; después, el comando Compose inicia el servidor definitivo, configura `pichu-rs` si aún no existe y espera a que sea `PRIMARY`. El healthcheck también confirma que MongoDB es el primario escribible.
 
 MongoDB se publica únicamente en `127.0.0.1:27018`; no queda expuesto en otras interfaces de red. Los contenedores conectados a la red privada de Compose usan el nombre `mongo` como hostname.
+
+### Actualizar una instalación existente sin perder datos
+
+Al activar el replica set por primera vez, conserva ambos volúmenes y recrea únicamente el contenedor. No ejecutes `down --volumes`:
+
+```powershell
+docker compose -f compose.yml up -d --force-recreate mongo
+docker compose -f compose.yml ps
+```
+
+La inicialización de MongoDB detecta el volumen de datos existente y no vuelve a ejecutar los scripts de `/docker-entrypoint-initdb.d`. El comando de inicio comprueba el estado del replica set y lo inicializa automáticamente solo si aún no está configurado. No es necesario borrar ni inicializar manualmente los datos. Comprueba el primario y el estado del contenedor:
+
+```powershell
+docker compose -f compose.yml exec mongo mongosh --quiet --username pichu_local_admin --authenticationDatabase admin --password --eval "db.hello()"
+docker compose -f compose.yml ps
+```
+
+El healthcheck cambiará a `healthy` cuando el nodo sea primario. El keyfile se conserva en el volumen `mongo_keyfile` y debe permanecer allí para la autenticación interna del replica set. El script de inicialización no migra automáticamente usuarios ni datos de un volumen existente.
 
 ## Conexión con MongoDB Compass
 
@@ -54,14 +72,18 @@ El administrador local puede usarse para tareas de mantenimiento desde Compass c
 
 Dentro de la red Compose, cada servicio debe usar exclusivamente su propio usuario:
 
-| Servicio   | URI local dentro de Docker                                                                              |
-| ---------- | ------------------------------------------------------------------------------------------------------- |
-| Identity   | `mongodb://identity_user:<IDENTITY_DB_PASSWORD>@mongo:27017/identity_db?authSource=identity_db`         |
-| Vehicle    | `mongodb://vehicle_user:<VEHICLE_DB_PASSWORD>@mongo:27017/vehicle_db?authSource=vehicle_db`             |
-| Device     | `mongodb://device_user:<DEVICE_DB_PASSWORD>@mongo:27017/device_db?authSource=device_db`                 |
-| Automation | `mongodb://automation_user:<AUTOMATION_DB_PASSWORD>@mongo:27017/automation_db?authSource=automation_db` |
+| Servicio   | URI local dentro de Docker                                                                                                  |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Identity   | `mongodb://identity_user:<IDENTITY_DB_PASSWORD>@mongo:27017/identity_db?authSource=identity_db&replicaSet=pichu-rs`         |
+| Vehicle    | `mongodb://vehicle_user:<VEHICLE_DB_PASSWORD>@mongo:27017/vehicle_db?authSource=vehicle_db&replicaSet=pichu-rs`             |
+| Device     | `mongodb://device_user:<DEVICE_DB_PASSWORD>@mongo:27017/device_db?authSource=device_db&replicaSet=pichu-rs`                 |
+| Automation | `mongodb://automation_user:<AUTOMATION_DB_PASSWORD>@mongo:27017/automation_db?authSource=automation_db&replicaSet=pichu-rs` |
 
-Estos son ejemplos de conexión para uso futuro; esta infraestructura no configura ni modifica los microservicios. No uses el usuario administrador ni compartas contraseñas entre servicios.
+Estos son ejemplos de conexión para uso futuro; esta infraestructura no configura ni modifica los microservicios. Los clientes que se ejecuten en el host pueden usar `localhost:27018` y `directConnection=true` junto con `authSource`; los clientes dentro de Docker deben usar el hostname anunciado `mongo:27017` y `replicaSet=pichu-rs`. No uses el usuario administrador ni compartas contraseñas entre servicios.
+
+La verificación de correo de Identity Service usa transacciones MongoDB. Los reenvíos para un mismo usuario se coordinan con un lease atómico en su documento de usuario, renovado mientras se envía el correo; la invalidación y liberación del lease se confirman juntas en una transacción. Si el proceso cae, el lease vence y otro reenvío puede continuar; un propietario vencido no puede invalidar tokens después de perder la coordinación. El envío del correo y la invalidación de tokens anteriores no forman una transacción distribuida: si el proveedor acepta el correo y después falla la transacción que invalida los tokens, el correo puede haber sido entregado y los tokens anteriores pueden seguir siendo válidos. El endpoint responde de forma genérica ante ese fallo.
+
+El registro y el reenvío limitan a cinco solicitudes por IP cada 15 minutos usando memoria local. Es una protección de instancia única: para desplegar varias instancias se deberá sustituir por una solución de rate limiting compartida.
 
 ## Detener y conservar datos
 
@@ -71,11 +93,11 @@ Desde `infrastructure\docker`:
 docker compose -f compose.yml down
 ```
 
-Esto detiene y elimina el contenedor y la red, pero conserva el volumen nombrado `mongo_data`.
+Esto detiene y elimina el contenedor y la red, pero conserva los volúmenes nombrados `mongo_data` y `mongo_keyfile`.
 
 ## Eliminar los datos conscientemente
 
-El siguiente comando elimina también el volumen persistente y todos los datos de MongoDB:
+El siguiente comando elimina los volúmenes persistentes `mongo_data` (bases de datos) y `mongo_keyfile` (autenticación interna), además de todos los datos de MongoDB:
 
 ```powershell
 docker compose -f compose.yml down --volumes
@@ -96,7 +118,7 @@ El archivo `mongo/init/01-create-databases.js` se monta en `/docker-entrypoint-i
 
 El script toma las contraseñas del entorno del contenedor. Cada cuenta recibe solamente el rol `readWrite` de su base; no recibe roles de administración.
 
-Importante: los scripts de `/docker-entrypoint-initdb.d` se ejecutan solamente cuando MongoDB inicializa un directorio de datos vacío. No se repiten en cada arranque. Cambiar `.env` o editar el script no modifica usuarios existentes en un volumen ya inicializado.
+Importante: los scripts de `/docker-entrypoint-initdb.d` se ejecutan solamente cuando MongoDB inicializa un directorio de datos vacío. No se repiten en cada arranque. El entrypoint oficial omite `--replSet` durante su inicialización temporal cuando se configuran credenciales root; por eso el script crea las cuentas de servicio y el comando de inicio configura el replica set después de arrancar el servidor definitivo. La comprobación de volumen inicializado del entrypoint busca marcadores concretos (`WiredTiger`, `journal`, `local.0` y `storage.bson`); el keyfile aislado no es uno de ellos. Aun así, el keyfile se mantiene en un volumen dedicado y externo a `/data/db`. En un volumen ya inicializado no se repiten los scripts; el mismo comando detecta un replica set ya configurado y conserva sus datos. Cambiar `.env` o editar el script no modifica usuarios existentes.
 
 ### Crear usuarios o rotar contraseñas en un volumen existente
 

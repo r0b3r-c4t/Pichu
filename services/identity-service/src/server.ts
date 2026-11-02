@@ -2,6 +2,7 @@ import { createApp } from './app.js';
 import { loadEnvironment, type Environment } from './config/env.js';
 import { closeDatabase, connectDatabase } from './database/connection.js';
 import { ZodError } from 'zod';
+import { ResendEmailProvider } from './email/resend-email.provider.js';
 
 let environment: Environment;
 try {
@@ -15,7 +16,16 @@ try {
   process.exit(1);
 }
 
-const app = createApp();
+const emailProvider = new ResendEmailProvider({
+  apiKey: environment.RESEND_API_KEY,
+  fromEmail: environment.RESEND_FROM_EMAIL,
+  fromName: environment.RESEND_FROM_NAME,
+});
+const app = createApp({
+  emailProvider,
+  verificationUrl: environment.EMAIL_VERIFICATION_URL,
+  tokenTtlMs: environment.EMAIL_VERIFICATION_TOKEN_TTL_SECONDS * 1000,
+});
 
 let shutdownPromise: Promise<void> | undefined;
 let shutdownRequested = false;

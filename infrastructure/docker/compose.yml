@@ -4,6 +4,88 @@ services:
   mongo:
     image: mongo:8.0.17
     restart: unless-stopped
+    command:
+      - bash
+      - -ec
+      - |
+        keyfile=/run/mongo-keyfile/pichu-keyfile
+        if [ ! -s "$$keyfile" ]; then
+          mkdir -p /run/mongo-keyfile
+          umask 077
+          head -c 756 /dev/urandom | base64 | tr -d '\n' > "$$keyfile"
+        fi
+        chown mongodb:mongodb /run/mongo-keyfile "$$keyfile"
+        chmod 700 /run/mongo-keyfile
+        chmod 400 "$$keyfile"
+        /usr/local/bin/docker-entrypoint.sh mongod --replSet pichu-rs --keyFile "$$keyfile" --bind_ip_all &
+        mongod_pid=$$!
+        shutdown() {
+          trap - TERM INT
+          kill -TERM "$$mongod_pid" 2>/dev/null || true
+          wait "$$mongod_pid"
+        }
+        trap shutdown TERM INT
+        replica_set_ready=false
+        for attempt in $$(seq 1 60); do
+          if ! kill -0 "$$mongod_pid" 2>/dev/null; then
+            wait "$$mongod_pid" || true
+            echo "MongoDB failed to start with replica set pichu-rs; refusing to alter an existing replica set configuration" >&2
+            exit 1
+          fi
+          # An uninitialized replica set reports isreplicaset=true but omits setName.
+          hello_output=$$(mongosh --quiet --host 127.0.0.1 --port 27017 \
+            --username "$$MONGO_INITDB_ROOT_USERNAME" \
+            --password "$$MONGO_INITDB_ROOT_PASSWORD" \
+            --authenticationDatabase admin \
+            --eval 'const hello = db.hello(); if (hello.setName === "pichu-rs") print("EXPECTED_REPLICA_SET"); else if (hello.setName) print("MISMATCH_REPLICA_SET"); else if (hello.isreplicaset) print("UNINITIALIZED_REPLICA_SET");' 2>/dev/null || true)
+          if [ "$$hello_output" = "EXPECTED_REPLICA_SET" ]; then
+            replica_set_ready=true
+            break
+          elif [ "$$hello_output" = "UNINITIALIZED_REPLICA_SET" ]; then
+            replica_set_ready=true
+            break
+          elif [ "$$hello_output" = "MISMATCH_REPLICA_SET" ]; then
+            echo "MongoDB replica set name does not match pichu-rs" >&2
+            exit 1
+          fi
+          sleep 1
+        done
+        if [ "$$replica_set_ready" != true ]; then
+          echo "MongoDB did not start with replica set pichu-rs within the timeout" >&2
+          exit 1
+        fi
+        mongosh --quiet --host 127.0.0.1 --port 27017 \
+          --username "$$MONGO_INITDB_ROOT_USERNAME" \
+          --password "$$MONGO_INITDB_ROOT_PASSWORD" \
+          --authenticationDatabase admin \
+          --eval 'try { rs.status(); } catch (error) { if (error.codeName !== "NotYetInitialized") throw error; rs.initiate({ _id: "pichu-rs", members: [{ _id: 0, host: "mongo:27017" }] }); }'
+        primary=false
+        for attempt in $$(seq 1 60); do
+          if ! kill -0 "$$mongod_pid" 2>/dev/null; then
+            wait "$$mongod_pid" || true
+            echo "MongoDB replica set process stopped before becoming primary" >&2
+            exit 1
+          fi
+          if mongosh --quiet --host 127.0.0.1 --port 27017 \
+            --username "$$MONGO_INITDB_ROOT_USERNAME" \
+            --password "$$MONGO_INITDB_ROOT_PASSWORD" \
+            --authenticationDatabase admin \
+            --eval "const hello = db.hello(); quit(hello.setName === 'pichu-rs' && hello.isWritablePrimary ? 0 : 1)" >/dev/null 2>&1; then
+            primary=true
+            break
+          fi
+          sleep 1
+        done
+        if [ "$$primary" != true ]; then
+          echo "MongoDB replica set pichu-rs did not become primary" >&2
+          exit 1
+        fi
+        if ! kill -0 "$$mongod_pid" 2>/dev/null; then
+          wait "$$mongod_pid" || true
+          echo "MongoDB replica set process stopped unexpectedly" >&2
+          exit 1
+        fi
+        wait "$$mongod_pid"
     env_file:
       - .env
     environment:
@@ -12,6 +94,7 @@ services:
       - '127.0.0.1:27018:27017'
     volumes:
       - mongo_data:/data/db
+      - mongo_keyfile:/run/mongo-keyfile
       - ./mongo/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test:
@@ -21,7 +104,7 @@ services:
           --username "$$MONGO_INITDB_ROOT_USERNAME"
           --password "$$MONGO_INITDB_ROOT_PASSWORD"
           --authenticationDatabase admin
-          --eval "quit(db.adminCommand('ping').ok ? 0 : 1)"
+          --eval "const hello = db.hello(); quit(hello.setName === 'pichu-rs' && hello.isWritablePrimary ? 0 : 1)"
       interval: 10s
       timeout: 5s
       retries: 5
@@ -31,6 +114,7 @@ services:
 
 volumes:
   mongo_data:
+  mongo_keyfile:
 
 networks:
   pichu_backend:
