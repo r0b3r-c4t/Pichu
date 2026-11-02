@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify';
+import cookie from '@fastify/cookie';
 import { healthRoutes } from './routes/health.js';
 import { createAuthRoutes } from './routes/auth.js';
 import type { EmailProvider } from './email/email-provider.js';
@@ -10,6 +11,9 @@ import {
   createMongooseRegistrationRepository,
   RegistrationService,
 } from './services/registration.service.js';
+import { LoginService } from './services/login.service.js';
+import { SessionService } from './services/session.service.js';
+import { JwtService } from './security/jwt.js';
 
 export interface AppDependencies {
   emailProvider?: EmailProvider;
@@ -17,6 +21,11 @@ export interface AppDependencies {
   tokenTtlMs?: number;
   registrationService?: RegistrationService;
   emailVerificationService?: EmailVerificationService;
+  loginService?: LoginService;
+  sessionService?: SessionService;
+  jwtService?: JwtService;
+  cookieSecure?: boolean;
+  cookieOrigin?: string;
 }
 
 export function createApp(dependencies: AppDependencies = {}): FastifyInstance {
@@ -27,7 +36,9 @@ export function createApp(dependencies: AppDependencies = {}): FastifyInstance {
         ? error.statusCode
         : undefined;
     const errorCode =
-      error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : undefined;
+      error instanceof Error && 'code' in error && typeof error.code === 'string'
+        ? error.code
+        : undefined;
     const statusCode =
       statusCodeValue !== undefined && statusCodeValue >= 400 && statusCodeValue < 500
         ? statusCodeValue
@@ -43,6 +54,7 @@ export function createApp(dependencies: AppDependencies = {}): FastifyInstance {
       message: statusCode >= 500 ? 'Internal Server Error' : 'Invalid request',
     });
   });
+  void app.register(cookie);
   void app.register(healthRoutes);
   const registrationService =
     dependencies.registrationService ??
@@ -66,8 +78,18 @@ export function createApp(dependencies: AppDependencies = {}): FastifyInstance {
         })
       : undefined);
 
-  if (registrationService || emailVerificationService) {
-    void app.register(createAuthRoutes({ registrationService, emailVerificationService }));
+  if (registrationService || emailVerificationService || dependencies.loginService) {
+    void app.register(
+      createAuthRoutes({
+        registrationService,
+        emailVerificationService,
+        loginService: dependencies.loginService,
+        sessionService: dependencies.sessionService,
+        jwtService: dependencies.jwtService,
+        cookieSecure: dependencies.cookieSecure,
+        cookieOrigin: dependencies.cookieOrigin,
+      }),
+    );
   }
   return app;
 }

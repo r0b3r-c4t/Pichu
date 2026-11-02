@@ -11,6 +11,14 @@ const environmentSchema = z
     EMAIL_VERIFICATION_URL: z.string().url(),
     EMAIL_VERIFICATION_TOKEN_TTL_SECONDS: z.coerce.number().int().min(60).max(86_400),
     NODE_ENV: z.enum(['development', 'test', 'production']),
+    JWT_SECRET: z.string().refine((value) => Buffer.byteLength(value, 'utf8') >= 32, {
+      message: 'JWT_SECRET must contain at least 32 bytes',
+    }),
+    JWT_ISSUER: z.string().trim().min(1),
+    JWT_AUDIENCE: z.string().trim().min(1),
+    ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().min(60).max(3_600),
+    REFRESH_TOKEN_TTL_SECONDS: z.coerce.number().int().min(300).max(2_592_000),
+    AUTH_COOKIE_ORIGIN: z.string().url(),
     DATABASE_URL: z
       .string()
       .url()
@@ -37,13 +45,31 @@ const environmentSchema = z
     const hostname = verificationUrl.hostname.replace(/^\[|\]$/g, '');
     const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(hostname);
     const isHttps = verificationUrl.protocol === 'https:';
-    const isDevelopmentHttp = verificationUrl.protocol === 'http:' && isLocalhost && environment.NODE_ENV !== 'production';
+    const isDevelopmentHttp =
+      verificationUrl.protocol === 'http:' && isLocalhost && environment.NODE_ENV !== 'production';
 
     if (!isHttps && !isDevelopmentHttp) {
       context.addIssue({
         code: 'custom',
         path: ['EMAIL_VERIFICATION_URL'],
-        message: 'EMAIL_VERIFICATION_URL must use HTTPS, except HTTP localhost URLs outside production',
+        message:
+          'EMAIL_VERIFICATION_URL must use HTTPS, except HTTP localhost URLs outside production',
+      });
+    }
+
+    const cookieOrigin = new URL(environment.AUTH_COOKIE_ORIGIN);
+    if (cookieOrigin.protocol !== 'http:' && cookieOrigin.protocol !== 'https:') {
+      context.addIssue({
+        code: 'custom',
+        path: ['AUTH_COOKIE_ORIGIN'],
+        message: 'AUTH_COOKIE_ORIGIN must use HTTP or HTTPS',
+      });
+    }
+    if (environment.NODE_ENV === 'production' && cookieOrigin.protocol !== 'https:') {
+      context.addIssue({
+        code: 'custom',
+        path: ['AUTH_COOKIE_ORIGIN'],
+        message: 'AUTH_COOKIE_ORIGIN must use HTTPS in production',
       });
     }
   });
