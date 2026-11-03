@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ClientSession, Model, Types } from 'mongoose';
+import type { ClientSession, Connection, Model, Types } from 'mongoose';
 import { RefreshTokenModel, type RefreshToken } from '../models/refresh-token.model.js';
 import { SessionModel, type Session, type SessionDocument } from '../models/session.model.js';
 import { generateOpaqueToken, hashToken } from '../security/crypto.js';
@@ -58,6 +58,13 @@ export class SessionService {
     this.sessionModel = dependencies.sessionModel ?? SessionModel;
     this.refreshTokenModel = dependencies.refreshTokenModel ?? RefreshTokenModel;
     this.refreshTokenTtlMs = dependencies.refreshTokenTtlMs ?? DEFAULT_REFRESH_TOKEN_TTL_MS;
+    this.assertPersistenceConnection(this.sessionModel.db);
+  }
+
+  assertPersistenceConnection(connection: Connection): void {
+    if (this.sessionModel.db !== connection || this.refreshTokenModel.db !== connection) {
+      throw new Error('Session and refresh token models must use the same Mongoose connection');
+    }
   }
 
   get refreshTokenTtlSeconds(): number {
@@ -254,32 +261,48 @@ export class SessionService {
     }
   }
 
-  async revokeAllSessions(userId: Types.ObjectId, reason = 'logout-all'): Promise<void> {
+  async revokeAllSessions(
+    userId: Types.ObjectId,
+    reason = 'logout-all',
+    transaction?: ClientSession,
+  ): Promise<void> {
     try {
+      if (transaction) {
+        await this.revokeAllSessionsInTransaction(userId, reason, transaction);
+        return;
+      }
       await this.withTransaction(async (transaction) => {
-        const now = new Date();
-        const sessions = await this.sessionModel
-          .find({ userId, revokedAt: null })
-          .session(transaction)
-          .select({ _id: 1 })
-          .lean()
-          .exec();
-        const sessionIds = sessions.map((session) => session._id);
-        await this.sessionModel.updateMany(
-          { userId, revokedAt: null },
-          { $set: { revokedAt: now, revokeReason: reason } },
-          { session: transaction },
-        );
-        if (sessionIds.length > 0) {
-          await this.refreshTokenModel.updateMany(
-            { sessionId: { $in: sessionIds }, revokedAt: null },
-            { $set: { revokedAt: now } },
-            { session: transaction },
-          );
-        }
+        await this.revokeAllSessionsInTransaction(userId, reason, transaction);
       });
     } catch {
       throw new SessionServiceError();
+    }
+  }
+
+  private async revokeAllSessionsInTransaction(
+    userId: Types.ObjectId,
+    reason: string,
+    transaction: ClientSession,
+  ): Promise<void> {
+    const now = new Date();
+    const sessions = await this.sessionModel
+      .find({ userId, revokedAt: null })
+      .session(transaction)
+      .select({ _id: 1 })
+      .lean()
+      .exec();
+    const sessionIds = sessions.map((session) => session._id);
+    await this.sessionModel.updateMany(
+      { userId, revokedAt: null },
+      { $set: { revokedAt: now, revokeReason: reason } },
+      { session: transaction },
+    );
+    if (sessionIds.length > 0) {
+      await this.refreshTokenModel.updateMany(
+        { sessionId: { $in: sessionIds }, revokedAt: null },
+        { $set: { revokedAt: now } },
+        { session: transaction },
+      );
     }
   }
 

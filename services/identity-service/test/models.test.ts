@@ -17,6 +17,8 @@ test('User normalizes email and validates required fields', async () => {
   assert.equal(user.name, 'Ada Lovelace');
   assert.equal(user.normalizedEmail, 'ada@example.com');
   assert.equal(user.emailVerifiedAt, null);
+  assert.equal(user.passwordRecoverySequence, 0);
+  assert.equal(user.passwordRecoveryGeneration, null);
   assert.equal(user.toJSON().passwordHash, undefined);
   assert.equal(user.toObject().passwordHash, undefined);
 });
@@ -49,6 +51,12 @@ test('User and EmailToken expose the required indexes', () => {
   assert.ok(tokenIndexes.some(([fields]) => fields.userId === 1 && fields.type === 1));
   assert.ok(
     tokenIndexes.some(
+      ([fields]) =>
+        fields.userId === 1 && fields.type === 1 && fields.status === 1 && fields.generation === 1,
+    ),
+  );
+  assert.ok(
+    tokenIndexes.some(
       ([fields, options]) => fields.expiresAt === 1 && options?.expireAfterSeconds === 0,
     ),
   );
@@ -64,6 +72,27 @@ test('EmailToken validates its type and required fields', async () => {
 
   await token.validate();
   assert.equal(token.usedAt, null);
+  assert.equal(token.status, 'ACTIVE');
+  assert.equal(token.generation, null);
+
+  const pendingResetToken = new EmailTokenModel({
+    userId: new Types.ObjectId(),
+    type: 'PASSWORD_RESET',
+    tokenHash: 'reset-hash',
+    generation: 1,
+    expiresAt: new Date(Date.now() + 60_000),
+  });
+  await pendingResetToken.validate();
+  assert.equal(pendingResetToken.status, 'PENDING');
+
+  const invalidGenerationToken = new EmailTokenModel({
+    userId: new Types.ObjectId(),
+    type: 'PASSWORD_RESET',
+    tokenHash: 'reset-hash-2',
+    generation: 0,
+    expiresAt: new Date(Date.now() + 60_000),
+  });
+  await assert.rejects(invalidGenerationToken.validate());
 
   const invalidToken = new EmailTokenModel({
     userId: new Types.ObjectId(),

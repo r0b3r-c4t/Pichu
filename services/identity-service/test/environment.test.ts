@@ -11,6 +11,8 @@ const validEnvironment = {
   RESEND_FROM_NAME: 'PICHU',
   EMAIL_VERIFICATION_URL: 'http://localhost:3000/verify-email',
   EMAIL_VERIFICATION_TOKEN_TTL_SECONDS: '86400',
+  PASSWORD_RESET_URL: 'http://localhost:3000/reset-password',
+  PASSWORD_RESET_TOKEN_TTL_SECONDS: '3600',
   NODE_ENV: 'test',
   JWT_SECRET: 'a'.repeat(32),
   JWT_ISSUER: 'pichu-identity-service',
@@ -27,6 +29,7 @@ test('parses valid service environment variables', () => {
     ...validEnvironment,
     PORT: 3001,
     EMAIL_VERIFICATION_TOKEN_TTL_SECONDS: 86400,
+    PASSWORD_RESET_TOKEN_TTL_SECONDS: 3600,
     ACCESS_TOKEN_TTL_SECONDS: 900,
     REFRESH_TOKEN_TTL_SECONDS: 2592000,
   });
@@ -54,6 +57,9 @@ test('allows HTTPS verification URLs in every environment', () => {
         ...validEnvironment,
         NODE_ENV: nodeEnv,
         EMAIL_VERIFICATION_URL: 'https://accounts.example.test/verify',
+        ...(nodeEnv === 'production'
+          ? { PASSWORD_RESET_URL: 'https://accounts.example.test/reset-password' }
+          : {}),
         ...(nodeEnv === 'production' ? { AUTH_COOKIE_ORIGIN: 'https://app.example.test' } : {}),
       }),
     );
@@ -117,6 +123,7 @@ test('requires HTTPS for the cookie origin in production', () => {
       ...validEnvironment,
       NODE_ENV: 'production',
       EMAIL_VERIFICATION_URL: 'https://accounts.example.test/verify',
+      PASSWORD_RESET_URL: 'https://accounts.example.test/reset-password',
       AUTH_COOKIE_ORIGIN: 'https://app.example.test',
     }),
   );

@@ -14,6 +14,7 @@ import {
 import { LoginService } from './services/login.service.js';
 import { SessionService } from './services/session.service.js';
 import { JwtService } from './security/jwt.js';
+import { PasswordRecoveryService } from './services/password-recovery.service.js';
 
 export interface AppDependencies {
   emailProvider?: EmailProvider;
@@ -26,6 +27,7 @@ export interface AppDependencies {
   jwtService?: JwtService;
   cookieSecure?: boolean;
   cookieOrigin?: string;
+  passwordRecoveryService?: PasswordRecoveryService;
 }
 
 export function createApp(dependencies: AppDependencies = {}): FastifyInstance {
@@ -78,7 +80,12 @@ export function createApp(dependencies: AppDependencies = {}): FastifyInstance {
         })
       : undefined);
 
-  if (registrationService || emailVerificationService || dependencies.loginService) {
+  if (
+    registrationService ||
+    emailVerificationService ||
+    dependencies.loginService ||
+    dependencies.passwordRecoveryService
+  ) {
     void app.register(
       createAuthRoutes({
         registrationService,
@@ -88,6 +95,7 @@ export function createApp(dependencies: AppDependencies = {}): FastifyInstance {
         jwtService: dependencies.jwtService,
         cookieSecure: dependencies.cookieSecure,
         cookieOrigin: dependencies.cookieOrigin,
+        passwordRecoveryService: dependencies.passwordRecoveryService,
       }),
     );
   }

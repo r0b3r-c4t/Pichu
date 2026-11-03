@@ -4,6 +4,8 @@
 
 Endpoints principales: `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `POST /auth/logout-all`, `GET /sessions` y `DELETE /sessions/:sessionId`.
 
+La recuperación usa `POST /auth/password-reset/request` y `POST /auth/password-reset/confirm`. La solicitud está limitada a cinco intentos por IP cada 15 minutos. Este límite se mantiene en memoria por instancia; no es compartido entre réplicas y una solución distribuida como Redis queda fuera del alcance actual.
+
 El servicio emite access tokens JWT HS256 con una duración de 15 minutos y refresh tokens opacos con una duración inicial de 30 días. En MongoDB solo se almacena el hash SHA-256 del refresh token.
 
 Cada sesión tiene una familia independiente de refresh tokens. La renovación consume el token anterior y crea el siguiente dentro de una transacción MongoDB con reintentos ante conflictos. Un token usado nuevamente revoca la sesión completa en una transacción independiente. Los tokens usados se conservan hasta `expiresAt`; los índices TTL solo realizan limpieza y no participan en la autorización.

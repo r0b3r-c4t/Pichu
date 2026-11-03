@@ -7,6 +7,8 @@ import {
   type RegisterInput,
   loginSchema,
   refreshSchema,
+  passwordRecoveryRequestSchema,
+  passwordRecoveryConfirmSchema,
 } from '../schemas/auth.schema.js';
 import {
   EmailVerificationService,
@@ -26,6 +28,10 @@ import {
 } from '../services/session.service.js';
 import { createAuthenticationGuard } from '../security/authentication.js';
 import { JwtService } from '../security/jwt.js';
+import {
+  PasswordRecoveryService,
+  PasswordRecoveryServiceError,
+} from '../services/password-recovery.service.js';
 
 export interface AuthRoutesDependencies {
   registrationService?: RegistrationService;
@@ -35,6 +41,7 @@ export interface AuthRoutesDependencies {
   jwtService?: JwtService;
   cookieSecure?: boolean;
   cookieOrigin?: string;
+  passwordRecoveryService?: PasswordRecoveryService;
 }
 
 const RESEND_LIMIT = 5;
@@ -45,6 +52,8 @@ const MAX_TRACKED_CLIENTS = 10_000;
 const REFRESH_COOKIE = 'pichu_refresh_token';
 const COOKIE_TRANSPORT = 'cookie';
 const BODY_TRANSPORT = 'body';
+const PASSWORD_RESET_REQUEST_LIMIT = 5;
+const PASSWORD_RESET_REQUEST_WINDOW_MS = 15 * 60 * 1000;
 
 function sessionOperationFailed(reply: FastifyReply) {
   return reply.code(503).send({ message: 'Session operation could not be completed' });
@@ -101,9 +110,65 @@ export const createAuthRoutes =
     jwtService,
     cookieSecure = false,
     cookieOrigin,
+    passwordRecoveryService,
   }: AuthRoutesDependencies): FastifyPluginAsync =>
   async (fastify) => {
     const registerRateLimiter = createIpRateLimiter(REGISTER_LIMIT, REGISTER_WINDOW_MS);
+
+    if (passwordRecoveryService) {
+      const passwordResetRequestRateLimiter = createIpRateLimiter(
+        PASSWORD_RESET_REQUEST_LIMIT,
+        PASSWORD_RESET_REQUEST_WINDOW_MS,
+      );
+
+      fastify.post('/auth/password-reset/request', async (request, reply) => {
+        const retryAfter = passwordResetRequestRateLimiter(request.ip, Date.now());
+        if (retryAfter !== undefined) {
+          reply.header('retry-after', retryAfter);
+          return reply.code(429).send({ message: 'Too many requests' });
+        }
+
+        const parsed = passwordRecoveryRequestSchema.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(400).send({ message: 'Invalid email address' });
+        }
+
+        try {
+          await passwordRecoveryService.requestRecovery(parsed.data.email);
+          return reply.code(202).send({ accepted: true });
+        } catch (error) {
+          if (error instanceof PasswordRecoveryServiceError) {
+            request.log.error({ code: error.code }, 'Password recovery request failed');
+            return reply.code(503).send({ message: 'Request could not be completed' });
+          }
+          throw error;
+        }
+      });
+
+      fastify.post('/auth/password-reset/confirm', async (request, reply) => {
+        const parsed = passwordRecoveryConfirmSchema.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(400).send({ message: 'Invalid or expired password reset token' });
+        }
+
+        try {
+          const reset = await passwordRecoveryService.confirmRecovery(
+            parsed.data.token,
+            parsed.data.password,
+          );
+          if (!reset) {
+            return reply.code(400).send({ message: 'Invalid or expired password reset token' });
+          }
+          return { reset: true };
+        } catch (error) {
+          if (error instanceof PasswordRecoveryServiceError) {
+            request.log.error({ code: error.code }, 'Password recovery confirmation failed');
+            return reply.code(503).send({ message: 'Request could not be completed' });
+          }
+          throw error;
+        }
+      });
+    }
 
     if (loginService && sessionService && jwtService && cookieOrigin) {
       const loginRateLimiter = createIpRateLimiter(REGISTER_LIMIT, REGISTER_WINDOW_MS);

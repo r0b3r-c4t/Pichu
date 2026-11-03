@@ -14,6 +14,15 @@ export const resendVerificationSchema = z.object({
   email: z.string().trim().email().max(320),
 });
 
+export const passwordRecoveryRequestSchema = z.object({
+  email: z.string().trim().email().max(320),
+});
+
+export const passwordRecoveryConfirmSchema = z.object({
+  token: z.string().regex(/^[a-f0-9]{64}$/),
+  password: z.string().min(12).max(256),
+});
+
 export const loginSchema = z.object({
   email: z.string().trim().email().max(320),
   password: z.string().min(1).max(256),
@@ -29,5 +38,7 @@ export const refreshSchema = z.object({
 export type RegisterInput = z.infer<typeof registerSchema>;
 export type VerifyEmailInput = z.infer<typeof verifyEmailSchema>;
 export type ResendVerificationInput = z.infer<typeof resendVerificationSchema>;
+export type PasswordRecoveryRequestInput = z.infer<typeof passwordRecoveryRequestSchema>;
+export type PasswordRecoveryConfirmInput = z.infer<typeof passwordRecoveryConfirmSchema>;
 export type LoginInput = z.infer<typeof loginSchema>;
 export type RefreshInput = z.infer<typeof refreshSchema>;
