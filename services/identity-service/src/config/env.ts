@@ -10,6 +10,8 @@ const environmentSchema = z
     RESEND_FROM_NAME: z.string().trim().min(1),
     EMAIL_VERIFICATION_URL: z.string().url(),
     EMAIL_VERIFICATION_TOKEN_TTL_SECONDS: z.coerce.number().int().min(60).max(86_400),
+    PASSWORD_RESET_URL: z.string().url(),
+    PASSWORD_RESET_TOKEN_TTL_SECONDS: z.coerce.number().int().min(300).max(86_400),
     NODE_ENV: z.enum(['development', 'test', 'production']),
     JWT_SECRET: z.string().refine((value) => Buffer.byteLength(value, 'utf8') >= 32, {
       message: 'JWT_SECRET must contain at least 32 bytes',
@@ -41,20 +43,24 @@ const environmentSchema = z
       }, 'DATABASE_URL must target identity_db using identity_user and authSource=identity_db'),
   })
   .superRefine((environment, context) => {
-    const verificationUrl = new URL(environment.EMAIL_VERIFICATION_URL);
-    const hostname = verificationUrl.hostname.replace(/^\[|\]$/g, '');
-    const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(hostname);
-    const isHttps = verificationUrl.protocol === 'https:';
-    const isDevelopmentHttp =
-      verificationUrl.protocol === 'http:' && isLocalhost && environment.NODE_ENV !== 'production';
+    for (const [field, value] of [
+      ['EMAIL_VERIFICATION_URL', environment.EMAIL_VERIFICATION_URL],
+      ['PASSWORD_RESET_URL', environment.PASSWORD_RESET_URL],
+    ] as const) {
+      const targetUrl = new URL(value);
+      const hostname = targetUrl.hostname.replace(/^\[|\]$/g, '');
+      const isLocalhost = ['localhost', '127.0.0.1', '::1'].includes(hostname);
+      const isHttps = targetUrl.protocol === 'https:';
+      const isDevelopmentHttp =
+        targetUrl.protocol === 'http:' && isLocalhost && environment.NODE_ENV !== 'production';
 
-    if (!isHttps && !isDevelopmentHttp) {
-      context.addIssue({
-        code: 'custom',
-        path: ['EMAIL_VERIFICATION_URL'],
-        message:
-          'EMAIL_VERIFICATION_URL must use HTTPS, except HTTP localhost URLs outside production',
-      });
+      if (!isHttps && !isDevelopmentHttp) {
+        context.addIssue({
+          code: 'custom',
+          path: [field],
+          message: `${field} must use HTTPS, except HTTP localhost URLs outside production`,
+        });
+      }
     }
 
     const cookieOrigin = new URL(environment.AUTH_COOKIE_ORIGIN);

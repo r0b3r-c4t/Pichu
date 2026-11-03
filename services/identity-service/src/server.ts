@@ -6,6 +6,10 @@ import { ResendEmailProvider } from './email/resend-email.provider.js';
 import { JwtService } from './security/jwt.js';
 import { LoginService } from './services/login.service.js';
 import { SessionService } from './services/session.service.js';
+import {
+  createMongoosePasswordRecoveryRepository,
+  PasswordRecoveryService,
+} from './services/password-recovery.service.js';
 
 let environment: Environment;
 try {
@@ -34,6 +38,12 @@ const sessionService = new SessionService({
   refreshTokenTtlMs: environment.REFRESH_TOKEN_TTL_SECONDS * 1000,
 });
 const loginService = new LoginService({ sessionService, jwtService });
+const passwordRecoveryService = new PasswordRecoveryService({
+  repository: createMongoosePasswordRecoveryRepository({ sessionService }),
+  emailProvider,
+  resetUrl: environment.PASSWORD_RESET_URL,
+  tokenTtlMs: environment.PASSWORD_RESET_TOKEN_TTL_SECONDS * 1000,
+});
 const app = createApp({
   emailProvider,
   verificationUrl: environment.EMAIL_VERIFICATION_URL,
@@ -43,6 +53,7 @@ const app = createApp({
   jwtService,
   cookieSecure: environment.NODE_ENV === 'production',
   cookieOrigin: new URL(environment.AUTH_COOKIE_ORIGIN).origin,
+  passwordRecoveryService,
 });
 
 let shutdownPromise: Promise<void> | undefined;

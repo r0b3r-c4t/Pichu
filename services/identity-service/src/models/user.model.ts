@@ -11,6 +11,8 @@ export interface User {
   emailVerifiedAt: Date | null;
   verificationResendLockId?: string | null;
   verificationResendLockExpiresAt?: Date | null;
+  passwordRecoverySequence: number;
+  passwordRecoveryGeneration: number | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -59,6 +61,25 @@ const userSchema = new Schema<User>(
       type: Date,
       default: null,
       select: false,
+    },
+    passwordRecoverySequence: {
+      type: Number,
+      required: true,
+      default: 0,
+      min: 0,
+      validate: {
+        validator: Number.isInteger,
+        message: 'passwordRecoverySequence must be an integer',
+      },
+    },
+    passwordRecoveryGeneration: {
+      type: Number,
+      default: null,
+      min: 1,
+      validate: {
+        validator: (value: number | null): boolean => value === null || Number.isInteger(value),
+        message: 'passwordRecoveryGeneration must be a positive integer or null',
+      },
     },
   },
   { timestamps: true },
