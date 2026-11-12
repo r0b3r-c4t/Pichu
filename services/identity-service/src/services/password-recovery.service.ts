@@ -48,9 +48,12 @@ export interface PasswordRecoveryServiceDependencies {
 
 export class PasswordRecoveryServiceError extends Error {
   readonly code = 'PASSWORD_RECOVERY_FAILED';
+  readonly stage:
+    'user.lookup' | 'token.create' | 'email.send' | 'token.activate' | 'password.reset';
 
-  constructor(message = 'Password recovery could not be completed') {
-    super(message);
+  constructor(stage: PasswordRecoveryServiceError['stage'] = 'password.reset', cause?: unknown) {
+    super('Password recovery could not be completed', { cause });
+    this.stage = stage;
     this.name = 'PasswordRecoveryServiceError';
   }
 }
@@ -67,8 +70,8 @@ export class PasswordRecoveryService {
     let user: PasswordRecoveryUser | null;
     try {
       user = await this.dependencies.repository.findUserByNormalizedEmail(normalizedEmail);
-    } catch {
-      throw new PasswordRecoveryServiceError();
+    } catch (error) {
+      throw new PasswordRecoveryServiceError('user.lookup', error);
     }
 
     if (!user) {
@@ -83,8 +86,8 @@ export class PasswordRecoveryService {
         tokenHash: hashToken(rawToken),
         expiresAt: new Date(Date.now() + this.tokenTtlMs),
       });
-    } catch {
-      throw new PasswordRecoveryServiceError();
+    } catch (error) {
+      throw new PasswordRecoveryServiceError('token.create', error);
     }
 
     const emailContent = createPasswordRecoveryEmail({
@@ -99,7 +102,7 @@ export class PasswordRecoveryService {
         html: emailContent.html,
         text: emailContent.text,
       });
-    } catch {
+    } catch (error) {
       try {
         await this.dependencies.repository.invalidatePendingToken({
           tokenId: token._id,
@@ -108,7 +111,7 @@ export class PasswordRecoveryService {
       } catch {
         // Preserve a generic delivery error and do not expose persistence details.
       }
-      throw new PasswordRecoveryServiceError();
+      throw new PasswordRecoveryServiceError('email.send', error);
     }
 
     try {
@@ -124,8 +127,8 @@ export class PasswordRecoveryService {
           generation: token.generation,
         });
       }
-    } catch {
-      throw new PasswordRecoveryServiceError();
+    } catch (error) {
+      throw new PasswordRecoveryServiceError('token.activate', error);
     }
 
     return { accepted: true };
@@ -135,8 +138,8 @@ export class PasswordRecoveryService {
     let passwordHash: string;
     try {
       passwordHash = await hashPassword(password);
-    } catch {
-      throw new PasswordRecoveryServiceError();
+    } catch (error) {
+      throw new PasswordRecoveryServiceError('password.reset', error);
     }
 
     try {
@@ -145,8 +148,8 @@ export class PasswordRecoveryService {
         passwordHash,
         new Date(),
       );
-    } catch {
-      throw new PasswordRecoveryServiceError();
+    } catch (error) {
+      throw new PasswordRecoveryServiceError('password.reset', error);
     }
   }
 }

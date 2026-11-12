@@ -5,6 +5,8 @@ const MAX_NAME_LENGTH = 120;
 
 export interface User {
   name: string;
+  username: string;
+  normalizedUsername: string;
   email: string;
   normalizedEmail: string;
   passwordHash: string;
@@ -23,6 +25,10 @@ export function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
+export function normalizeUsername(username: string): string {
+  return username.trim().toLowerCase();
+}
+
 const userSchema = new Schema<User>(
   {
     name: {
@@ -31,6 +37,20 @@ const userSchema = new Schema<User>(
       trim: true,
       minlength: MIN_NAME_LENGTH,
       maxlength: MAX_NAME_LENGTH,
+    },
+    username: {
+      type: String,
+      required: true,
+      trim: true,
+      minlength: 3,
+      maxlength: 30,
+      match: /^[A-Za-z0-9_]+$/,
+    },
+    normalizedUsername: {
+      type: String,
+      required: true,
+      trim: true,
+      set: normalizeUsername,
     },
     email: {
       type: String,
@@ -89,9 +109,17 @@ userSchema.pre('validate', function setNormalizedEmail() {
   if (typeof this.email === 'string') {
     this.normalizedEmail = normalizeEmail(this.email);
   }
+  if (typeof this.username === 'string') {
+    this.normalizedUsername = normalizeUsername(this.username);
+  }
 });
 
 userSchema.index({ normalizedEmail: 1 }, { unique: true });
+// Legacy users may lack this field until an approved backfill assigns their usernames.
+userSchema.index(
+  { normalizedUsername: 1 },
+  { unique: true, partialFilterExpression: { normalizedUsername: { $type: 'string' } } },
+);
 
 function removePasswordHash(_document: unknown, value: unknown): unknown {
   delete (value as Record<string, unknown>).passwordHash;

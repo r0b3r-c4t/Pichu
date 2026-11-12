@@ -2,24 +2,19 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   acceptedResponseSchema,
+  authenticatedUserResponseSchema,
   emailVerificationRequestSchema,
   emailVerificationResponseSchema,
   internalUserExistenceParamsSchema,
   internalUserExistenceResponseSchema,
-  loginBodyResponseSchema,
-  loginCookieResponseSchema,
   loginRequestSchema,
   loginResponseSchema,
-  loginTransportHeadersSchema,
   logoutAllRequestSchema,
   logoutAllResponseSchema,
   logoutRequestSchema,
   logoutResponseSchema,
   passwordResetConfirmSchema,
   passwordResetRequestSchema,
-  refreshBodyRequestBodySchema,
-  refreshBodyTransportHeadersSchema,
-  refreshCookieRequestBodySchema,
   refreshRequestSchema,
   registerRequestSchema,
   registerResponseSchema,
@@ -36,19 +31,40 @@ const objectId = '507f1f77bcf86cd799439011';
 const token = 'a'.repeat(64);
 const accessToken = 'signed-access-token';
 
-test('login accepts real credentials and models transport through the header', () => {
+test('authenticated profile exposes verification state without credential fields', () => {
+  const profile = {
+    id: objectId,
+    name: 'Ada',
+    username: 'ada_01',
+    email: 'ada@example.com',
+    emailVerified: false,
+    emailVerifiedAt: null,
+  };
+  assert.equal(authenticatedUserResponseSchema.safeParse(profile).success, true);
+  assert.equal(
+    authenticatedUserResponseSchema.safeParse({
+      ...profile,
+      emailVerified: true,
+      emailVerifiedAt: '2026-11-04T12:00:00.000Z',
+    }).success,
+    true,
+  );
+  assert.equal(
+    authenticatedUserResponseSchema.safeParse({ ...profile, passwordHash: 'secret' }).success,
+    false,
+  );
+  assert.equal(
+    authenticatedUserResponseSchema.safeParse({ ...profile, emailVerifiedAt: 'invalid' }).success,
+    false,
+  );
+});
+
+test('login accepts credentials without a transport selector', () => {
   const request = loginRequestSchema.parse({
     email: '  driver@example.com  ',
     password: 'x',
   });
   assert.equal(request.email, 'driver@example.com');
-  assert.equal(loginTransportHeadersSchema.parse({})['x-refresh-token-transport'], 'cookie');
-  assert.equal(
-    loginTransportHeadersSchema.parse({ 'x-refresh-token-transport': 'body' })[
-      'x-refresh-token-transport'
-    ],
-    'body',
-  );
   assert.equal(
     loginRequestSchema.safeParse({
       email: 'driver@example.com',
@@ -73,55 +89,20 @@ test('login rejects invalid boundaries and unknown properties', () => {
       .success,
     false,
   );
-  assert.equal(loginTransportHeadersSchema.safeParse({ host: 'localhost' }).success, false);
 });
 
-test('login responses distinguish cookie and body transports without invented fields', () => {
-  assert.equal(loginCookieResponseSchema.safeParse({ accessToken }).success, true);
-  assert.equal(
-    loginBodyResponseSchema.safeParse({ accessToken, refreshToken: token, sessionId: objectId })
-      .success,
-    true,
-  );
-  assert.equal(
-    loginResponseSchema.safeParse({ accessToken, refreshToken: token, sessionId: objectId })
-      .success,
-    true,
-  );
+test('login response contains only the access token', () => {
+  assert.equal(loginResponseSchema.safeParse({ accessToken }).success, true);
+  assert.equal(loginResponseSchema.safeParse({ accessToken, refreshToken: token }).success, false);
   assert.equal(loginResponseSchema.safeParse({ accessToken, expiresIn: 900 }).success, false);
-  assert.equal(
-    loginBodyResponseSchema.safeParse({ accessToken, refreshToken: token }).success,
-    false,
-  );
 });
 
-test('refresh enforces the selected transport and rejects mixed combinations', () => {
-  const cookie = refreshRequestSchema.parse({ headers: {} });
-  assert.equal(cookie.headers['x-refresh-token-transport'], 'cookie');
+test('refresh accepts no body and rejects token data in JSON', () => {
+  assert.equal(refreshRequestSchema.safeParse({}).success, true);
+  assert.equal(refreshRequestSchema.safeParse({ body: {} }).success, true);
+  assert.equal(refreshRequestSchema.safeParse({ body: { refreshToken: token } }).success, false);
   assert.equal(
-    refreshRequestSchema.safeParse({
-      headers: { 'x-refresh-token-transport': 'body' },
-      body: { refreshToken: token },
-    }).success,
-    true,
-  );
-  assert.equal(
-    refreshRequestSchema.safeParse({
-      headers: { 'x-refresh-token-transport': 'body' },
-      body: {},
-    }).success,
-    false,
-  );
-  assert.equal(
-    refreshRequestSchema.safeParse({ headers: {}, body: { refreshToken: token } }).success,
-    false,
-  );
-  assert.equal(refreshCookieRequestBodySchema.safeParse(undefined).success, true);
-  assert.equal(refreshCookieRequestBodySchema.safeParse({}).success, true);
-  assert.equal(refreshCookieRequestBodySchema.safeParse({ refreshToken: token }).success, false);
-  assert.equal(refreshBodyRequestBodySchema.safeParse({ refreshToken: token }).success, true);
-  assert.equal(
-    refreshBodyTransportHeadersSchema.safeParse({ 'x-refresh-token-transport': 'cookie' }).success,
+    refreshRequestSchema.safeParse({ headers: { 'x-refresh-token-transport': 'body' } }).success,
     false,
   );
 });
@@ -130,6 +111,16 @@ test('register validates creation policy, boundaries and closed DTOs', () => {
   assert.equal(
     registerRequestSchema.safeParse({
       name: 'A',
+      username: 'ada_01',
+      email: 'driver@example.com',
+      password: 'x'.repeat(8),
+    }).success,
+    true,
+  );
+  assert.equal(
+    registerRequestSchema.safeParse({
+      name: 'Driver',
+      username: 'ada_01',
       email: 'driver@example.com',
       password: 'x'.repeat(12),
     }).success,
@@ -138,6 +129,7 @@ test('register validates creation policy, boundaries and closed DTOs', () => {
   assert.equal(
     registerRequestSchema.safeParse({
       name: 'x'.repeat(120),
+      username: 'ada_01',
       email: 'driver@example.com',
       password: 'x'.repeat(256),
     }).success,
@@ -146,14 +138,25 @@ test('register validates creation policy, boundaries and closed DTOs', () => {
   assert.equal(
     registerRequestSchema.safeParse({
       name: 'Driver',
+      username: 'ada_01',
       email: 'driver@example.com',
-      password: 'x'.repeat(11),
+      password: 'x'.repeat(7),
     }).success,
     false,
   );
   assert.equal(
     registerRequestSchema.safeParse({
       name: 'Driver',
+      username: 'ada_01',
+      email: 'driver@example.com',
+      password: 'x'.repeat(257),
+    }).success,
+    false,
+  );
+  assert.equal(
+    registerRequestSchema.safeParse({
+      name: 'Driver',
+      username: 'ada_01',
       email: 'driver@example.com',
       password: 'x'.repeat(12),
       role: 'admin',
@@ -162,6 +165,21 @@ test('register validates creation policy, boundaries and closed DTOs', () => {
   );
   assert.equal(registerResponseSchema.safeParse({ accepted: true }).success, true);
   assert.equal(registerResponseSchema.safeParse({ accepted: false }).success, false);
+});
+
+test('register requires a valid ASCII username and trims surrounding whitespace', () => {
+  const request = { name: 'Driver', email: 'driver@example.com', password: 'password123' };
+  assert.equal(registerRequestSchema.safeParse(request).success, false);
+  for (const username of ['ab', 'a'.repeat(31), 'a-b', 'école', 'a b']) {
+    assert.equal(registerRequestSchema.safeParse({ ...request, username }).success, false);
+  }
+  for (const username of ['abc', 'A'.repeat(30), 'Ada_01']) {
+    assert.equal(registerRequestSchema.safeParse({ ...request, username }).success, true);
+  }
+  assert.equal(
+    registerRequestSchema.parse({ ...request, username: '  Ada_01  ' }).username,
+    'Ada_01',
+  );
 });
 
 test('session contracts match the serialized active-session response', () => {
@@ -228,10 +246,18 @@ test('logout and session deletion contracts are closed and use revoked responses
   assert.equal(sessionDeletionResponseSchema.safeParse({ revoked: true }).success, true);
 });
 
-test('password recovery keeps the implemented token and password constraints', () => {
+test('password recovery shares new-password policy and validates boundaries', () => {
   assert.equal(passwordResetRequestSchema.safeParse({ email: 'driver@example.com' }).success, true);
   assert.equal(
+    passwordResetConfirmSchema.safeParse({ token, password: 'x'.repeat(8) }).success,
+    true,
+  );
+  assert.equal(
     passwordResetConfirmSchema.safeParse({ token, password: 'x'.repeat(12) }).success,
+    true,
+  );
+  assert.equal(
+    passwordResetConfirmSchema.safeParse({ token, password: 'x'.repeat(256) }).success,
     true,
   );
   assert.equal(
@@ -240,7 +266,11 @@ test('password recovery keeps the implemented token and password constraints', (
     false,
   );
   assert.equal(
-    passwordResetConfirmSchema.safeParse({ token, password: 'x'.repeat(11) }).success,
+    passwordResetConfirmSchema.safeParse({ token, password: 'x'.repeat(7) }).success,
+    false,
+  );
+  assert.equal(
+    passwordResetConfirmSchema.safeParse({ token, password: 'x'.repeat(257) }).success,
     false,
   );
   assert.equal(

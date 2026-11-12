@@ -5,7 +5,6 @@ import {
   errorResponseSchema,
   internalRequestHeadersSchema,
   loginRequestSchema,
-  loginTransportHeadersSchema,
   passwordResetConfirmSchema,
   serviceNameSchema,
   vehicleCreateRequestSchema,
@@ -24,15 +23,12 @@ test('common error responses accept the versioned public shape', () => {
   assert.equal(result.success, true);
 });
 
-test('identity login keeps transport in its HTTP header contract', () => {
+test('identity login uses only credentials in its JSON contract', () => {
   const result = loginRequestSchema.parse({
     email: 'driver@example.com',
     password: 'a-secure-password',
   });
-  const headers = loginTransportHeadersSchema.parse({});
-
   assert.equal(result.email, 'driver@example.com');
-  assert.equal(headers['x-refresh-token-transport'], 'cookie');
 });
 
 test('password reset confirmation rejects malformed opaque tokens', () => {

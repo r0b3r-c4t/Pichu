@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { assertApiError } from './error-assertion.js';
 import test from 'node:test';
 import { createApp } from '../src/app.js';
 
@@ -13,5 +14,5 @@ test('health reports service status and database disconnection', async (context)
 
   const databaseResponse = await app.inject({ method: 'GET', url: '/health/db' });
   assert.equal(databaseResponse.statusCode, 503);
-  assert.deepEqual(databaseResponse.json(), { status: 'error', database: 'disconnected' });
+  assertApiError(databaseResponse, 'SERVICE_UNAVAILABLE', 'Database unavailable');
 });

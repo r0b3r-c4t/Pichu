@@ -81,6 +81,29 @@ test('sanitizes provider errors and does not expose the API key', async () => {
       assert.ok(error instanceof EmailProviderError);
       assert.equal(error.message, 'Email delivery failed');
       assert.equal(error.message.includes(apiKey), false);
+      assert.equal(error.providerCode, undefined);
+      assert.equal(error.cause !== undefined, true);
+      return true;
+    },
+  );
+});
+
+test('preserves a safe provider error code without exposing its message', async () => {
+  const fake = createClient({
+    data: null,
+    error: { name: 'validation_error', message: 'secret details' },
+  });
+  const provider = new ResendEmailProvider(
+    { apiKey: 're_sensitive_test_key', fromEmail: 'no-reply@example.com', fromName: 'PICHU' },
+    fake.client,
+  );
+
+  await assert.rejects(
+    provider.send({ to: 'user@example.com', subject: 'Notice', html: '<p />' }),
+    (error: unknown) => {
+      assert.ok(error instanceof EmailProviderError);
+      assert.equal(error.providerCode, 'VALIDATION_ERROR');
+      assert.equal(error.message.includes('secret details'), false);
       return true;
     },
   );

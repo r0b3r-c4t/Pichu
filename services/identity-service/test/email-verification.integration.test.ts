@@ -17,10 +17,12 @@ let replicaSetConnection: Promise<void> | undefined;
 
 async function connectToReplicaSet(): Promise<void> {
   assert.ok(databaseUrl, 'IDENTITY_TEST_DATABASE_URL is required');
+  assert.equal(decodeURIComponent(new URL(databaseUrl).pathname), '/identity_test_db');
   if (!replicaSetConnection) {
     replicaSetConnection = mongoose
       .connect(databaseUrl, { serverSelectionTimeoutMS: 5000 })
       .then(async () => {
+        assert.equal(mongoose.connection.name, 'identity_test_db');
         const hello = await mongoose.connection.db?.admin().command({ hello: 1 });
         assert.equal(hello?.setName, replicaSetName);
         assert.equal(hello?.isWritablePrimary, true);
@@ -38,6 +40,7 @@ after(async () => mongoose.disconnect());
 async function createVerificationFixture() {
   const user = await UserModel.create({
     name: 'Email Verification Integration Test',
+    username: `u_${new Types.ObjectId().toHexString()}`,
     email: `verification-${new Types.ObjectId().toHexString()}@example.com`,
     passwordHash: 'integration-test-hash',
     emailVerifiedAt: null,
@@ -63,6 +66,7 @@ async function createVerificationFixture() {
 async function createUnverifiedUser(name: string) {
   return UserModel.create({
     name,
+    username: `u_${new Types.ObjectId().toHexString()}`,
     email: `resend-${new Types.ObjectId().toHexString()}@example.com`,
     passwordHash: 'integration-test-hash',
     emailVerifiedAt: null,

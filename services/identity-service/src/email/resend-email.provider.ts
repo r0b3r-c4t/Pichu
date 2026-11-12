@@ -18,6 +18,14 @@ interface ResendResponse {
   error: unknown | null;
 }
 
+function providerCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('name' in error)) return undefined;
+  const name = (error as { name: unknown }).name;
+  if (typeof name !== 'string') return undefined;
+  const normalizedName = name.toUpperCase();
+  return /^[A-Z][A-Z0-9_]{0,31}$/.test(normalizedName) ? normalizedName : undefined;
+}
+
 export interface ResendEmailClient {
   emails: {
     send(payload: CreateEmailOptions): Promise<ResendResponse>;
@@ -56,7 +64,10 @@ export class ResendEmailProvider implements EmailProvider {
     try {
       const response = await this.client.emails.send(payload);
       if (response.error !== null) {
-        throw new EmailProviderError();
+        throw new EmailProviderError('Email delivery failed', {
+          cause: response.error,
+          providerCode: providerCode(response.error),
+        });
       }
 
       const id = response.data?.id;
@@ -70,7 +81,10 @@ export class ResendEmailProvider implements EmailProvider {
         throw error;
       }
 
-      throw new EmailProviderError();
+      throw new EmailProviderError('Email delivery failed', {
+        cause: error,
+        providerCode: providerCode(error),
+      });
     }
   }
 }

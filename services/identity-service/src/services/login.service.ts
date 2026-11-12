@@ -74,7 +74,7 @@ export class LoginService {
     } catch {
       throw new LoginServiceOperationalError();
     }
-    if (!user || !passwordMatches || !user.emailVerifiedAt) {
+    if (!user || !passwordMatches) {
       throw new LoginServiceError();
     }
 

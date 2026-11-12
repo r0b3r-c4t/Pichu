@@ -1,9 +1,11 @@
 import { z } from 'zod';
+import { newPasswordSchema, usernameSchema } from '@pichu/contracts';
 
 export const registerSchema = z.object({
   name: z.string().trim().min(1).max(120),
+  username: usernameSchema,
   email: z.string().trim().email().max(320),
-  password: z.string().min(12).max(256),
+  password: newPasswordSchema,
 });
 
 export const verifyEmailSchema = z.object({
@@ -20,7 +22,7 @@ export const passwordRecoveryRequestSchema = z.object({
 
 export const passwordRecoveryConfirmSchema = z.object({
   token: z.string().regex(/^[a-f0-9]{64}$/),
-  password: z.string().min(12).max(256),
+  password: newPasswordSchema,
 });
 
 export const loginSchema = z.object({
@@ -28,12 +30,7 @@ export const loginSchema = z.object({
   password: z.string().min(1).max(256),
 });
 
-export const refreshSchema = z.object({
-  refreshToken: z
-    .string()
-    .regex(/^[a-f0-9]{64}$/)
-    .optional(),
-});
+export const refreshSchema = z.union([z.undefined(), z.strictObject({})]);
 
 export type RegisterInput = z.infer<typeof registerSchema>;
 export type VerifyEmailInput = z.infer<typeof verifyEmailSchema>;

@@ -3,16 +3,13 @@ import { createHash } from 'node:crypto';
 import argon2 from 'argon2';
 import test from 'node:test';
 import { Types } from 'mongoose';
-import {
-  EmailProviderError,
-  type EmailMessage,
-  type EmailProvider,
-} from '../src/email/email-provider.js';
+import { EmailProviderError, type EmailMessage } from '../src/email/email-provider.js';
 import { EmailTokenModel } from '../src/models/email-token.model.js';
 import { UserModel, type UserDocument } from '../src/models/user.model.js';
 import {
   RegistrationService,
   RegistrationServiceError,
+  RegistrationConflictError,
   type RegistrationRepository,
 } from '../src/services/registration.service.js';
 
@@ -24,15 +21,14 @@ interface TestContext {
   createdTokenHashes: string[];
 }
 
-function createContext(
-  send: (message: EmailMessage) => Promise<void> = async () => undefined,
-): TestContext {
+function createContext(): TestContext {
   const sentMessages: EmailMessage[] = [];
   const createdUsers: UserDocument[] = [];
   const deletedTokenIds: Types.ObjectId[] = [];
   const createdTokenHashes: string[] = [];
   const repository: RegistrationRepository = {
     findUserByNormalizedEmail: async () => null,
+    findUserByNormalizedUsername: async () => null,
     createUser: async (input) => {
       const user = new UserModel(input);
       createdUsers.push(user);
@@ -44,14 +40,6 @@ function createContext(
     },
     deleteEmailToken: async (tokenId) => {
       deletedTokenIds.push(tokenId);
-    },
-  };
-
-  const provider: EmailProvider = {
-    send: async (message) => {
-      sentMessages.push(message);
-      await send(message);
-      return { id: 'email_test_id' };
     },
   };
 
@@ -74,6 +62,7 @@ test('registers a user with an Argon2id password hash and hashed verification to
 
   const result = await service.register({
     name: 'Ada Lovelace',
+    username: 'ada_01',
     email: ' ADA@Example.COM ',
     password: 'correct horse battery staple',
   });
@@ -83,6 +72,8 @@ test('registers a user with an Argon2id password hash and hashed verification to
   const user = context.createdUsers[0];
   assert.equal(user.emailVerifiedAt, null);
   assert.equal(user.normalizedEmail, 'ada@example.com');
+  assert.equal(user.username, 'ada_01');
+  assert.equal(user.normalizedUsername, 'ada_01');
   assert.equal(user.passwordHash.startsWith('$argon2id$'), true);
   assert.equal(await argon2.verify(user.passwordHash, 'correct horse battery staple'), true);
 
@@ -111,6 +102,7 @@ test('wraps password hashing failures without exposing internal details', async 
   await assert.rejects(
     service.register({
       name: 'Ada',
+      username: 'ada_01',
       email: 'ada@example.com',
       password: null as unknown as string,
     }),
@@ -125,7 +117,7 @@ test('wraps password hashing failures without exposing internal details', async 
   assert.equal(context.sentMessages.length, 0);
 });
 
-test('accepts duplicate email registration without sending another email', async () => {
+test('rejects duplicate email registration without creating a token or sending email', async () => {
   const context = createContext();
   context.repository.findUserByNormalizedEmail = async () =>
     new UserModel({
@@ -140,22 +132,56 @@ test('accepts duplicate email registration without sending another email', async
     verificationUrl: 'http://localhost:3000/verify-email',
   });
 
-  assert.deepEqual(
-    await service.register({
+  await assert.rejects(
+    service.register({
       name: 'Other',
+      username: 'ada_01',
       email: 'USER@example.com',
       password: 'correct horse battery staple',
     }),
-    { accepted: true },
+    (error: unknown) =>
+      error instanceof RegistrationConflictError && error.code === 'USER_ALREADY_EXISTS',
   );
   assert.equal(context.sentMessages.length, 0);
   assert.equal(context.createdUsers.length, 0);
+  assert.equal(context.createdTokenHashes.length, 0);
+});
+
+test('rejects a case-insensitive duplicate username before creating credentials', async () => {
+  const context = createContext();
+  let lookup = '';
+  context.repository.findUserByNormalizedUsername = async (normalizedUsername) => {
+    lookup = normalizedUsername;
+    return new UserModel({
+      name: 'Existing',
+      username: 'Ada_01',
+      email: 'existing@example.com',
+      passwordHash: 'hash',
+    });
+  };
+  const service = new RegistrationService({
+    repository: context.repository,
+    emailProvider: { send: async () => ({ id: 'unused' }) },
+    verificationUrl: 'http://localhost:3000/verify-email',
+  });
+  await assert.rejects(
+    service.register({
+      name: 'Another Ada',
+      username: ' ADA_01 ',
+      email: 'another@example.com',
+      password: 'correct horse battery staple',
+    }),
+    (error: unknown) =>
+      error instanceof RegistrationConflictError && error.code === 'USERNAME_ALREADY_EXISTS',
+  );
+  assert.equal(lookup, 'ada_01');
+  assert.equal(context.createdUsers.length, 0);
+  assert.equal(context.createdTokenHashes.length, 0);
+  assert.equal(context.sentMessages.length, 0);
 });
 
 test('keeps the user and removes the token when email delivery fails', async () => {
-  const context = createContext(async () => {
-    throw new EmailProviderError();
-  });
+  const context = createContext();
   const service = new RegistrationService({
     repository: context.repository,
     emailProvider: {
@@ -169,6 +195,7 @@ test('keeps the user and removes the token when email delivery fails', async () 
   await assert.rejects(
     service.register({
       name: 'Ada',
+      username: 'ada_01',
       email: 'ada@example.com',
       password: 'correct horse battery staple',
     }),
@@ -191,6 +218,7 @@ test('wraps failures while checking for an existing user', async () => {
   await assert.rejects(
     service.register({
       name: 'Ada',
+      username: 'ada_01',
       email: 'ada@example.com',
       password: 'correct horse battery staple',
     }),
@@ -212,6 +240,7 @@ test('treats a non-duplicate user creation error as internal', async () => {
   await assert.rejects(
     service.register({
       name: 'Ada',
+      username: 'ada_01',
       email: 'ada@example.com',
       password: 'correct horse battery staple',
     }),
@@ -219,14 +248,17 @@ test('treats a non-duplicate user creation error as internal', async () => {
   );
 });
 
-test('accepts only duplicate errors for the normalizedEmail index', async () => {
+test('maps duplicate email and username index errors to their public conflicts', async () => {
   const duplicateErrors = [
-    { code: 11000, keyPattern: { normalizedEmail: 1 } },
-    { code: 11000, keyValue: { normalizedEmail: 'ada@example.com' } },
-    { code: 11000, index: 'normalizedEmail_1' },
-  ];
+    [{ code: 11000, keyPattern: { normalizedEmail: 1 } }, 'USER_ALREADY_EXISTS'],
+    [{ code: 11000, keyValue: { normalizedEmail: 'ada@example.com' } }, 'USER_ALREADY_EXISTS'],
+    [{ code: 11000, index: 'normalizedEmail_1' }, 'USER_ALREADY_EXISTS'],
+    [{ code: 11000, keyPattern: { normalizedUsername: 1 } }, 'USERNAME_ALREADY_EXISTS'],
+    [{ code: 11000, keyValue: { normalizedUsername: 'ada_01' } }, 'USERNAME_ALREADY_EXISTS'],
+    [{ code: 11000, index: 'normalizedUsername_1' }, 'USERNAME_ALREADY_EXISTS'],
+  ] as const;
 
-  for (const duplicateError of duplicateErrors) {
+  for (const [duplicateError, code] of duplicateErrors) {
     const context = createContext();
     context.repository.createUser = async () => {
       throw duplicateError;
@@ -237,14 +269,17 @@ test('accepts only duplicate errors for the normalizedEmail index', async () => 
       verificationUrl: 'http://localhost:3000/verify-email',
     });
 
-    assert.deepEqual(
-      await service.register({
+    await assert.rejects(
+      service.register({
         name: 'Ada',
+        username: 'ada_01',
         email: 'ada@example.com',
         password: 'correct horse battery staple',
       }),
-      { accepted: true },
+      (error: unknown) => error instanceof RegistrationConflictError && error.code === code,
     );
+    assert.equal(context.createdTokenHashes.length, 0);
+    assert.equal(context.sentMessages.length, 0);
   }
 });
 
@@ -262,6 +297,7 @@ test('treats a duplicate error from another index as internal', async () => {
   await assert.rejects(
     service.register({
       name: 'Ada',
+      username: 'ada_01',
       email: 'ada@example.com',
       password: 'correct horse battery staple',
     }),
@@ -291,20 +327,31 @@ test('handles two concurrent registrations when one loses the unique index race'
     verificationUrl: 'http://localhost:3000/verify-email',
   });
 
-  const results = await Promise.all([
+  const results = await Promise.allSettled([
     service.register({
       name: 'Ada',
+      username: 'ada_01',
       email: 'ada@example.com',
       password: 'correct horse battery staple',
     }),
     service.register({
       name: 'Ada',
+      username: 'ada_01',
       email: 'ADA@example.com',
       password: 'correct horse battery staple',
     }),
   ]);
 
-  assert.deepEqual(results, [{ accepted: true }, { accepted: true }]);
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+  assert.equal(
+    results.filter(
+      (result) =>
+        result.status === 'rejected' &&
+        result.reason instanceof RegistrationConflictError &&
+        result.reason.code === 'USER_ALREADY_EXISTS',
+    ).length,
+    1,
+  );
   assert.equal(sentMessages.length, 1);
 });
 
@@ -322,6 +369,7 @@ test('keeps the user when token creation fails', async () => {
   await assert.rejects(
     service.register({
       name: 'Ada',
+      username: 'ada_01',
       email: 'ada@example.com',
       password: 'correct horse battery staple',
     }),
@@ -349,6 +397,7 @@ test('keeps the user when token cleanup also fails after delivery failure', asyn
   await assert.rejects(
     service.register({
       name: 'Ada',
+      username: 'ada_01',
       email: 'ada@example.com',
       password: 'correct horse battery staple',
     }),

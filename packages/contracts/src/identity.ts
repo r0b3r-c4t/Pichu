@@ -3,9 +3,18 @@ import { objectIdSchema } from './common.js';
 
 export const identityEmailSchema = z.string().trim().email().max(320);
 export const loginPasswordSchema = z.string().min(1).max(256);
-export const newPasswordSchema = z.string().min(12).max(256);
+export const usernameSchema = z
+  .string()
+  .trim()
+  .min(3)
+  .max(30)
+  .regex(/^[A-Za-z0-9_]+$/);
+export const NEW_PASSWORD_LENGTH_MESSAGE = 'Password must contain 8 to 256 characters';
+export const newPasswordSchema = z
+  .string()
+  .min(8, NEW_PASSWORD_LENGTH_MESSAGE)
+  .max(256, NEW_PASSWORD_LENGTH_MESSAGE);
 export const opaqueTokenSchema = z.string().regex(/^[a-f\d]{64}$/, 'Invalid token format');
-export const refreshTokenTransportSchema = z.enum(['cookie', 'body']);
 
 /**
  * Closed request DTOs reject unknown properties. Header schemas validate only
@@ -17,67 +26,32 @@ export const loginRequestSchema = z.strictObject({
 });
 export type LoginRequest = z.infer<typeof loginRequestSchema>;
 
-export const loginTransportHeadersSchema = z.strictObject({
-  'x-refresh-token-transport': refreshTokenTransportSchema.default('cookie'),
-});
-export type LoginTransportHeaders = z.infer<typeof loginTransportHeadersSchema>;
-
-export const loginCookieResponseSchema = z.strictObject({ accessToken: z.string().min(1) });
-export type LoginCookieResponse = z.infer<typeof loginCookieResponseSchema>;
-
-export const loginBodyResponseSchema = z.strictObject({
-  accessToken: z.string().min(1),
-  refreshToken: opaqueTokenSchema,
-  sessionId: objectIdSchema,
-});
-export type LoginBodyResponse = z.infer<typeof loginBodyResponseSchema>;
-
-export const loginResponseSchema = z.union([loginCookieResponseSchema, loginBodyResponseSchema]);
+export const loginResponseSchema = z.strictObject({ accessToken: z.string().min(1) });
 export type LoginResponse = z.infer<typeof loginResponseSchema>;
 
-export const refreshCookieRequestBodySchema = z.union([z.undefined(), z.strictObject({})]);
-export type RefreshCookieRequestBody = z.infer<typeof refreshCookieRequestBodySchema>;
-
-export const refreshBodyRequestBodySchema = z.strictObject({ refreshToken: opaqueTokenSchema });
-export type RefreshBodyRequestBody = z.infer<typeof refreshBodyRequestBodySchema>;
-
-export const refreshCookieTransportHeadersSchema = z.strictObject({
-  'x-refresh-token-transport': z.literal('cookie').default('cookie'),
+/** Public profile for the active session; credential material is never included. */
+export const authenticatedUserResponseSchema = z.strictObject({
+  id: objectIdSchema,
+  name: z.string().min(1).max(120),
+  username: usernameSchema.nullable(),
+  email: identityEmailSchema,
+  emailVerified: z.boolean(),
+  emailVerifiedAt: z.string().datetime().nullable(),
 });
-export type RefreshCookieTransportHeaders = z.infer<typeof refreshCookieTransportHeadersSchema>;
+export type AuthenticatedUserResponse = z.infer<typeof authenticatedUserResponseSchema>;
 
-export const refreshBodyTransportHeadersSchema = z.strictObject({
-  'x-refresh-token-transport': z.literal('body'),
+/** The refresh credential is supplied only by an HttpOnly cookie, outside the JSON DTO. */
+export const refreshRequestSchema = z.strictObject({
+  body: z.union([z.undefined(), z.strictObject({})]).optional(),
 });
-export type RefreshBodyTransportHeaders = z.infer<typeof refreshBodyTransportHeadersSchema>;
-
-/**
- * HTTP-level refresh contract. Keeping headers and body as separate fields
- * makes the transport/body relationship explicit and rejects mixed transport.
- */
-export const refreshRequestSchema = z.union([
-  z.strictObject({
-    headers: refreshCookieTransportHeadersSchema,
-    body: refreshCookieRequestBodySchema.optional(),
-  }),
-  z.strictObject({
-    headers: refreshBodyTransportHeadersSchema,
-    body: refreshBodyRequestBodySchema,
-  }),
-]);
 export type RefreshRequest = z.infer<typeof refreshRequestSchema>;
-
-export const refreshCookieResponseSchema = loginCookieResponseSchema;
-export type RefreshCookieResponse = z.infer<typeof refreshCookieResponseSchema>;
-
-export const refreshBodyResponseSchema = loginBodyResponseSchema;
-export type RefreshBodyResponse = z.infer<typeof refreshBodyResponseSchema>;
 
 export const refreshResponseSchema = loginResponseSchema;
 export type RefreshResponse = z.infer<typeof refreshResponseSchema>;
 
 export const registerRequestSchema = z.strictObject({
   name: z.string().trim().min(1).max(120),
+  username: usernameSchema,
   email: identityEmailSchema,
   password: newPasswordSchema,
 });
