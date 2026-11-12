@@ -1,13 +1,19 @@
 import { Types } from 'mongoose';
-import { type EmailProvider } from '../email/email-provider.js';
+import { EmailProviderError, type EmailProvider } from '../email/email-provider.js';
 import { createVerificationEmail } from '../email/verification-email.js';
 import { EmailTokenModel, type EmailTokenDocument } from '../models/email-token.model.js';
-import { normalizeEmail, UserModel, type UserDocument } from '../models/user.model.js';
+import {
+  normalizeEmail,
+  normalizeUsername,
+  UserModel,
+  type UserDocument,
+} from '../models/user.model.js';
 import { generateOpaqueToken, hashToken } from '../security/crypto.js';
 import { hashPassword } from '../security/password.js';
 
 export interface RegistrationInput {
   name: string;
+  username: string;
   email: string;
   password: string;
 }
@@ -18,8 +24,11 @@ export interface RegistrationResult {
 
 export interface RegistrationRepository {
   findUserByNormalizedEmail(normalizedEmail: string): Promise<UserDocument | null>;
+  findUserByNormalizedUsername(normalizedUsername: string): Promise<UserDocument | null>;
   createUser(input: {
     name: string;
+    username: string;
+    normalizedUsername: string;
     email: string;
     normalizedEmail: string;
     passwordHash: string;
@@ -44,10 +53,31 @@ export interface RegistrationServiceDependencies {
 
 export class RegistrationServiceError extends Error {
   readonly code = 'REGISTRATION_FAILED';
+  readonly stage: string;
+  readonly providerCode?: string;
+  readonly cleanupFailed: boolean;
 
-  constructor(message = 'Registration could not be completed') {
-    super(message);
+  constructor(
+    message = 'Registration could not be completed',
+    options: {
+      cause?: unknown;
+      stage?: string;
+      providerCode?: string;
+      cleanupFailed?: boolean;
+    } = {},
+  ) {
+    super(message, { cause: options.cause });
+    this.stage = options.stage ?? 'unknown';
+    this.providerCode = options.providerCode;
+    this.cleanupFailed = options.cleanupFailed ?? false;
     this.name = 'RegistrationServiceError';
+  }
+}
+
+export class RegistrationConflictError extends Error {
+  constructor(readonly code: 'USER_ALREADY_EXISTS' | 'USERNAME_ALREADY_EXISTS') {
+    super(code === 'USER_ALREADY_EXISTS' ? 'Email already in use' : 'Username already in use');
+    this.name = 'RegistrationConflictError';
   }
 }
 
@@ -55,30 +85,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
-function isNormalizedEmailDuplicateError(error: unknown): boolean {
+function duplicateField(error: unknown): 'normalizedEmail' | 'normalizedUsername' | undefined {
   if (!isRecord(error) || error.code !== 11000) {
-    return false;
+    return undefined;
   }
-
-  const keyPattern = error.keyPattern;
-  if (
-    isRecord(keyPattern) &&
-    Object.keys(keyPattern).length === 1 &&
-    Object.prototype.hasOwnProperty.call(keyPattern, 'normalizedEmail')
-  ) {
-    return true;
+  for (const field of ['normalizedEmail', 'normalizedUsername'] as const) {
+    for (const key of ['keyPattern', 'keyValue'] as const) {
+      const value = error[key];
+      if (
+        isRecord(value) &&
+        Object.keys(value).length === 1 &&
+        Object.prototype.hasOwnProperty.call(value, field)
+      )
+        return field;
+    }
+    if (error.index === `${field}_1`) return field;
   }
-
-  const keyValue = error.keyValue;
-  if (
-    isRecord(keyValue) &&
-    Object.keys(keyValue).length === 1 &&
-    Object.prototype.hasOwnProperty.call(keyValue, 'normalizedEmail')
-  ) {
-    return true;
-  }
-
-  return error.index === 'normalizedEmail_1';
+  return undefined;
 }
 
 export class RegistrationService {
@@ -90,36 +113,62 @@ export class RegistrationService {
 
   async register(input: RegistrationInput): Promise<RegistrationResult> {
     const normalizedEmail = normalizeEmail(input.email);
+    const normalizedUsername = normalizeUsername(input.username);
     let existingUser: UserDocument | null;
     try {
       existingUser = await this.dependencies.repository.findUserByNormalizedEmail(normalizedEmail);
-    } catch {
-      throw new RegistrationServiceError();
+    } catch (error) {
+      throw new RegistrationServiceError('Registration could not be completed', {
+        cause: error,
+        stage: 'user.lookup',
+      });
     }
     if (existingUser) {
-      return { accepted: true };
+      throw new RegistrationConflictError('USER_ALREADY_EXISTS');
+    }
+    try {
+      existingUser =
+        await this.dependencies.repository.findUserByNormalizedUsername(normalizedUsername);
+    } catch (error) {
+      throw new RegistrationServiceError('Registration could not be completed', {
+        cause: error,
+        stage: 'username.lookup',
+      });
+    }
+    if (existingUser) {
+      throw new RegistrationConflictError('USERNAME_ALREADY_EXISTS');
     }
 
     let passwordHash: string;
     try {
       passwordHash = await hashPassword(input.password);
-    } catch {
-      throw new RegistrationServiceError();
+    } catch (error) {
+      throw new RegistrationServiceError('Registration could not be completed', {
+        cause: error,
+        stage: 'password.hash',
+      });
     }
     let user: UserDocument;
     try {
       user = await this.dependencies.repository.createUser({
         name: input.name.trim(),
+        username: input.username.trim(),
+        normalizedUsername,
         email: input.email.trim(),
         normalizedEmail,
         passwordHash,
         emailVerifiedAt: null,
       });
     } catch (error) {
-      if (isNormalizedEmailDuplicateError(error)) {
-        return { accepted: true };
-      }
-      throw new RegistrationServiceError();
+      const duplicate = duplicateField(error);
+      if (duplicate === 'normalizedEmail')
+        throw new RegistrationConflictError('USER_ALREADY_EXISTS');
+      if (duplicate === 'normalizedUsername')
+        throw new RegistrationConflictError('USERNAME_ALREADY_EXISTS');
+      throw new RegistrationServiceError('Registration could not be completed', {
+        cause: error,
+        stage: 'user.create',
+      });
     }
 
     const rawToken = generateOpaqueToken();
@@ -134,8 +183,11 @@ export class RegistrationService {
         expiresAt,
         usedAt: null,
       });
-    } catch {
-      throw new RegistrationServiceError();
+    } catch (error) {
+      throw new RegistrationServiceError('Registration could not be completed', {
+        cause: error,
+        stage: 'token.create',
+      });
     }
 
     const email = createVerificationEmail({
@@ -151,13 +203,19 @@ export class RegistrationService {
         html: email.html,
         text: email.text,
       });
-    } catch {
+    } catch (error) {
+      let cleanupFailed = false;
       try {
         await this.dependencies.repository.deleteEmailToken(token._id);
       } catch {
-        // Preserve the generic delivery failure and avoid exposing persistence details.
+        cleanupFailed = true;
       }
-      throw new RegistrationServiceError();
+      throw new RegistrationServiceError('Registration could not be completed', {
+        cause: error,
+        stage: 'email.send',
+        providerCode: error instanceof EmailProviderError ? error.providerCode : undefined,
+        cleanupFailed,
+      });
     }
 
     return { accepted: true };
@@ -167,6 +225,8 @@ export class RegistrationService {
 export function createMongooseRegistrationRepository(): RegistrationRepository {
   return {
     findUserByNormalizedEmail: (normalizedEmail) => UserModel.findOne({ normalizedEmail }).exec(),
+    findUserByNormalizedUsername: (normalizedUsername) =>
+      UserModel.findOne({ normalizedUsername }).exec(),
     createUser: (input) => UserModel.create(input),
     createEmailToken: (input) => EmailTokenModel.create(input),
     deleteEmailToken: async (tokenId) => {

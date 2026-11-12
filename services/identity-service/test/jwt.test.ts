@@ -28,7 +28,13 @@ test('JWT service rejects altered, expired, wrong-audience and non-HS256 tokens'
     '507f1f77bcf86cd799439011',
     '507f1f77bcf86cd799439012',
   );
-  await assert.rejects(service.verifyAccessToken(`${token.slice(0, -1)}x`));
+  const [header, payload, encodedSignature] = token.split('.');
+  assert.ok(header && payload && encodedSignature);
+  const signature = Buffer.from(encodedSignature, 'base64url');
+  signature[0] ^= 1;
+  const alteredToken = `${header}.${payload}.${signature.toString('base64url')}`;
+  assert.notEqual(alteredToken, token);
+  await assert.rejects(service.verifyAccessToken(alteredToken));
 
   const wrongAudience = new JwtService({ ...configuration, audience: 'other-service' });
   const wrongAudienceToken = await wrongAudience.createAccessToken(

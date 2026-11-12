@@ -14,7 +14,11 @@ import {
   EmailVerificationService,
   EmailVerificationServiceError,
 } from '../services/email-verification.service.js';
-import { RegistrationService, RegistrationServiceError } from '../services/registration.service.js';
+import {
+  RegistrationConflictError,
+  RegistrationService,
+  RegistrationServiceError,
+} from '../services/registration.service.js';
 import {
   LoginService,
   LoginServiceError,
@@ -32,6 +36,7 @@ import {
   PasswordRecoveryService,
   PasswordRecoveryServiceError,
 } from '../services/password-recovery.service.js';
+import { UserProfileService, UserProfileServiceError } from '../services/user-profile.service.js';
 
 export interface AuthRoutesDependencies {
   registrationService?: RegistrationService;
@@ -42,6 +47,7 @@ export interface AuthRoutesDependencies {
   cookieSecure?: boolean;
   cookieOrigin?: string;
   passwordRecoveryService?: PasswordRecoveryService;
+  userProfileService?: UserProfileService;
 }
 
 const RESEND_LIMIT = 5;
@@ -50,8 +56,6 @@ const REGISTER_LIMIT = 5;
 const REGISTER_WINDOW_MS = 15 * 60 * 1000;
 const MAX_TRACKED_CLIENTS = 10_000;
 const REFRESH_COOKIE = 'pichu_refresh_token';
-const COOKIE_TRANSPORT = 'cookie';
-const BODY_TRANSPORT = 'body';
 const PASSWORD_RESET_REQUEST_LIMIT = 5;
 const PASSWORD_RESET_REQUEST_WINDOW_MS = 15 * 60 * 1000;
 
@@ -111,6 +115,7 @@ export const createAuthRoutes =
     cookieSecure = false,
     cookieOrigin,
     passwordRecoveryService,
+    userProfileService,
   }: AuthRoutesDependencies): FastifyPluginAsync =>
   async (fastify) => {
     const registerRateLimiter = createIpRateLimiter(REGISTER_LIMIT, REGISTER_WINDOW_MS);
@@ -138,7 +143,11 @@ export const createAuthRoutes =
           return reply.code(202).send({ accepted: true });
         } catch (error) {
           if (error instanceof PasswordRecoveryServiceError) {
-            request.log.error({ code: error.code }, 'Password recovery request failed');
+            request.log.error(
+              { code: error.code, stage: error.stage, requestId: request.id },
+              'Password recovery request failed',
+            );
+            if (error.stage === 'email.send') return reply.code(202).send({ accepted: true });
             return reply.code(503).send({ message: 'Request could not be completed' });
           }
           throw error;
@@ -148,7 +157,7 @@ export const createAuthRoutes =
       fastify.post('/auth/password-reset/confirm', async (request, reply) => {
         const parsed = passwordRecoveryConfirmSchema.safeParse(request.body);
         if (!parsed.success) {
-          return reply.code(400).send({ message: 'Invalid or expired password reset token' });
+          return reply.code(400).send({ message: 'Invalid password reset data' });
         }
 
         try {
@@ -174,6 +183,53 @@ export const createAuthRoutes =
       const loginRateLimiter = createIpRateLimiter(REGISTER_LIMIT, REGISTER_WINDOW_MS);
       const refreshRateLimiter = createIpRateLimiter(REGISTER_LIMIT, REGISTER_WINDOW_MS);
       const authenticate = createAuthenticationGuard(jwtService, sessionService);
+      if (userProfileService) {
+        fastify.get('/auth/me', { preHandler: authenticate }, async (request, reply) => {
+          try {
+            const profile = await userProfileService.findById(request.auth!.userId);
+            if (!profile) return reply.code(401).send({ message: 'Authentication required' });
+            return profile;
+          } catch (error) {
+            if (error instanceof UserProfileServiceError)
+              return reply.code(503).send({ message: 'Profile could not be loaded' });
+            throw error;
+          }
+        });
+
+        if (emailVerificationService) {
+          const authenticatedResendRateLimiter = createIpRateLimiter(
+            RESEND_LIMIT,
+            RESEND_WINDOW_MS,
+          );
+          fastify.post(
+            '/auth/verification/resend/me',
+            { preHandler: authenticate },
+            async (request, reply) => {
+              const retryAfter = authenticatedResendRateLimiter(request.ip, Date.now());
+              if (retryAfter !== undefined) {
+                reply.header('retry-after', retryAfter);
+                return reply.code(429).send({ message: 'Too many requests' });
+              }
+              try {
+                const profile = await userProfileService.findById(request.auth!.userId);
+                if (!profile) return reply.code(401).send({ message: 'Authentication required' });
+                if (!profile.emailVerified)
+                  await emailVerificationService.resendVerification(profile.email);
+                return reply.code(202).send({ accepted: true });
+              } catch (error) {
+                if (error instanceof UserProfileServiceError)
+                  return reply.code(503).send({ message: 'Request could not be completed' });
+                if (error instanceof EmailVerificationServiceError) {
+                  request.log.error({ code: error.code, stage: error.stage }, 'Resend failed');
+                  if (error.stage === 'email.send') return reply.code(202).send({ accepted: true });
+                  return reply.code(503).send({ message: 'Request could not be completed' });
+                }
+                throw error;
+              }
+            },
+          );
+        }
+      }
       const cookieOptions = {
         httpOnly: true,
         secure: cookieSecure,
@@ -190,24 +246,15 @@ export const createAuthRoutes =
         }
         const parsed = loginSchema.safeParse(request.body);
         if (!parsed.success) {
-          return reply.code(401).send({ message: 'Invalid credentials' });
+          return reply.code(400).send({ message: 'Invalid login data' });
         }
-        const transportHeader = request.headers['x-refresh-token-transport'];
-        const transport = transportHeader ?? COOKIE_TRANSPORT;
-        if (transport !== COOKIE_TRANSPORT && transport !== BODY_TRANSPORT) {
-          return reply.code(400).send({ message: 'Invalid token transport' });
-        }
-        const useCookie = transport === COOKIE_TRANSPORT;
-        if (useCookie && request.headers.origin !== cookieOrigin) {
+        if (request.headers.origin !== cookieOrigin) {
           return reply.code(403).send({ message: 'Invalid request origin' });
         }
         try {
           const result = await loginService.login(parsed.data, request.headers['user-agent']);
-          if (useCookie) {
-            reply.setCookie(REFRESH_COOKIE, result.refreshToken, cookieOptions);
-            return { accessToken: result.accessToken };
-          }
-          return result;
+          reply.setCookie(REFRESH_COOKIE, result.refreshToken, cookieOptions);
+          return { accessToken: result.accessToken };
         } catch (error) {
           if (error instanceof LoginServiceError) {
             return reply.code(401).send({ message: 'Invalid credentials' });
@@ -225,35 +272,19 @@ export const createAuthRoutes =
           reply.header('retry-after', retryAfter);
           return reply.code(429).send({ message: 'Too many requests' });
         }
-        const parsed = refreshSchema.safeParse(request.body ?? {});
+        const parsed = refreshSchema.safeParse(request.body);
         if (!parsed.success) {
-          return reply.code(401).send({ message: 'Invalid refresh token' });
+          return reply.code(400).send({ message: 'Invalid refresh token format' });
         }
-        const transportHeader = request.headers['x-refresh-token-transport'];
-        const transport = transportHeader ?? COOKIE_TRANSPORT;
-        if (transport !== COOKIE_TRANSPORT && transport !== BODY_TRANSPORT) {
-          return reply.code(400).send({ message: 'Invalid token transport' });
-        }
-        const bodyToken = parsed.data.refreshToken;
         const cookieToken = request.cookies[REFRESH_COOKIE];
-        if (
-          transport === BODY_TRANSPORT &&
-          (bodyToken === undefined || cookieToken !== undefined)
-        ) {
-          return reply.code(400).send({ message: 'Invalid refresh token transport' });
-        }
-        if (
-          transport === COOKIE_TRANSPORT &&
-          (bodyToken !== undefined || cookieToken === undefined)
-        ) {
-          return reply.code(400).send({ message: 'Invalid refresh token transport' });
-        }
-        const usingCookie = transport === COOKIE_TRANSPORT;
-        if (usingCookie && request.headers.origin !== cookieOrigin) {
+        if (request.headers.origin !== cookieOrigin) {
           return reply.code(403).send({ message: 'Invalid request origin' });
         }
+        if (cookieToken === undefined) {
+          return reply.code(401).send({ message: 'Refresh credentials required' });
+        }
         try {
-          const result = await sessionService.rotateRefreshToken(bodyToken ?? cookieToken!);
+          const result = await sessionService.rotateRefreshToken(cookieToken);
           let accessToken: string;
           try {
             accessToken = await jwtService.createAccessToken(
@@ -261,9 +292,7 @@ export const createAuthRoutes =
               result.session._id,
             );
           } catch {
-            if (usingCookie) {
-              reply.clearCookie(REFRESH_COOKIE, cookieOptions);
-            }
+            reply.clearCookie(REFRESH_COOKIE, cookieOptions);
             try {
               await sessionService.revokeSession(
                 result.session._id,
@@ -274,24 +303,15 @@ export const createAuthRoutes =
             }
             return reply.code(503).send({ message: 'Request could not be completed' });
           }
-          if (usingCookie) {
-            const remainingTtlSeconds = Math.max(
-              0,
-              Math.floor((result.session.expiresAt.getTime() - Date.now()) / 1000),
-            );
-
-            reply.setCookie(REFRESH_COOKIE, result.refreshToken, {
-              ...cookieOptions,
-              maxAge: remainingTtlSeconds,
-            });
-
-            return { accessToken };
-          }
-          return {
-            accessToken,
-            refreshToken: result.refreshToken,
-            sessionId: String(result.session._id),
-          };
+          const remainingTtlSeconds = Math.max(
+            0,
+            Math.floor((result.session.expiresAt.getTime() - Date.now()) / 1000),
+          );
+          reply.setCookie(REFRESH_COOKIE, result.refreshToken, {
+            ...cookieOptions,
+            maxAge: remainingTtlSeconds,
+          });
+          return { accessToken };
         } catch (error) {
           if (
             error instanceof RefreshTokenReuseError ||
@@ -308,6 +328,8 @@ export const createAuthRoutes =
       });
 
       fastify.post('/auth/logout', { preHandler: authenticate }, async (request, reply) => {
+        if (request.headers.origin !== cookieOrigin)
+          return reply.code(403).send({ message: 'Invalid request origin' });
         try {
           await sessionService.revokeSession(new Types.ObjectId(request.auth!.sessionId));
           reply.clearCookie(REFRESH_COOKIE, cookieOptions);
@@ -321,6 +343,8 @@ export const createAuthRoutes =
       });
 
       fastify.post('/auth/logout-all', { preHandler: authenticate }, async (request, reply) => {
+        if (request.headers.origin !== cookieOrigin)
+          return reply.code(403).send({ message: 'Invalid request origin' });
         try {
           await sessionService.revokeAllSessions(new Types.ObjectId(request.auth!.userId));
           reply.clearCookie(REFRESH_COOKIE, cookieOptions);
@@ -407,8 +431,22 @@ export const createAuthRoutes =
           try {
             return await registrationService.register(input);
           } catch (error) {
+            if (error instanceof RegistrationConflictError)
+              return reply.code(409).send({ error: error.code, message: error.message });
             if (error instanceof RegistrationServiceError) {
-              request.log.error({ code: error.code }, 'Registration failed');
+              request.log.error(
+                {
+                  code: error.code,
+                  stage: error.stage,
+                  provider: error.stage === 'email.send' ? 'resend' : undefined,
+                  providerCode: error.providerCode,
+                  causeType: error.cause instanceof Error ? error.cause.name : undefined,
+                  cleanupFailed: error.cleanupFailed,
+                  requestId: request.id,
+                },
+                'Registration failed',
+              );
+              if (error.stage === 'email.send') return { accepted: true };
               return reply.code(503).send({ message: 'Registration could not be completed' });
             }
             throw error;
@@ -435,7 +473,17 @@ export const createAuthRoutes =
           return { verified: true };
         } catch (error) {
           if (error instanceof EmailVerificationServiceError) {
-            request.log.error({ code: error.code }, 'Email verification failed');
+            request.log.error(
+              {
+                code: error.code,
+                stage: error.stage,
+                provider: error.stage === 'email.send' ? 'resend' : undefined,
+                providerCode: error.providerCode,
+                causeType: error.cause instanceof Error ? error.cause.name : undefined,
+                requestId: request.id,
+              },
+              'Email verification failed',
+            );
             return reply.code(503).send({ message: 'Request could not be completed' });
           }
           throw error;
@@ -464,7 +512,18 @@ export const createAuthRoutes =
             return reply.code(202).send({ accepted: true });
           } catch (error) {
             if (error instanceof EmailVerificationServiceError) {
-              request.log.error({ code: error.code }, 'Verification email resend failed');
+              request.log.error(
+                {
+                  code: error.code,
+                  stage: error.stage,
+                  provider: error.stage === 'email.send' ? 'resend' : undefined,
+                  providerCode: error.providerCode,
+                  causeType: error.cause instanceof Error ? error.cause.name : undefined,
+                  requestId: request.id,
+                },
+                'Verification email resend failed',
+              );
+              if (error.stage === 'email.send') return reply.code(202).send({ accepted: true });
               return reply.code(503).send({ message: 'Request could not be completed' });
             }
             throw error;

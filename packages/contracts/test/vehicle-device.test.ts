@@ -24,6 +24,8 @@ import {
   membershipRoleSchema,
   vehicleCreateRequestSchema,
   vehicleCreateResponseSchema,
+  vehicleDetailResponseSchema,
+  vehicleDeviceRegistrationResponseSchema,
   vehicleListQuerySchema,
   vehicleListResponseSchema,
   vehicleParamsSchema,
@@ -34,6 +36,45 @@ const vehicleId = '507f1f77bcf86cd799439011';
 const userId = '507f1f77bcf86cd799439012';
 const deviceId = '507f1f77bcf86cd799439013';
 const publicKey = '-----BEGIN PUBLIC KEY-----\n' + 'A'.repeat(80) + '\n-----END PUBLIC KEY-----';
+
+test('enriched vehicle responses retain legacy fields and reject private properties', () => {
+  const data = {
+    id: vehicleId,
+    name: 'Persisted Mazda 3',
+    make: 'Mazda',
+    model: '3',
+    year: 2011,
+    engine: '2.0',
+    ownerUserId: userId,
+  };
+  assert.equal(
+    vehicleCreateResponseSchema.safeParse({
+      vehicleId,
+      message: 'Vehicle created',
+      data,
+      requestId: 'request-42',
+    }).success,
+    true,
+  );
+  assert.equal(
+    vehicleDetailResponseSchema.safeParse({ ...data, requestId: 'request-42' }).success,
+    true,
+  );
+  assert.equal(
+    vehicleCreateResponseSchema.safeParse({ vehicleId, data: { ...data, __v: 1 } }).success,
+    false,
+  );
+  assert.equal(
+    vehicleDeviceRegistrationResponseSchema.safeParse({
+      deviceId,
+      status: 'PENDING',
+      message: 'Device registration accepted',
+      data: { deviceId, vehicleId, status: 'PENDING' },
+      requestId: 'request-42',
+    }).success,
+    true,
+  );
+});
 
 test('vehicle creation and summary use explicit identifiers and closed DTOs', () => {
   assert.equal(

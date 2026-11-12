@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { assertApiError } from './error-assertion.js';
 import test from 'node:test';
 import { createApp } from '../src/app.js';
 import { PasswordRecoveryServiceError } from '../src/services/password-recovery.service.js';
@@ -92,7 +93,7 @@ test('password reset confirmation handles success, invalid tokens and operationa
   assert.equal(success.statusCode, 200);
   assert.deepEqual(success.json(), { reset: true });
   assert.equal(invalid.statusCode, 400);
-  assert.deepEqual(invalid.json(), { message: 'Invalid or expired password reset token' });
+  assertApiError(invalid, 'INVALID_TOKEN', 'Invalid or expired password reset token');
   assert.equal(malformed.statusCode, 400);
 
   await app.close();
@@ -119,4 +120,47 @@ test('password reset confirmation handles success, invalid tokens and operationa
   assert.equal(confirmFailure.statusCode, 503);
   assert.equal(requestFailure.body.includes('internal details'), false);
   assert.equal(confirmFailure.body.includes('internal details'), false);
+});
+
+test('password reset confirmation uses the shared password policy and reports field details', async (context) => {
+  const confirmedPasswords: string[] = [];
+  const app = createRecoveryApp({
+    confirmRecovery: async (_token, password) => {
+      confirmedPasswords.push(password);
+      return true;
+    },
+  });
+  context.after(async () => app.close());
+
+  for (const password of ['x'.repeat(8), 'x'.repeat(12), 'x'.repeat(256)]) {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/password-reset/confirm',
+      payload: { token: 'a'.repeat(64), password },
+    });
+    assert.equal(response.statusCode, 200);
+  }
+
+  for (const [password, expectedMessage] of [
+    ['x'.repeat(7), 'Password must contain 8 to 256 characters'],
+    ['x'.repeat(257), 'Password must contain 8 to 256 characters'],
+  ]) {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/password-reset/confirm',
+      payload: { token: 'a'.repeat(64), password },
+    });
+    assert.equal(response.statusCode, 400);
+    const error = assertApiError(response, 'VALIDATION_ERROR', 'Invalid password reset data');
+    assert.deepEqual(
+      error.details?.map(({ field }) => field),
+      ['password'],
+    );
+    assert.equal(error.details?.[0]?.message, expectedMessage);
+  }
+
+  assert.deepEqual(
+    confirmedPasswords.map((password) => password.length),
+    [8, 12, 256],
+  );
 });

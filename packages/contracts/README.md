@@ -46,14 +46,26 @@ wire format. Los schemas de headers reciben solamente una proyección de las
 cabeceras contractuales; no deben aplicarse directamente al objeto completo de
 headers de Node.js o Fastify.
 
-El transporte de refresh tokens se declara mediante
-`x-refresh-token-transport`. Si la cabecera se omite, el transporte es `cookie`.
-El transporte `cookie` exige un body ausente o un objeto vacío, mientras que
-`body` exige el refresh token en el body. Los contratos no modelan cookies.
+El refresh token se transmite exclusivamente mediante una cookie HttpOnly. Login y refresh
+devuelven solo el access token en JSON. Refresh admite un body ausente o `{}` y rechaza
+un campo `refreshToken`. Los contratos no modelan el valor de la cookie.
 Las cabeceras criptográficas solo tienen schemas de formato en `internal.ts`;
 no se verifican aquí. Logout y eliminación de sesión no admiten body.
 
+El registro requiere `name`, `username`, `email` y `password`. `username` se recorta y admite
+3–30 letras ASCII, dígitos o guiones bajos. Un correo repetido responde 409
+`USER_ALREADY_EXISTS`; un username repetido responde 409 `USERNAME_ALREADY_EXISTS`.
+El perfil público incluye `username`; puede ser `null` para cuentas anteriores a la migración.
+
 ## Contratos de Vehicle y Device
+
+Las respuestas enriquecidas de Vehicle conservan `vehicleId`, `invitationId`,
+`status` y `accepted` para clientes existentes. Añaden `message`, `data` y
+`requestId` cuando procede. `data` se construye desde el estado persistido y
+contiene solo campos públicos. Los campos nuevos son opcionales en los DTOs
+anteriores para permitir una transición compatible; los clientes nuevos deben
+prever respuestas antiguas durante el despliegue. El registro de un dispositivo
+devuelve `PENDING`: no significa que la vinculación criptográfica haya terminado.
 
 Los DTOs de Vehicle usan `id` para representar el recurso vehículo y mantienen
 `vehicleId` y `userId` explícitos en referencias. El body público de creación no

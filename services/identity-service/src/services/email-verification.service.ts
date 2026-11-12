@@ -1,5 +1,5 @@
 import { Types, type Model } from 'mongoose';
-import type { EmailProvider } from '../email/email-provider.js';
+import { EmailProviderError, type EmailProvider } from '../email/email-provider.js';
 import { createVerificationEmail } from '../email/verification-email.js';
 import { EmailTokenModel, type EmailToken } from '../models/email-token.model.js';
 import { normalizeEmail, UserModel, type User } from '../models/user.model.js';
@@ -64,9 +64,13 @@ export interface EmailVerificationServiceDependencies {
 
 export class EmailVerificationServiceError extends Error {
   readonly code = 'EMAIL_VERIFICATION_FAILED';
+  readonly stage: string;
+  readonly providerCode?: string;
 
-  constructor() {
-    super('Email verification could not be completed');
+  constructor(options: { cause?: unknown; stage?: string; providerCode?: string } = {}) {
+    super('Email verification could not be completed', { cause: options.cause });
+    this.stage = options.stage ?? 'unknown';
+    this.providerCode = options.providerCode;
     this.name = 'EmailVerificationServiceError';
   }
 }
@@ -83,8 +87,8 @@ export class EmailVerificationService {
 
     try {
       return await this.dependencies.repository.verifyEmailTokenAndUser(hashToken(token), now);
-    } catch {
-      throw new EmailVerificationServiceError();
+    } catch (error) {
+      throw new EmailVerificationServiceError({ cause: error, stage: 'token.verify' });
     }
   }
 
@@ -113,6 +117,8 @@ export class EmailVerificationService {
     let heartbeat = Promise.resolve();
     let accountUnavailable = false;
     let failed = false;
+    let failure: EmailVerificationServiceError | undefined;
+    let currentStage = 'resend.lock.acquire';
     const stopHeartbeat = async (): Promise<void> => {
       if (heartbeatTimer) {
         clearInterval(heartbeatTimer);
@@ -124,6 +130,7 @@ export class EmailVerificationService {
     try {
       while (!lockAcquired) {
         const now = new Date();
+        currentStage = 'resend.lock.acquire';
         const acquisition = await this.dependencies.repository.acquireVerificationResendLock(
           userId,
           lockId,
@@ -169,6 +176,7 @@ export class EmailVerificationService {
           verificationUrl: this.dependencies.verificationUrl,
           token: rawToken,
         });
+        currentStage = 'token.create';
         const token = await this.dependencies.repository.createEmailVerificationToken({
           userId: user._id,
           tokenHash: hashToken(rawToken),
@@ -176,25 +184,31 @@ export class EmailVerificationService {
         });
 
         try {
+          currentStage = 'email.send';
           await this.dependencies.emailProvider.send({
             to: user.email,
             subject: emailContent.subject,
             html: emailContent.html,
             text: emailContent.text,
           });
-        } catch {
+        } catch (error) {
           try {
             await this.dependencies.repository.deleteEmailVerificationToken(token._id);
           } catch {
             // Keep the delivery failure generic and preserve previously valid tokens.
           }
-          throw new EmailVerificationServiceError();
+          throw new EmailVerificationServiceError({
+            cause: error,
+            stage: 'email.send',
+            providerCode: error instanceof EmailProviderError ? error.providerCode : undefined,
+          });
         }
 
         await stopHeartbeat();
         if (heartbeatFailed) {
           throw new EmailVerificationServiceError();
         }
+        currentStage = 'token.invalidate';
         await this.dependencies.repository.invalidatePreviousEmailVerificationTokens(
           user._id,
           token._id,
@@ -203,26 +217,35 @@ export class EmailVerificationService {
         );
         lockReleased = true;
       }
-    } catch {
+    } catch (error) {
       failed = true;
+      failure =
+        error instanceof EmailVerificationServiceError
+          ? error
+          : new EmailVerificationServiceError({ cause: error, stage: currentStage });
     }
 
     try {
       await stopHeartbeat();
-    } catch {
+    } catch (error) {
       failed = true;
+      failure ??= new EmailVerificationServiceError({ cause: error, stage: 'resend.heartbeat' });
     }
 
     if (lockAcquired && !lockReleased) {
       try {
         await this.dependencies.repository.releaseVerificationResendLock(userId, lockId);
-      } catch {
+      } catch (error) {
         failed = true;
+        failure ??= new EmailVerificationServiceError({
+          cause: error,
+          stage: 'resend.lock.release',
+        });
       }
     }
 
     if (failed) {
-      throw new EmailVerificationServiceError();
+      throw failure ?? new EmailVerificationServiceError({ stage: currentStage });
     }
   }
 }

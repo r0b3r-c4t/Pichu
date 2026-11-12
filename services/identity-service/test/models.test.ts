@@ -9,12 +9,15 @@ import { UserModel } from '../src/models/user.model.js';
 test('User normalizes email and validates required fields', async () => {
   const user = new UserModel({
     name: '  Ada Lovelace  ',
+    username: '  Ada_01  ',
     email: '  ADA@Example.COM ',
     passwordHash: 'hash',
   });
 
   await user.validate();
   assert.equal(user.name, 'Ada Lovelace');
+  assert.equal(user.username, 'Ada_01');
+  assert.equal(user.normalizedUsername, 'ada_01');
   assert.equal(user.normalizedEmail, 'ada@example.com');
   assert.equal(user.emailVerifiedAt, null);
   assert.equal(user.passwordRecoverySequence, 0);
@@ -46,6 +49,15 @@ test('User and EmailToken expose the required indexes', () => {
 
   assert.ok(
     userIndexes.some(([fields, options]) => fields.normalizedEmail === 1 && options?.unique),
+  );
+  assert.ok(
+    userIndexes.some(
+      ([fields, options]) =>
+        fields.normalizedUsername === 1 &&
+        options?.unique &&
+        JSON.stringify(options.partialFilterExpression) ===
+          JSON.stringify({ normalizedUsername: { $type: 'string' } }),
+    ),
   );
   assert.ok(tokenIndexes.some(([fields, options]) => fields.tokenHash === 1 && options?.unique));
   assert.ok(tokenIndexes.some(([fields]) => fields.userId === 1 && fields.type === 1));

@@ -8,7 +8,7 @@ export const healthRoutes: FastifyPluginAsync = async (fastify) => {
     const connected = await checkDatabaseConnection();
 
     if (!connected) {
-      return reply.code(503).send({ status: 'error', database: 'disconnected' });
+      return reply.code(503).send({ message: 'Database unavailable' });
     }
 
     return { status: 'ok', database: 'connected' };

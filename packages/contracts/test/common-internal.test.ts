@@ -5,6 +5,7 @@ import {
   domainServiceNameSchema,
   errorCodeSchema,
   errorResponseSchema,
+  gatewayErrorResponseSchema,
   healthResponseSchema,
   internalCallerNameSchema,
   internalRequestHeadersSchema,
@@ -39,6 +40,16 @@ test('common error, health and pagination contracts are strict', () => {
     true,
   );
   assert.equal(errorCodeSchema.safeParse('SERVICE_UNAVAILABLE').success, false);
+  assert.equal(
+    gatewayErrorResponseSchema.safeParse({
+      error: 'VALIDATION_ERROR',
+      message: 'Invalid request',
+      details: [{ field: 'password', message: 'Password is too short' }],
+      requestId: 'request-1',
+    }).success,
+    true,
+  );
+  assert.equal(gatewayErrorResponseSchema.safeParse({ message: 'Invalid request' }).success, false);
   assert.equal(
     errorResponseSchema.safeParse({
       error: { code: 'NOT_FOUND', message: 'Not found', details: true },

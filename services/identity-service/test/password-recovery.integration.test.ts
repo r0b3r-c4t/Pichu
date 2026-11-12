@@ -41,12 +41,55 @@ async function connectToTestReplicaSet(): Promise<void> {
 
 after(async () => mongoose.disconnect());
 
+test('concurrent confirmations consume a recovery token once', { skip: !databaseUrl }, async () => {
+  await connectToTestReplicaSet();
+  const fixture = await createFixture();
+  try {
+    const { service } = createRecoveryService();
+    const results = await Promise.all([
+      service.confirmRecovery(fixture.rawToken, 'first new password'),
+      service.confirmRecovery(fixture.rawToken, 'second new password'),
+    ]);
+    assert.deepEqual(results.sort(), [false, true]);
+    assert.equal(await service.confirmRecovery(fixture.rawToken, 'third new password'), false);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test(
+  'expired and email verification tokens cannot reset a password',
+  { skip: !databaseUrl },
+  async () => {
+    await connectToTestReplicaSet();
+    const fixture = await createFixture();
+    try {
+      const { service } = createRecoveryService();
+      await EmailTokenModel.updateOne(
+        { _id: fixture.emailToken._id },
+        { $set: { expiresAt: new Date(Date.now() - 1000) } },
+      );
+      assert.equal(await service.confirmRecovery(fixture.rawToken, 'new password value'), false);
+      await EmailTokenModel.updateOne(
+        { _id: fixture.emailToken._id },
+        { $set: { expiresAt: new Date(Date.now() + 60_000), type: 'EMAIL_VERIFICATION' } },
+      );
+      assert.equal(await service.confirmRecovery(fixture.rawToken, 'new password value'), false);
+      const user = await UserModel.findById(fixture.userId).select('+passwordHash').lean().exec();
+      assert.equal(user?.passwordHash, fixture.oldPasswordHash);
+    } finally {
+      await fixture.cleanup();
+    }
+  },
+);
+
 async function createFixture() {
   const userId = new Types.ObjectId();
   const oldPasswordHash = await hashPassword('old password value');
   await UserModel.create({
     _id: userId,
     name: 'Ada',
+    username: `u_${userId.toHexString()}`,
     email: `${userId.toHexString()}@example.com`,
     normalizedEmail: `${userId.toHexString()}@example.com`,
     passwordHash: oldPasswordHash,
@@ -90,6 +133,7 @@ async function createRecoveryUserFixture() {
   await UserModel.create({
     _id: userId,
     name: 'Ada',
+    username: `u_${userId.toHexString()}`,
     email: `${userId.toHexString()}@example.com`,
     normalizedEmail: `${userId.toHexString()}@example.com`,
     passwordHash: await hashPassword('old password value'),

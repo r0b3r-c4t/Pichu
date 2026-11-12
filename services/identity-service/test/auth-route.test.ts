@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { assertApiError } from './error-assertion.js';
 import test from 'node:test';
 import { Types } from 'mongoose';
 import { createApp } from '../src/app.js';
@@ -13,7 +14,6 @@ import {
 import { RegistrationService } from '../src/services/registration.service.js';
 import { SessionServiceError } from '../src/services/session.service.js';
 import { LoginServiceOperationalError } from '../src/services/login.service.js';
-import { SessionModel } from '../src/models/session.model.js';
 import Fastify from 'fastify';
 import { createAuthenticationGuard } from '../src/security/authentication.js';
 import { DEFAULT_REFRESH_TOKEN_TTL_MS } from '../src/services/session.service.js';
@@ -152,6 +152,9 @@ test('cookie login requires the allowed Origin and does not expose refresh token
   assert.deepEqual(allowed.json(), { accessToken: 'access-token' });
   const loginCookie = getSetCookieHeader(allowed.headers['set-cookie']);
   assert.match(loginCookie, /HttpOnly/);
+  assert.match(loginCookie, /Secure/);
+  assert.match(loginCookie, /SameSite=Lax/);
+  assert.match(loginCookie, /Path=\/auth(?:;|$)/);
   assert.match(loginCookie, /Max-Age=900/);
 
   const different = await app.inject({
@@ -221,7 +224,7 @@ test('refresh revokes the rotated session and clears cookie if access token crea
   });
 
   assert.equal(response.statusCode, 503);
-  assert.deepEqual(response.json(), { message: 'Request could not be completed' });
+  assertApiError(response, 'SERVICE_UNAVAILABLE', 'Request could not be completed');
   assert.equal(response.body.includes('sensitive signing failure'), false);
   const clearedCookie = getSetCookieHeader(response.headers['set-cookie']);
   assert.match(clearedCookie, /pichu_refresh_token=;/);
@@ -231,47 +234,57 @@ test('refresh revokes the rotated session and clears cookie if access token crea
   assert.equal(revocations[0].reason, 'access-token-issuance-failed');
 });
 
-test('refresh revokes the rotated session after access token failure using body transport', async (context) => {
-  const { app, sessionId, revocations } = createRefreshFailureApp();
+test('login ignores the former transport selector and never exposes refresh tokens', async (context) => {
+  const { app, getLoginCalls } = createLoginRouteApp();
   context.after(async () => app.close());
 
   const response = await app.inject({
     method: 'POST',
-    url: '/auth/refresh',
-    headers: { 'x-refresh-token-transport': 'body' },
-    payload: { refreshToken: 'a'.repeat(64) },
+    url: '/auth/login',
+    headers: { 'x-refresh-token-transport': 'body', origin: 'https://app.example.test' },
+    payload: { email: 'ada@example.com', password: 'correct password' },
   });
-
-  assert.equal(response.statusCode, 503);
-  assert.deepEqual(response.json(), { message: 'Request could not be completed' });
-  assert.equal(response.body.includes('sensitive signing failure'), false);
-  assert.equal(response.headers['set-cookie'], undefined);
-  assert.equal(revocations.length, 1);
-  assert.equal(revocations[0].sessionId.equals(sessionId), true);
-  assert.equal(revocations[0].reason, 'access-token-issuance-failed');
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.json(), { accessToken: 'access-token' });
+  assert.match(getSetCookieHeader(response.headers['set-cookie']), /HttpOnly/);
+  assert.equal(getLoginCalls(), 1);
 });
 
-test('native body login is explicit and unknown transport is rejected', async (context) => {
-  const { app, getLoginCalls } = createLoginRouteApp();
+test('logout and logout-all reject missing Origin before revoking a session', async (context) => {
+  let revocations = 0;
+  const app = createApp({
+    loginService: { login: async () => ({}) } as never,
+    sessionService: {
+      refreshTokenTtlSeconds: 900,
+      isSessionActive: async () => true,
+      revokeSession: async () => {
+        revocations += 1;
+      },
+      revokeAllSessions: async () => {
+        revocations += 1;
+      },
+    } as never,
+    jwtService: {
+      verifyAccessToken: async () => ({
+        userId: new Types.ObjectId().toHexString(),
+        sessionId: new Types.ObjectId().toHexString(),
+        issuedAt: 1,
+        expiresAt: 2,
+      }),
+    } as never,
+    cookieOrigin: 'https://app.example.test',
+  });
   context.after(async () => app.close());
-
-  const native = await app.inject({
-    method: 'POST',
-    url: '/auth/login',
-    headers: { 'x-refresh-token-transport': 'body' },
-    payload: { email: 'ada@example.com', password: 'correct password' },
-  });
-  assert.equal(native.statusCode, 200);
-  assert.equal(native.json().refreshToken, 'a'.repeat(64));
-
-  const unknown = await app.inject({
-    method: 'POST',
-    url: '/auth/login',
-    headers: { 'x-refresh-token-transport': 'header', origin: 'https://app.example.test' },
-    payload: { email: 'ada@example.com', password: 'correct password' },
-  });
-  assert.equal(unknown.statusCode, 400);
-  assert.equal(getLoginCalls(), 1);
+  for (const url of ['/auth/logout', '/auth/logout-all']) {
+    const response = await app.inject({
+      method: 'POST',
+      url,
+      headers: { authorization: 'Bearer access-token' },
+    });
+    assert.equal(response.statusCode, 403);
+    assertApiError(response, 'FORBIDDEN', 'Invalid request origin');
+  }
+  assert.equal(revocations, 0);
 });
 
 test('login route maps operational login failures to generic 503', async (context) => {
@@ -284,11 +297,11 @@ test('login route maps operational login failures to generic 503', async (contex
   const response = await app.inject({
     method: 'POST',
     url: '/auth/login',
-    headers: { 'x-refresh-token-transport': 'body' },
+    headers: { origin: 'https://app.example.test' },
     payload: { email: 'ada@example.com', password: 'correct password' },
   });
   assert.equal(response.statusCode, 503);
-  assert.deepEqual(response.json(), { message: 'Login could not be completed' });
+  assertApiError(response, 'SERVICE_UNAVAILABLE', 'Login could not be completed');
 });
 
 test('authentication guard rejects a JWT whose user does not own its session', async (context) => {
@@ -429,7 +442,7 @@ test('session routes return generic 503 responses for persistence failures', asy
     cookieOrigin: 'https://app.example.test',
   });
   context.after(async () => app.close());
-  const headers = { authorization: 'Bearer access-token' };
+  const headers = { authorization: 'Bearer access-token', origin: 'https://app.example.test' };
 
   for (const request of [
     { method: 'POST' as const, url: '/auth/logout' },
@@ -439,7 +452,7 @@ test('session routes return generic 503 responses for persistence failures', asy
   ]) {
     const response = await app.inject({ ...request, headers });
     assert.equal(response.statusCode, 503);
-    assert.deepEqual(response.json(), { message: 'Session operation could not be completed' });
+    assertApiError(response, 'SERVICE_UNAVAILABLE', 'Session operation could not be completed');
   }
 });
 
@@ -447,6 +460,7 @@ test('register route rejects invalid input without sensitive response fields', a
   const service = new RegistrationService({
     repository: {
       findUserByNormalizedEmail: async () => null,
+      findUserByNormalizedUsername: async () => null,
       createUser: async () => {
         throw new Error('not expected');
       },
@@ -464,21 +478,27 @@ test('register route rejects invalid input without sensitive response fields', a
   const response = await app.inject({
     method: 'POST',
     url: '/auth/register',
-    payload: { name: '', email: 'invalid', password: 'short' },
+    payload: { name: '', username: 'ada_01', email: 'invalid', password: 'short' },
   });
 
   assert.equal(response.statusCode, 400);
-  assert.deepEqual(response.json(), { message: 'Invalid registration data' });
+  const invalid = assertApiError(response, 'VALIDATION_ERROR', 'Invalid registration data');
+  assert.deepEqual(
+    invalid.details?.map(({ field }) => field),
+    ['name', 'email', 'password'],
+  );
 });
 
 test('register route returns a generic accepted response for valid input', async (context) => {
   const service = new RegistrationService({
     repository: {
       findUserByNormalizedEmail: async () => null,
+      findUserByNormalizedUsername: async () => null,
       createUser: async () =>
         new UserModel({
           _id: new Types.ObjectId(),
           name: 'Ada',
+          username: 'ada_01',
           email: 'ada@example.com',
           normalizedEmail: 'ada@example.com',
           passwordHash: 'hash',
@@ -499,11 +519,125 @@ test('register route returns a generic accepted response for valid input', async
   const response = await app.inject({
     method: 'POST',
     url: '/auth/register',
-    payload: { name: 'Ada', email: 'ada@example.com', password: 'correct horse battery staple' },
+    payload: {
+      name: 'Ada',
+      username: 'ada_01',
+      email: 'ada@example.com',
+      password: 'correct horse battery staple',
+    },
   });
 
   assert.equal(response.statusCode, 200);
   assert.deepEqual(response.json(), { accepted: true });
+});
+
+test('register route exposes explicit conflict codes with the request ID', async (context) => {
+  for (const [field, code] of [
+    ['email', 'USER_ALREADY_EXISTS'],
+    ['username', 'USERNAME_ALREADY_EXISTS'],
+  ] as const) {
+    const service = new RegistrationService({
+      repository: {
+        findUserByNormalizedEmail: async () => (field === 'email' ? new UserModel({}) : null),
+        findUserByNormalizedUsername: async () => (field === 'username' ? new UserModel({}) : null),
+        createUser: async () => {
+          throw new Error('unexpected user');
+        },
+        createEmailToken: async () => {
+          throw new Error('unexpected token');
+        },
+        deleteEmailToken: async () => undefined,
+      },
+      emailProvider: {
+        send: async () => {
+          throw new Error('unexpected email');
+        },
+      },
+      verificationUrl: 'http://localhost:3000/verify-email',
+    });
+    const app = createApp({ registrationService: service });
+    context.after(async () => app.close());
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/register',
+      headers: { 'x-request-id': 'register-123' },
+      payload: {
+        name: 'Ada',
+        username: 'ada_01',
+        email: 'ada@example.com',
+        password: 'password123',
+      },
+    });
+    assert.equal(response.statusCode, 409);
+    assert.equal(response.json().error, code);
+    assert.equal(response.json().requestId, 'register-123');
+    assert.equal(response.headers['x-request-id'], 'register-123');
+  }
+});
+
+test('Identity Swagger requires username and documents both registration conflicts', async (context) => {
+  const app = createApp();
+  context.after(async () => app.close());
+  const document = (await app.inject('/docs/json')).json();
+  const register = document.paths['/auth/register'].post;
+  const request = register.requestBody.content['application/json'].schema;
+  assert.ok(request.required.includes('username'));
+  assert.equal(request.properties.username.minLength, 3);
+  assert.equal(request.properties.username.maxLength, 30);
+  assert.equal(register.responses['409'].description, 'Email or username already in use');
+  assert.equal(
+    register.responses['409'].content['application/json'].examples.email.value.error,
+    'USER_ALREADY_EXISTS',
+  );
+  assert.equal(
+    register.responses['409'].content['application/json'].examples.username.value.error,
+    'USERNAME_ALREADY_EXISTS',
+  );
+});
+
+test('register route uses the shared password policy and returns password validation details', async (context) => {
+  const registeredPasswords: string[] = [];
+  const app = createApp({
+    registrationService: {
+      register: async (input: { password: string }) => {
+        registeredPasswords.push(input.password);
+        return { accepted: true };
+      },
+    } as never,
+  });
+  context.after(async () => app.close());
+
+  for (const password of ['x'.repeat(8), 'x'.repeat(12), 'x'.repeat(256)]) {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/register',
+      payload: { name: 'Driver', username: 'ada_01', email: 'driver@example.com', password },
+    });
+    assert.equal(response.statusCode, 200);
+  }
+
+  for (const [password, expectedMessage] of [
+    ['x'.repeat(7), 'Password must contain 8 to 256 characters'],
+    ['x'.repeat(257), 'Password must contain 8 to 256 characters'],
+  ]) {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/auth/register',
+      payload: { name: 'Driver', username: 'ada_01', email: 'driver@example.com', password },
+    });
+    assert.equal(response.statusCode, 400);
+    const error = assertApiError(response, 'VALIDATION_ERROR', 'Invalid registration data');
+    assert.deepEqual(
+      error.details?.map(({ field }) => field),
+      ['password'],
+    );
+    assert.equal(error.details?.[0]?.message, expectedMessage);
+  }
+
+  assert.deepEqual(
+    registeredPasswords.map((password) => password.length),
+    [8, 12, 256],
+  );
 });
 
 test('register route limits each IP to five requests and returns Retry-After', async (context) => {
@@ -526,6 +660,7 @@ test('register route limits each IP to five requests and returns Retry-After', a
         remoteAddress: '192.0.2.1',
         payload: {
           name: 'Ada',
+          username: 'ada_01',
           email: 'ada@example.com',
           password: 'correct horse battery staple',
         },
@@ -538,6 +673,7 @@ test('register route limits each IP to five requests and returns Retry-After', a
     remoteAddress: '192.0.2.2',
     payload: {
       name: 'Ada',
+      username: 'ada_01',
       email: 'ada@example.com',
       password: 'correct horse battery staple',
     },
@@ -548,7 +684,7 @@ test('register route limits each IP to five requests and returns Retry-After', a
     [200, 200, 200, 200, 200, 429],
   );
   assert.deepEqual(responses[4].json(), { accepted: true });
-  assert.deepEqual(responses[5].json(), { message: 'Too many requests' });
+  assertApiError(responses[5], 'RATE_LIMIT_EXCEEDED', 'Too many requests');
   assert.ok(Number(responses[5].headers['retry-after']) > 0);
   assert.equal(otherIpResponse.statusCode, 200);
   assert.equal(registrationCalls, 6);
@@ -561,6 +697,7 @@ test('register route does not expose internal database or provider errors', asyn
       findUserByNormalizedEmail: async () => {
         throw new Error(sensitiveDetails);
       },
+      findUserByNormalizedUsername: async () => null,
       createUser: async () => {
         throw new Error('not expected');
       },
@@ -578,11 +715,16 @@ test('register route does not expose internal database or provider errors', asyn
   const response = await app.inject({
     method: 'POST',
     url: '/auth/register',
-    payload: { name: 'Ada', email: 'ada@example.com', password: 'correct horse battery staple' },
+    payload: {
+      name: 'Ada',
+      username: 'ada_01',
+      email: 'ada@example.com',
+      password: 'correct horse battery staple',
+    },
   });
 
   assert.equal(response.statusCode, 503);
-  assert.deepEqual(response.json(), { message: 'Registration could not be completed' });
+  assertApiError(response, 'SERVICE_UNAVAILABLE', 'Registration could not be completed');
   assert.equal(response.body.includes(sensitiveDetails), false);
   assert.equal(response.body.includes('passwordHash'), false);
   assert.equal(response.body.includes('tokenHash'), false);
@@ -602,7 +744,12 @@ test('register route uses Fastify generic handling for unexpected errors', async
   const response = await app.inject({
     method: 'POST',
     url: '/auth/register',
-    payload: { name: 'Ada', email: 'ada@example.com', password: 'correct horse battery staple' },
+    payload: {
+      name: 'Ada',
+      username: 'ada_01',
+      email: 'ada@example.com',
+      password: 'correct horse battery staple',
+    },
   });
 
   assert.equal(response.statusCode, 500);
@@ -624,7 +771,7 @@ test('verification route returns a generic invalid-token response without exposi
   });
 
   assert.equal(response.statusCode, 400);
-  assert.deepEqual(response.json(), { message: 'Invalid or expired verification token' });
+  assertApiError(response, 'INVALID_TOKEN', 'Invalid or expired verification token');
   assert.equal(response.body.includes(invalidToken), false);
   assert.equal(response.body.includes('tokenHash'), false);
 });
@@ -698,5 +845,5 @@ test('resend route limits requests per client IP', async (context) => {
   );
   assert.ok(Number(responses[5].headers['retry-after']) > 0);
   assert.equal(getResendCalls(), 5);
-  assert.deepEqual(responses[5].json(), { message: 'Too many requests' });
+  assertApiError(responses[5], 'RATE_LIMIT_EXCEEDED', 'Too many requests');
 });

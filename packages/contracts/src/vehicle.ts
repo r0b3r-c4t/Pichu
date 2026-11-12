@@ -1,5 +1,10 @@
 import { z } from 'zod';
-import { objectIdSchema, pageInfoSchema, paginationQuerySchema } from './common.js';
+import {
+  objectIdSchema,
+  pageInfoSchema,
+  paginationQuerySchema,
+  requestIdSchema,
+} from './common.js';
 
 export const vehicleNameSchema = z.string().trim().min(1).max(120);
 export const membershipRoleSchema = z.enum(['OWNER', 'MEMBER']);
@@ -29,6 +34,9 @@ export type VehicleCreateRequest = z.infer<typeof vehicleCreateRequestSchema>;
 
 export const vehicleCreateResponseSchema = z.strictObject({
   vehicleId: objectIdSchema,
+  message: z.string().optional(),
+  data: vehicleSummarySchema.optional(),
+  requestId: requestIdSchema.optional(),
 });
 export type VehicleCreateResponse = z.infer<typeof vehicleCreateResponseSchema>;
 
@@ -46,8 +54,14 @@ export type VehicleListQuery = z.infer<typeof vehicleListQuerySchema>;
 export const vehicleListResponseSchema = z.strictObject({
   vehicles: z.array(vehicleSummarySchema),
   page: pageInfoSchema.optional(),
+  requestId: requestIdSchema.optional(),
 });
 export type VehicleListResponse = z.infer<typeof vehicleListResponseSchema>;
+
+export const vehicleDetailResponseSchema = vehicleSummarySchema.extend({
+  requestId: requestIdSchema.optional(),
+});
+export type VehicleDetailResponse = z.infer<typeof vehicleDetailResponseSchema>;
 
 export const vehicleParamsSchema = z.strictObject({
   vehicleId: objectIdSchema,
@@ -77,6 +91,18 @@ export type InternalInvitationCreateRequest = z.infer<typeof internalInvitationC
 export const invitationCreateResponseSchema = z.strictObject({
   invitationId: objectIdSchema,
   status: invitationStatusSchema,
+  message: z.string().optional(),
+  data: z
+    .strictObject({
+      id: objectIdSchema,
+      vehicleId: objectIdSchema,
+      inviteeUserId: objectIdSchema,
+      permissions: z.array(membershipPermissionSchema).max(100),
+      status: invitationStatusSchema,
+      expiresAt: z.string().datetime(),
+    })
+    .optional(),
+  requestId: requestIdSchema.optional(),
 });
 export type InvitationCreateResponse = z.infer<typeof invitationCreateResponseSchema>;
 
@@ -88,5 +114,24 @@ export type InvitationAcceptRequest = z.infer<typeof invitationAcceptRequestSche
 export const invitationAcceptResponseSchema = z.strictObject({
   accepted: z.literal(true),
   vehicleId: objectIdSchema,
+  message: z.string().optional(),
+  data: membershipSchema.optional(),
+  requestId: requestIdSchema.optional(),
 });
 export type InvitationAcceptResponse = z.infer<typeof invitationAcceptResponseSchema>;
+
+/** Vehicle's public response after Device accepts a registration; activation is still pending. */
+export const vehicleDeviceRegistrationResponseSchema = z.strictObject({
+  deviceId: objectIdSchema,
+  status: z.literal('PENDING'),
+  message: z.string(),
+  data: z.strictObject({
+    deviceId: objectIdSchema,
+    vehicleId: objectIdSchema,
+    status: z.literal('PENDING'),
+  }),
+  requestId: requestIdSchema,
+});
+export type VehicleDeviceRegistrationResponse = z.infer<
+  typeof vehicleDeviceRegistrationResponseSchema
+>;

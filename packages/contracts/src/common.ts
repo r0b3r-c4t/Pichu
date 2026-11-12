@@ -49,6 +49,22 @@ export const errorResponseSchema = z.strictObject({
 });
 export type ErrorResponse = z.infer<typeof errorResponseSchema>;
 
+export const gatewayErrorResponseSchema = z.strictObject({
+  error: z.string().trim().min(1).max(64),
+  message: z.string().trim().min(1).max(500),
+  details: z
+    .array(
+      z.strictObject({
+        field: z.string().trim().min(1).max(128),
+        message: z.string().trim().min(1).max(200),
+      }),
+    )
+    .max(50)
+    .optional(),
+  requestId: requestIdSchema.optional(),
+});
+export type GatewayErrorResponse = z.infer<typeof gatewayErrorResponseSchema>;
+
 export const healthResponseSchema = z.strictObject({
   status: z.enum(['ok', 'degraded', 'error']),
   service: z.string().trim().min(1).max(80),
