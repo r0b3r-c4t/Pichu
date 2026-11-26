@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { GatewayConfigError, loadGatewayEnv } from '../src/config/env.js';
+import { testInternalAuthEnv } from './test-env.js';
 
 const validEnvironment = {
   HOST: '127.0.0.1',
   PORT: '3000',
   NODE_ENV: 'test',
-  INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+  ...testInternalAuthEnv,
   JWT_SECRET: 'j'.repeat(32),
   JWT_ISSUER: 'issuer',
   JWT_AUDIENCE: 'audience',

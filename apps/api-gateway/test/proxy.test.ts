@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { proxyRequest, ProxyRequestError } from '../src/lib/proxy.js';
 import { createHmac } from 'node:crypto';
 import { createApp } from '../src/app.js';
+import { testInternalAuthEnv } from './test-env.js';
 
 function createToken(secret: string): string {
   const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
@@ -117,7 +118,7 @@ test('gateway propagates a validated request id to the upstream service', async 
       HOST: '127.0.0.1',
       PORT: 3000,
       NODE_ENV: 'test',
-      INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+      ...testInternalAuthEnv,
       JWT_SECRET: secret,
       JWT_ISSUER: 'issuer',
       JWT_AUDIENCE: 'audience',
@@ -151,6 +152,96 @@ test('gateway propagates a validated request id to the upstream service', async 
   assert.equal(upstreamRequestId, 'client-request-42');
 });
 
+test('gateway retries GET once with a new nonce and preserves request id/deadline', async () => {
+  const secret = 'k'.repeat(32);
+  let calls = 0;
+  const captured: Array<{ nonce: string; requestId: string; deadline: string }> = [];
+  const app = createApp({
+    env: {
+      HOST: '127.0.0.1',
+      PORT: 3000,
+      NODE_ENV: 'test',
+      ...testInternalAuthEnv,
+      JWT_SECRET: secret,
+      JWT_ISSUER: 'issuer',
+      JWT_AUDIENCE: 'audience',
+      VEHICLE_SERVICE_URL: 'http://vehicle.test',
+      DEVICE_SERVICE_URL: 'http://device.test',
+      PROXY_TIMEOUT_MS: 1000,
+    },
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith('/auth/me')) return identityProfile(true);
+      calls += 1;
+      const headers = new Headers(init?.headers);
+      captured.push({
+        nonce: headers.get('x-nonce') ?? '',
+        requestId: headers.get('x-request-id') ?? '',
+        deadline: headers.get('x-internal-deadline') ?? '',
+      });
+      return calls === 1
+        ? new Response(JSON.stringify({ message: 'temporary' }), {
+            status: 503,
+            headers: { 'content-type': 'application/json' },
+          })
+        : new Response(JSON.stringify({ vehicles: [] }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+    },
+  });
+  const response = await app.inject({
+    method: 'GET',
+    url: '/api/vehicles',
+    headers: {
+      authorization: `Bearer ${createToken(secret)}`,
+      'x-request-id': 'retry-request-1',
+    },
+  });
+  await app.close();
+  assert.equal(response.statusCode, 200);
+  assert.equal(calls, 2);
+  assert.notEqual(captured[0].nonce, captured[1].nonce);
+  assert.equal(captured[0].requestId, 'retry-request-1');
+  assert.equal(captured[1].requestId, 'retry-request-1');
+  assert.equal(captured[0].deadline, captured[1].deadline);
+});
+
+test('gateway never retries writes after a transient upstream failure', async () => {
+  const secret = 'l'.repeat(32);
+  let vehicleCalls = 0;
+  const app = createApp({
+    env: {
+      HOST: '127.0.0.1',
+      PORT: 3000,
+      NODE_ENV: 'test',
+      ...testInternalAuthEnv,
+      JWT_SECRET: secret,
+      JWT_ISSUER: 'issuer',
+      JWT_AUDIENCE: 'audience',
+      VEHICLE_SERVICE_URL: 'http://vehicle.test',
+      DEVICE_SERVICE_URL: 'http://device.test',
+      PROXY_TIMEOUT_MS: 1000,
+    },
+    fetchImpl: async (url) => {
+      if (String(url).endsWith('/auth/me')) return identityProfile(true);
+      vehicleCalls += 1;
+      return new Response(JSON.stringify({ message: 'temporary' }), {
+        status: 503,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/vehicles',
+    headers: { authorization: `Bearer ${createToken(secret)}` },
+    payload: { name: 'Mazda 3' },
+  });
+  await app.close();
+  assert.equal(response.statusCode, 503);
+  assert.equal(vehicleCalls, 1);
+});
+
 test('gateway preserves persisted public vehicle data and excludes private fields', async () => {
   const secret = 'j'.repeat(32);
   const vehicleId = '507f1f77bcf86cd799439012';
@@ -159,7 +250,7 @@ test('gateway preserves persisted public vehicle data and excludes private field
       HOST: '127.0.0.1',
       PORT: 3000,
       NODE_ENV: 'test',
-      INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+      ...testInternalAuthEnv,
       JWT_SECRET: secret,
       JWT_ISSUER: 'issuer',
       JWT_AUDIENCE: 'audience',
@@ -211,7 +302,7 @@ test('gateway rejects unknown public fields before proxying', async () => {
       HOST: '127.0.0.1',
       PORT: 3000,
       NODE_ENV: 'test',
-      INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+      ...testInternalAuthEnv,
       JWT_SECRET: 'j'.repeat(32),
       JWT_ISSUER: 'issuer',
       JWT_AUDIENCE: 'audience',
@@ -239,7 +330,7 @@ test('gateway exposes dynamic OpenAPI routes and bearer security', async () => {
       HOST: '127.0.0.1',
       PORT: 3000,
       NODE_ENV: 'test',
-      INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+      ...testInternalAuthEnv,
       JWT_SECRET: 'j'.repeat(32),
       JWT_ISSUER: 'issuer',
       JWT_AUDIENCE: 'audience',
@@ -290,7 +381,7 @@ test('gateway enforces CORS, rate limiting and payload limits', async () => {
       HOST: '127.0.0.1',
       PORT: 3000,
       NODE_ENV: 'test',
-      INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+      ...testInternalAuthEnv,
       JWT_SECRET: 'j'.repeat(32),
       JWT_ISSUER: 'issuer',
       JWT_AUDIENCE: 'audience',
@@ -332,7 +423,7 @@ test('gateway forwards Identity cookie transport and Set-Cookie headers', async 
       HOST: '127.0.0.1',
       PORT: 3000,
       NODE_ENV: 'test',
-      INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+      ...testInternalAuthEnv,
       JWT_SECRET: 'j'.repeat(32),
       JWT_ISSUER: 'issuer',
       JWT_AUDIENCE: 'audience',
@@ -381,7 +472,7 @@ test('gateway preserves Identity error status, body and request id', async () =>
       HOST: '127.0.0.1',
       PORT: 3000,
       NODE_ENV: 'test',
-      INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+      ...testInternalAuthEnv,
       JWT_SECRET: 'j'.repeat(32),
       JWT_ISSUER: 'issuer',
       JWT_AUDIENCE: 'audience',

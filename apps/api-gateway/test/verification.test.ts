@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHmac } from 'node:crypto';
 import { createApp } from '../src/app.js';
+import { testInternalAuthEnv } from './test-env.js';
 
 const userId = '507f1f77bcf86cd799439011';
 const vehicleId = '507f1f77bcf86cd799439013';
@@ -28,7 +29,7 @@ function environment() {
     HOST: '127.0.0.1',
     PORT: 3000,
     NODE_ENV: 'test' as const,
-    INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+    ...testInternalAuthEnv,
     JWT_SECRET: secret,
     JWT_ISSUER: 'issuer',
     JWT_AUDIENCE: 'audience',

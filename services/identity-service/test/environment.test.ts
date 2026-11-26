@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parseEnvironment } from '../src/config/env.js';
+import { parseEnvironment, parseInternalAuthKeyring } from '../src/config/env.js';
 
 const validEnvironment = {
   HOST: '0.0.0.0',
@@ -22,6 +22,9 @@ const validEnvironment = {
   AUTH_COOKIE_ORIGIN: 'http://localhost:3000',
   DATABASE_URL:
     'mongodb://identity_user:local-password@localhost:27018/identity_db?authSource=identity_db',
+  TLS_CERT_PATH: 'test-cert.pem',
+  TLS_KEY_PATH: 'test-key.pem',
+  TLS_CA_PATH: 'test-ca.pem',
 };
 
 test('parses valid service environment variables', () => {
@@ -108,6 +111,66 @@ test('rejects unsupported verification URL protocols', () => {
       EMAIL_VERIFICATION_URL: 'ftp://localhost/verify',
     }),
   );
+});
+
+test('parses directed v2 keyring configuration without exposing key material', () => {
+  const environment = parseEnvironment({
+    ...validEnvironment,
+    INTERNAL_AUTH_ENVIRONMENT: 'test',
+    INTERNAL_AUTH_KEYRING_JSON: JSON.stringify([
+      {
+        environment: 'test',
+        sender: 'vehicle-service',
+        audience: 'identity-service',
+        keyId: 'vehicle-test',
+        secretBase64Url: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+        notBefore: 1,
+        notAfter: 9_000_000_000_000,
+        state: 'active',
+      },
+    ]),
+  });
+  const keyring = parseInternalAuthKeyring(environment);
+  assert.equal(keyring.length, 1);
+  assert.equal(keyring[0].sender, 'vehicle-service');
+  assert.equal(keyring[0].audience, 'identity-service');
+  assert.equal(keyring[0].secret.length, 32);
+});
+
+test('rejects missing, malformed, cross-environment, and noncanonical internal keys generically', () => {
+  const base = { ...validEnvironment, INTERNAL_AUTH_ENVIRONMENT: 'test' };
+  assert.throws(
+    () => parseInternalAuthKeyring(parseEnvironment(base)),
+    /configuration is incomplete/,
+  );
+  for (const key of [
+    {
+      environment: 'test',
+      sender: 'vehicle-service',
+      audience: 'identity-service',
+      keyId: 'k',
+      secretBase64Url: 'secret',
+      notBefore: 1,
+      notAfter: 2,
+      state: 'active',
+    },
+    {
+      environment: 'production',
+      sender: 'vehicle-service',
+      audience: 'identity-service',
+      keyId: 'k',
+      secretBase64Url: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      notBefore: 1,
+      notAfter: 2,
+      state: 'active',
+    },
+  ]) {
+    const input = parseEnvironment({ ...base, INTERNAL_AUTH_KEYRING_JSON: JSON.stringify([key]) });
+    assert.throws(
+      () => parseInternalAuthKeyring(input),
+      /Invalid internal authentication configuration/,
+    );
+  }
 });
 
 test('requires HTTPS for the cookie origin in production', () => {

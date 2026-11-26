@@ -1,0 +1,178 @@
+services:
+  - type: web
+    name: pichu-api-gateway
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: corepack enable && corepack prepare pnpm@12.16.1 --activate && pnpm install --frozen-lockfile && pnpm --filter @pichu/api-gateway build
+    startCommand: pnpm --filter @pichu/api-gateway start
+    healthCheckPath: /health/ready
+    envVars:
+      - key: NODE_VERSION
+        value: '24.14.0'
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: '3000'
+      - key: NODE_ENV
+        value: production
+      - key: INTERNAL_AUTH_ENVIRONMENT
+        value: production
+      - key: INTERNAL_AUTH_KEYRING_JSON
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_ISSUER
+        value: pichu-identity-service
+      - key: JWT_AUDIENCE
+        value: pichu-api
+      - key: VEHICLE_SERVICE_URL
+        sync: false
+      - key: DEVICE_SERVICE_URL
+        sync: false
+      - key: IDENTITY_SERVICE_URL
+        sync: false
+      - key: TLS_CA_PATH
+        value: /etc/secrets/pichu-ca.pem
+      - key: PROXY_TIMEOUT_MS
+        value: '1000'
+      - key: CORS_ORIGINS
+        sync: false
+      - key: MAX_PAYLOAD_BYTES
+        value: '1048576'
+      - key: RATE_LIMIT_MAX
+        value: '100'
+      - key: RATE_LIMIT_WINDOW_SECONDS
+        value: '60'
+      - key: SENSITIVE_RATE_LIMIT_MAX
+        value: '20'
+
+  - type: pserv
+    name: pichu-identity
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: corepack enable && corepack prepare pnpm@12.16.1 --activate && pnpm install --frozen-lockfile && pnpm --filter @pichu/identity-service build
+    startCommand: pnpm --filter @pichu/identity-service start
+    healthCheckPath: /health/ready
+    envVars:
+      - key: NODE_VERSION
+        value: '24.14.0'
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: '3001'
+      - key: NODE_ENV
+        value: production
+      - key: DOCUMENTATION_URL
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
+      - key: RESEND_FROM_NAME
+        value: PICHU
+      - key: EMAIL_VERIFICATION_URL
+        sync: false
+      - key: EMAIL_VERIFICATION_TOKEN_TTL_SECONDS
+        value: '86400'
+      - key: PASSWORD_RESET_URL
+        sync: false
+      - key: PASSWORD_RESET_TOKEN_TTL_SECONDS
+        value: '3600'
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_ISSUER
+        value: pichu-identity-service
+      - key: JWT_AUDIENCE
+        value: pichu-api
+      - key: ACCESS_TOKEN_TTL_SECONDS
+        value: '900'
+      - key: REFRESH_TOKEN_TTL_SECONDS
+        value: '2592000'
+      - key: AUTH_COOKIE_ORIGIN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: INTERNAL_AUTH_ENVIRONMENT
+        value: production
+      - key: INTERNAL_AUTH_KEYRING_JSON
+        sync: false
+      - key: INTERNAL_AUTH_BODY_LIMIT
+        value: '1048576'
+      - key: TLS_CERT_PATH
+        value: /etc/secrets/identity-cert.pem
+      - key: TLS_KEY_PATH
+        value: /etc/secrets/identity-key.pem
+      - key: TLS_CA_PATH
+        value: /etc/secrets/pichu-ca.pem
+
+  - type: pserv
+    name: pichu-vehicle
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: corepack enable && corepack prepare pnpm@12.16.1 --activate && pnpm install --frozen-lockfile && pnpm --filter @pichu/vehicle-service build
+    startCommand: pnpm --filter @pichu/vehicle-service start
+    healthCheckPath: /health/ready
+    envVars:
+      - key: NODE_VERSION
+        value: '24.14.0'
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: '3002'
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: INTERNAL_AUTH_ENVIRONMENT
+        value: production
+      - key: INTERNAL_AUTH_KEYRING_JSON
+        sync: false
+      - key: INTERNAL_AUTH_BODY_LIMIT
+        value: '1048576'
+      - key: IDENTITY_SERVICE_URL
+        sync: false
+      - key: DEVICE_SERVICE_URL
+        sync: false
+      - key: TLS_CERT_PATH
+        value: /etc/secrets/vehicle-cert.pem
+      - key: TLS_KEY_PATH
+        value: /etc/secrets/vehicle-key.pem
+      - key: TLS_CA_PATH
+        value: /etc/secrets/pichu-ca.pem
+
+  - type: pserv
+    name: pichu-device
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: corepack enable && corepack prepare pnpm@12.16.1 --activate && pnpm install --frozen-lockfile && pnpm --filter @pichu/device-service build
+    startCommand: pnpm --filter @pichu/device-service start
+    healthCheckPath: /health/ready
+    envVars:
+      - key: NODE_VERSION
+        value: '24.14.0'
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: '3003'
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: INTERNAL_AUTH_ENVIRONMENT
+        value: production
+      - key: INTERNAL_AUTH_KEYRING_JSON
+        sync: false
+      - key: INTERNAL_AUTH_BODY_LIMIT
+        value: '1048576'
+      - key: IDENTITY_SERVICE_URL
+        sync: false
+      - key: TLS_CERT_PATH
+        value: /etc/secrets/device-cert.pem
+      - key: TLS_KEY_PATH
+        value: /etc/secrets/device-key.pem
+      - key: TLS_CA_PATH
+        value: /etc/secrets/pichu-ca.pem

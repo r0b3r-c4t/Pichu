@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { decodeBytes32, validateKeyring, type Keyring } from '@pichu/internal-auth';
 
 const environmentSchema = z
   .object({
@@ -41,6 +42,12 @@ const environmentSchema = z
           return false;
         }
       }, 'DATABASE_URL must target identity_db using identity_user and authSource=identity_db'),
+    INTERNAL_AUTH_ENVIRONMENT: z.enum(['development', 'test', 'staging', 'production']).optional(),
+    INTERNAL_AUTH_KEYRING_JSON: z.string().trim().min(2).optional(),
+    INTERNAL_AUTH_BODY_LIMIT: z.coerce.number().int().min(1).max(1_048_576).optional(),
+    TLS_CERT_PATH: z.string().trim().min(1).optional(),
+    TLS_KEY_PATH: z.string().trim().min(1).optional(),
+    TLS_CA_PATH: z.string().trim().min(1).optional(),
   })
   .superRefine((environment, context) => {
     for (const [field, value] of [
@@ -83,9 +90,74 @@ const environmentSchema = z
 export type Environment = z.infer<typeof environmentSchema>;
 
 export function parseEnvironment(input: NodeJS.ProcessEnv): Environment {
-  return environmentSchema.parse(input);
+  const environment = environmentSchema.parse(input);
+  if (
+    environment.NODE_ENV === 'production' &&
+    (!environment.TLS_CERT_PATH || !environment.TLS_KEY_PATH || !environment.TLS_CA_PATH)
+  )
+    throw new Error('Production TLS configuration is incomplete');
+  return environment;
 }
 
 export function loadEnvironment(): Environment {
   return parseEnvironment(process.env);
+}
+
+const internalKeySchema = z.strictObject({
+  environment: z.enum(['development', 'test', 'staging', 'production']),
+  sender: z.enum([
+    'api-gateway',
+    'identity-service',
+    'vehicle-service',
+    'device-service',
+    'automation-service',
+  ]),
+  audience: z.enum([
+    'api-gateway',
+    'identity-service',
+    'vehicle-service',
+    'device-service',
+    'automation-service',
+  ]),
+  keyId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+  secretBase64Url: z.string(),
+  notBefore: z.number().int().nonnegative().safe(),
+  notAfter: z.number().int().nonnegative().safe(),
+  state: z.enum(['active', 'previous', 'revoked']),
+});
+
+/** Parse key material from explicit configuration without exposing it in errors/logs. */
+export function parseInternalAuthKeyring(environment: Environment): Keyring {
+  if (!environment.INTERNAL_AUTH_ENVIRONMENT || !environment.INTERNAL_AUTH_KEYRING_JSON) {
+    throw new Error('Internal authentication configuration is incomplete');
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(environment.INTERNAL_AUTH_KEYRING_JSON);
+  } catch {
+    throw new Error('Invalid internal authentication configuration');
+  }
+  const parsed = z.array(internalKeySchema).safeParse(raw);
+  if (
+    !parsed.success ||
+    parsed.data.some((entry) => entry.environment !== environment.INTERNAL_AUTH_ENVIRONMENT)
+  ) {
+    throw new Error('Invalid internal authentication configuration');
+  }
+  try {
+    const keyring: Keyring = parsed.data.map((entry) => ({
+      environment: entry.environment,
+      sender: entry.sender,
+      audience: entry.audience,
+      keyId: entry.keyId,
+      secret: decodeBytes32(entry.secretBase64Url),
+      notBefore: entry.notBefore,
+      notAfter: entry.notAfter,
+      state: entry.state,
+    }));
+    validateKeyring(keyring);
+    return keyring;
+  } catch {
+    throw new Error('Invalid internal authentication configuration');
+  }
 }

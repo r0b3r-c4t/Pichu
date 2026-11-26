@@ -1,0 +1,40 @@
+{
+  "name": "@pichu/internal-auth-adapters",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./fastify": {
+      "types": "./dist/fastify.d.ts",
+      "import": "./dist/fastify.js"
+    },
+    "./mongodb": {
+      "types": "./dist/mongodb.d.ts",
+      "import": "./dist/mongodb.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    },
+    "./tls": {
+      "types": "./dist/tls.d.ts",
+      "import": "./dist/tls.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint src test",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "test": "tsx --test test/unit.test.ts test/http.test.ts",
+    "test:mongo": "tsx --test test/mongo.integration.test.ts"
+  },
+  "dependencies": {
+    "@pichu/contracts": "workspace:*",
+    "@pichu/internal-auth": "workspace:*",
+    "fastify": "^5.6.2",
+    "mongodb": "7.7.0"
+  }
+}

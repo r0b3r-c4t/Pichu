@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { randomUUID } from 'node:crypto';
+import { randomInt } from 'node:crypto';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import { gatewayOpenApiOptions, gatewaySwaggerUiOptions } from './routes/docs.js';
@@ -30,10 +31,12 @@ import {
 } from './schemas/gateway.schema.js';
 import { proxyRequest, ProxyRequestError } from './lib/proxy.js';
 import { jsonSchema } from './lib/openapi.js';
-import { signInternalRequest } from './security/internal-auth.js';
+import {
+  createInternalHeaders as signInternalHeaders,
+  parseGatewayKeyring,
+} from './security/internal-auth.js';
 import { GatewayJwtError, verifyGatewayAccessToken } from './security/jwt.js';
 import {
-  CONTRACTS_VERSION,
   invitationAcceptResponseSchema,
   invitationCreateResponseSchema,
   vehicleCreateResponseSchema,
@@ -234,7 +237,9 @@ export interface GatewayAppOptions {
 
 export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
   const env = options.env ? gatewayEnvSchema.parse(options.env) : loadGatewayEnv();
+  const internalKeyring = parseGatewayKeyring(env);
   const fetchImpl = options.fetchImpl;
+  const internalTls = env.TLS_CA_PATH ? { caPath: env.TLS_CA_PATH } : undefined;
   const app = Fastify({
     logger: true,
     bodyLimit: env.MAX_PAYLOAD_BYTES,
@@ -295,7 +300,7 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
   app.addHook('onRequest', async (request, reply) => {
     const incoming = request.headers['x-request-id'];
     const candidate =
-      typeof incoming === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(incoming)
+      typeof incoming === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(incoming)
         ? incoming
         : randomUUID();
     requestIds.set(request, candidate);
@@ -366,6 +371,7 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
         },
         timeoutMs: env.PROXY_TIMEOUT_MS,
         fetchImpl,
+        tls: internalTls,
       });
       if (profileResponse.status === 401) {
         await sendProxyResult(reply, requestId, 401, {
@@ -396,24 +402,26 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
   void app.register(swagger, gatewayOpenApiOptions);
   void app.register(swaggerUi, gatewaySwaggerUiOptions);
 
-  app.decorate('createInternalHeaders', (method: string, url: string, body: unknown) => {
-    const requestId = randomUUID();
-    const timestamp = String(Date.now());
-    return {
-      'x-service-name': 'api-gateway',
-      'x-contract-version': CONTRACTS_VERSION,
-      'x-request-id': requestId,
-      'x-timestamp': timestamp,
-      'x-signature': signInternalRequest(
-        env.INTERNAL_SERVICE_SECRET,
+  app.decorate(
+    'createInternalHeaders',
+    (
+      method: string,
+      url: string,
+      body: unknown,
+      audience: 'vehicle-service' | 'device-service' = 'vehicle-service',
+    ) => {
+      const bodyBytes = body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(body));
+      return signInternalHeaders({
+        env,
+        keyring: internalKeyring,
+        audience,
         method,
-        url,
-        body,
-        timestamp,
-        requestId,
-      ),
-    };
-  });
+        target: url,
+        body: bodyBytes,
+        requestId: randomUUID(),
+      });
+    },
+  );
 
   app.after(() => {
     const livenessHandler = async (request: FastifyRequest, reply: FastifyReply) => {
@@ -462,10 +470,11 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
           [env.IDENTITY_SERVICE_URL, env.VEHICLE_SERVICE_URL, env.DEVICE_SERVICE_URL].map(
             (baseUrl) =>
               proxyRequest({
-                url: `${baseUrl}/health`,
+                url: `${baseUrl}/health/ready`,
                 method: 'GET',
                 timeoutMs: env.PROXY_TIMEOUT_MS,
                 fetchImpl,
+                tls: internalTls,
               }),
           ),
         );
@@ -509,32 +518,67 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
         method === 'GET'
           ? {}
           : { ...(typeof body === 'object' && body !== null ? body : {}), userId };
-      const timestamp = String(Date.now());
-      const signature = signInternalRequest(
-        env.INTERNAL_SERVICE_SECRET,
-        method,
-        path,
-        payload,
-        timestamp,
-        requestId,
-      );
+      const bodyBytes = method === 'GET' ? Buffer.alloc(0) : Buffer.from(JSON.stringify(payload));
+      const deadline = Date.now() + 5000;
+      const audience = serviceUrl === env.DEVICE_SERVICE_URL ? 'device-service' : 'vehicle-service';
+      const authorization =
+        typeof request.headers.authorization === 'string'
+          ? request.headers.authorization
+          : undefined;
+      const idempotencyKey =
+        typeof request.headers['idempotency-key'] === 'string' &&
+        /^[A-Za-z0-9_-]{1,128}$/.test(request.headers['idempotency-key'])
+          ? request.headers['idempotency-key']
+          : undefined;
+      const maxAttempts = method === 'GET' ? 2 : 1;
       try {
-        const response = await proxyRequest({
-          url: `${serviceUrl}${path}`,
-          method,
-          body: method === 'GET' ? undefined : payload,
-          headers: {
-            'content-type': 'application/json',
-            'x-service-name': 'api-gateway',
-            'x-contract-version': CONTRACTS_VERSION,
-            'x-request-id': requestId,
-            'x-timestamp': timestamp,
-            'x-signature': signature,
-          },
-          timeoutMs: env.PROXY_TIMEOUT_MS,
-          fetchImpl,
-        });
-        return sendProxyResult(reply, requestId, response.status, response.body);
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw new ProxyRequestError('timeout');
+          const headers = signInternalHeaders({
+            env,
+            keyring: internalKeyring,
+            audience,
+            method,
+            target: path,
+            body: bodyBytes,
+            requestId,
+            deadline,
+            authorization,
+            idempotencyKey,
+          });
+          let response;
+          try {
+            response = await proxyRequest({
+              url: `${serviceUrl}${path}`,
+              method,
+              body: method === 'GET' ? undefined : payload,
+              bodyBytes: method === 'GET' ? undefined : bodyBytes,
+              headers,
+              timeoutMs: Math.min(env.PROXY_TIMEOUT_MS, remaining),
+              fetchImpl,
+              tls: internalTls,
+            });
+          } catch (error) {
+            if (attempt + 1 >= maxAttempts || deadline - Date.now() < 1100) throw error;
+            const backoff = randomInt(100, 301);
+            if (deadline - Date.now() < backoff + 1000) throw error;
+            await new Promise((resolve) => setTimeout(resolve, backoff));
+            continue;
+          }
+          const retryableStatus = [502, 503, 504].includes(response.status);
+          if (!retryableStatus || attempt + 1 >= maxAttempts) {
+            return sendProxyResult(reply, requestId, response.status, response.body);
+          }
+          const backoff = randomInt(100, 301);
+          const retryAfter = response.retryAfter ? Number(response.retryAfter) * 1000 : 0;
+          const waitMs = Math.max(backoff, Number.isFinite(retryAfter) ? retryAfter : 0);
+          if (deadline - Date.now() < waitMs + 1000) {
+            return sendProxyResult(reply, requestId, response.status, response.body);
+          }
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+        }
+        throw new ProxyRequestError('timeout');
       } catch (error) {
         return sendProxyError(reply, requestId, error);
       }
@@ -564,6 +608,7 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
           headers,
           timeoutMs: env.PROXY_TIMEOUT_MS,
           fetchImpl,
+          tls: internalTls,
         });
         if (response.retryAfter) reply.header('retry-after', response.retryAfter);
         return sendProxyResult(

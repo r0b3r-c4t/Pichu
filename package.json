@@ -7,10 +7,11 @@
     "node": ">=24.14.0"
   },
   "scripts": {
+    "build:shared": "pnpm --filter @pichu/contracts build && pnpm --filter @pichu/internal-auth build && pnpm --filter @pichu/internal-auth-adapters build",
     "lint": "pnpm -r --if-present lint",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "typecheck": "pnpm -r --if-present typecheck"
+    "typecheck": "pnpm build:shared && pnpm -r --if-present typecheck"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

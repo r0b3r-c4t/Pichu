@@ -4,6 +4,13 @@ import { checkDatabaseConnection } from '../database/connection.js';
 export const healthRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get('/health', async () => ({ status: 'ok' }));
 
+  fastify.get('/health/ready', async (_request, reply) => {
+    if (!(await checkDatabaseConnection())) {
+      return reply.code(503).send({ status: 'unready' });
+    }
+    return { status: 'ready' };
+  });
+
   fastify.get('/health/db', async (_request, reply) => {
     const connected = await checkDatabaseConnection();
 

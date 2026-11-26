@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createApp } from '../src/app.js';
+import { testInternalAuthEnv } from './test-env.js';
 import { createApp as createIdentity } from '../../../services/identity-service/src/app.js';
 import {
   RefreshTokenInvalidError,
@@ -15,7 +16,7 @@ test('Gateway preserves upstream error details and Retry-After, and envelopes ne
     const app = createApp({
       env: {
         NODE_ENV: 'test',
-        INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+        ...testInternalAuthEnv,
         JWT_SECRET: 'j'.repeat(32),
         JWT_ISSUER: 'issuer',
         JWT_AUDIENCE: 'audience',
@@ -62,7 +63,7 @@ test('Gateway forwards registration conflicts and request IDs', async (t) => {
   const gateway = createApp({
     env: {
       NODE_ENV: 'test',
-      INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+      ...testInternalAuthEnv,
       JWT_SECRET: 'j'.repeat(32),
       JWT_ISSUER: 'issuer',
       JWT_AUDIENCE: 'audience',
@@ -140,7 +141,7 @@ function fixture() {
   const gateway = createApp({
     env: {
       NODE_ENV: 'test',
-      INTERNAL_SERVICE_SECRET: 'i'.repeat(32),
+      ...testInternalAuthEnv,
       JWT_SECRET: 'j'.repeat(32),
       JWT_ISSUER: 'issuer',
       JWT_AUDIENCE: 'audience',
