@@ -13,7 +13,8 @@ const document = {
   openapi: '3.0.3',
   info: { title: 'PICHU Vehicle Service', version: '0.1.0' },
   paths: {
-    '/health': { get: { summary: 'Estado del servicio' } },
+    '/health': { get: { summary: 'Liveness del servicio' } },
+    '/health/ready': { get: { summary: 'Readiness del servicio e índices críticos' } },
     '/vehicles': { get: { summary: 'Listar vehículos' }, post: { summary: 'Crear vehículo' } },
     '/vehicles/{vehicleId}': { get: { summary: 'Consultar vehículo' } },
     '/vehicles/{vehicleId}/invitations': { post: { summary: 'Crear invitación' } },
@@ -25,11 +26,11 @@ const document = {
 const requestExamples: Record<string, unknown> = {
   '/vehicles': {
     userId: '507f1f77bcf86cd799439011',
-    name: 'Mazda 3',
-    make: 'Mazda',
-    model: '3',
-    year: 2011,
-    engine: '2.0',
+    name: 'Daily Sedan',
+    make: 'Toyota',
+    model: 'Corolla',
+    year: 2020,
+    engine: '1.8 Hybrid',
   },
   '/vehicles/{vehicleId}/invitations': {
     inviterUserId: '507f1f77bcf86cd799439011',
@@ -39,27 +40,27 @@ const requestExamples: Record<string, unknown> = {
   '/invitations/{invitationId}/accept': { userId: '507f1f77bcf86cd799439012' },
   '/vehicles/{vehicleId}/devices/link': {
     userId: '507f1f77bcf86cd799439011',
-    deviceIdentifier: 'esp32-mazda-3',
+    deviceIdentifier: 'esp32-node-01',
     publicKey: '-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----',
   },
 };
+
 const paths = document.paths as unknown as Record<string, Record<string, Record<string, unknown>>>;
 const vehicleTags = [
-  { name: 'Health', description: 'Estado del servicio' },
-  { name: 'Vehicles', description: 'Vehículos y acceso del propietario' },
+  { name: 'Health', description: 'Estado y disponibilidad del servicio' },
+  { name: 'Vehicles', description: 'Vehículos y acceso aislado por recurso' },
   { name: 'Invitations', description: 'Invitaciones y membresías' },
-  { name: 'Devices', description: 'Vinculación de dispositivos' },
+  { name: 'Devices', description: 'Vinculación autorizada de dispositivos' },
 ];
 (document as unknown as { tags: typeof vehicleTags }).tags = vehicleTags;
 for (const [path, operations] of Object.entries(paths)) {
-  const tag =
-    path === '/health'
-      ? 'Health'
-      : path.includes('invitations')
-        ? 'Invitations'
-        : path.includes('/devices/')
-          ? 'Devices'
-          : 'Vehicles';
+  const tag = path.startsWith('/health')
+    ? 'Health'
+    : path.includes('invitations')
+      ? 'Invitations'
+      : path.includes('/devices/')
+        ? 'Devices'
+        : 'Vehicles';
   for (const operation of Object.values(operations)) operation.tags = [tag];
 }
 for (const operations of Object.values(paths))
@@ -109,13 +110,27 @@ const message = z.string();
 const error = result('Request failed', z.strictObject({ message }), { message: 'Invalid request' });
 const vehicleExample = {
   id: '507f1f77bcf86cd799439011',
-  name: 'Mazda 3',
-  make: 'Mazda',
-  model: '3',
-  year: 2011,
-  engine: '2.0',
+  name: 'Daily Sedan',
+  make: 'Toyota',
+  model: 'Corolla',
+  year: 2020,
+  engine: '1.8 Hybrid',
   ownerUserId: '507f1f77bcf86cd799439012',
 };
+
+paths['/health/ready'].get.responses = {
+  200: result(
+    'Service ready',
+    z.strictObject({ status: z.literal('ready'), service: z.literal('vehicle-service') }),
+    { status: 'ready', service: 'vehicle-service' },
+  ),
+  503: result(
+    'Service unready',
+    z.strictObject({ status: z.literal('unready'), service: z.literal('vehicle-service') }),
+    { status: 'unready', service: 'vehicle-service' },
+  ),
+};
+
 paths['/vehicles'].post.responses = {
   201: result(
     'Vehicle created',
@@ -179,6 +194,7 @@ paths['/vehicles/{vehicleId}/invitations'].post.responses = {
   400: error,
   401: error,
   404: error,
+  409: error,
   503: error,
 };
 paths['/invitations/{invitationId}/accept'].post.responses = {
@@ -207,6 +223,7 @@ paths['/invitations/{invitationId}/accept'].post.responses = {
   400: error,
   401: error,
   404: error,
+  409: error,
   500: error,
 };
 paths['/vehicles/{vehicleId}/devices/link'].post.responses = {
@@ -241,7 +258,7 @@ paths['/vehicles/{vehicleId}/devices/link'].post.responses = {
   503: error,
 };
 for (const [path, operations] of Object.entries(paths)) {
-  if (path === '/health') continue;
+  if (path.startsWith('/health')) continue;
   for (const operation of Object.values(operations)) {
     const responses = operation.responses as Record<string, unknown>;
     responses['403'] = result(

@@ -13,15 +13,17 @@ export const vehicleKey: KeyEntry = {
   notBefore: 1,
   notAfter: 8000000000000000,
 };
+
 export class TestNonceStore implements NonceStore {
   private readonly seen = new Set<string>();
   async assertReady(): Promise<void> {}
-  async reserve(input: NonceReservation, _signal: AbortSignal): Promise<'reserved' | 'replay'> {
+  async reserve(input: NonceReservation): Promise<'reserved' | 'replay'> {
     if (this.seen.has(input.nonce)) return 'replay';
     this.seen.add(input.nonce);
     return 'reserved';
   }
 }
+
 export function setupVehicleTestAuth(): VehicleAppDependencies {
   const entries = [
     {
@@ -45,15 +47,24 @@ export function setupVehicleTestAuth(): VehicleAppDependencies {
       state: 'active',
     },
   ];
+  process.env.NODE_ENV = 'test';
   process.env.INTERNAL_AUTH_ENVIRONMENT = 'test';
   process.env.INTERNAL_AUTH_KEYRING_JSON = JSON.stringify(entries);
   process.env.DATABASE_URL ??= 'mongodb://127.0.0.1:27017/test';
   return {
     internalAuth: { environment: 'test', keyring: [vehicleKey], nonces: new TestNonceStore() },
+    readinessCheck: async () => {},
   };
 }
-export function v2Headers(body: Buffer, method: string, target: string): Record<string, string> {
+
+export function v2Headers(
+  body: Buffer,
+  method: string,
+  target: string,
+  options: { deadlineMsFromNow?: number; requestId?: string; authorization?: string } = {},
+): Record<string, string> {
   const now = Date.now();
+  const deadline = now + (options.deadlineMsFromNow ?? 5000);
   const unsigned: InternalUnsignedHeadersV2 = {
     'x-internal-auth-version': '2',
     'x-service-name': 'api-gateway',
@@ -62,8 +73,9 @@ export function v2Headers(body: Buffer, method: string, target: string): Record<
     'x-contract-version': 'v1',
     'x-timestamp': String(now),
     'x-nonce': generateNonce(),
-    'x-request-id': `req-${generateNonce()}`,
-    'x-internal-deadline': String(now + 5000),
+    'x-request-id': options.requestId ?? `req-${generateNonce()}`,
+    'x-internal-deadline': String(deadline),
+    ...(options.authorization ? { authorization: options.authorization } : {}),
     ...(body.length ? { 'content-type': 'application/json' as const } : {}),
   };
   return {
@@ -75,6 +87,7 @@ export function v2Headers(body: Buffer, method: string, target: string): Record<
     }),
   };
 }
-export function createVehicleTestApp() {
-  return createApp(setupVehicleTestAuth());
+
+export function createVehicleTestApp(overrides: Partial<VehicleAppDependencies> = {}) {
+  return createApp({ ...setupVehicleTestAuth(), ...overrides });
 }
