@@ -1,4 +1,12 @@
-import mongoose, { type ClientSession, type Model, Types } from 'mongoose';
+import { createHash } from 'node:crypto';
+import mongoose, { type ClientSession, type Model, type PipelineStage, Types } from 'mongoose';
+import { z } from 'zod';
+import {
+  VEHICLE_MUTABLE_FIELDS,
+  VEHICLE_TEXT_LIMITS,
+  VEHICLE_YEAR_RANGE,
+  type VehicleMutableField,
+} from '@pichu/contracts';
 import { AccessGrantModel, type AccessGrant } from '../models/access-grant.model.js';
 import { InvitationModel, type Invitation } from '../models/invitation.model.js';
 import { MembershipModel, type Membership } from '../models/membership.model.js';
@@ -10,9 +18,11 @@ import {
   isKnownPermission,
   isOwnerReservedPermission,
   normalizeOptionalText,
+  MEMBERSHIP_ROLES,
   validatePermissionSet,
   type AccessGrantChannel,
   type AccessGrantScopeType,
+  type MembershipRole,
 } from '../models/vehicle-constants.js';
 import { VehicleModel, type Vehicle } from '../models/vehicle.model.js';
 
@@ -55,6 +65,16 @@ export interface CreateVehicleInput {
   transmission?: string | null;
   fuelType?: string | null;
 }
+
+/** Partial update: omitted fields are preserved and `null` clears an optional field. */
+export type UpdateVehicleInput = Partial<CreateVehicleInput>;
+
+type VehicleFieldChanges = Partial<
+  { name: string; year: number | null } & Record<VehicleOptionalTextField, string | null>
+>;
+
+type VehicleRecord = Vehicle & { _id: Types.ObjectId };
+type MembershipRecord = Membership & { _id: Types.ObjectId };
 
 const VERIFIED_RESOURCE_BINDING_BRAND: unique symbol = Symbol('VerifiedExternalResourceBinding');
 
@@ -210,56 +230,106 @@ async function createDocumentWithSession<TSchema>(
   return created[0]!;
 }
 
+type VehicleOptionalTextField = Exclude<VehicleMutableField, 'name' | 'year'>;
+
+const VEHICLE_OPTIONAL_TEXT_FIELDS: readonly VehicleOptionalTextField[] = [
+  'make',
+  'model',
+  'generation',
+  'trim',
+  'bodyStyle',
+  'engine',
+  'transmission',
+  'fuelType',
+];
+
+const mutableVehicleFieldSet = new Set<string>(VEHICLE_MUTABLE_FIELDS);
+
+function invalidVehicleField(field: string): VehicleServiceError {
+  return new VehicleServiceError('VALIDATION_ERROR', `Invalid vehicle ${field}`);
+}
+
+/** Control characters are rejected before trimming; empty or whitespace-only text is invalid. */
+function normalizeVehicleText(value: unknown, field: string, maxLength: number): string {
+  if (typeof value !== 'string' || containsControlCharacter(value)) {
+    throw invalidVehicleField(field);
+  }
+  const trimmed = value.trim();
+  if (trimmed.length < 1 || trimmed.length > maxLength) {
+    throw invalidVehicleField(field);
+  }
+  return trimmed;
+}
+
+function normalizeVehicleYear(value: unknown): number | null {
+  if (value === null) {
+    return null;
+  }
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < VEHICLE_YEAR_RANGE.min ||
+    value > VEHICLE_YEAR_RANGE.max
+  ) {
+    throw invalidVehicleField('year');
+  }
+  return value;
+}
+
+/**
+ * Shared create/update validation over the closed list of mutable fields. Omitted fields are
+ * not returned; `null` clears optional fields and is never accepted for `name`.
+ */
+function normalizeVehicleFields(input: object): VehicleFieldChanges {
+  const source = input as Record<string, unknown>;
+  for (const key of Object.keys(source)) {
+    if (!mutableVehicleFieldSet.has(key)) {
+      throw new VehicleServiceError('VALIDATION_ERROR', 'Unsupported vehicle field');
+    }
+  }
+
+  const changes: VehicleFieldChanges = {};
+  if (source.name !== undefined) {
+    changes.name = normalizeVehicleText(source.name, 'name', VEHICLE_TEXT_LIMITS.name);
+  }
+  for (const field of VEHICLE_OPTIONAL_TEXT_FIELDS) {
+    const raw = source[field];
+    if (raw !== undefined) {
+      changes[field] =
+        raw === null ? null : normalizeVehicleText(raw, field, VEHICLE_TEXT_LIMITS[field]);
+    }
+  }
+  if (source.year !== undefined) {
+    changes.year = normalizeVehicleYear(source.year);
+  }
+  return changes;
+}
+
 function validateCreateVehicleInput(input: CreateVehicleInput): Required<CreateVehicleInput> {
-  const trimmedName = typeof input.name === 'string' ? input.name.trim() : '';
-  if (trimmedName.length < 1 || trimmedName.length > 120 || containsControlCharacter(trimmedName)) {
-    throw new VehicleServiceError('VALIDATION_ERROR', 'Invalid vehicle name');
+  const changes = normalizeVehicleFields(input);
+  if (changes.name === undefined) {
+    throw invalidVehicleField('name');
   }
-
-  const optionalSpecs: Array<[keyof Omit<CreateVehicleInput, 'name' | 'year'>, number]> = [
-    ['make', 80],
-    ['model', 80],
-    ['generation', 60],
-    ['trim', 80],
-    ['bodyStyle', 60],
-    ['engine', 80],
-    ['transmission', 60],
-    ['fuelType', 60],
-  ];
-
-  const normalizedStrings: Record<string, string | null> = {};
-  for (const [field, maxLen] of optionalSpecs) {
-    const raw = input[field];
-    if (raw !== undefined && raw !== null && typeof raw !== 'string') {
-      throw new VehicleServiceError('VALIDATION_ERROR', `Invalid vehicle ${field}`);
-    }
-    const normalized = normalizeOptionalText(raw);
-    if (
-      normalized !== null &&
-      (normalized.length > maxLen || containsControlCharacter(normalized))
-    ) {
-      throw new VehicleServiceError('VALIDATION_ERROR', `Invalid vehicle ${field}`);
-    }
-    normalizedStrings[field] = normalized;
-  }
-
-  const year = input.year ?? null;
-  if (year !== null && (!Number.isInteger(year) || year < 1886 || year > 2100)) {
-    throw new VehicleServiceError('VALIDATION_ERROR', 'Invalid vehicle year');
-  }
-
   return {
-    name: trimmedName,
-    make: normalizedStrings.make ?? null,
-    model: normalizedStrings.model ?? null,
-    generation: normalizedStrings.generation ?? null,
-    trim: normalizedStrings.trim ?? null,
-    year,
-    bodyStyle: normalizedStrings.bodyStyle ?? null,
-    engine: normalizedStrings.engine ?? null,
-    transmission: normalizedStrings.transmission ?? null,
-    fuelType: normalizedStrings.fuelType ?? null,
+    name: changes.name,
+    make: changes.make ?? null,
+    model: changes.model ?? null,
+    generation: changes.generation ?? null,
+    trim: changes.trim ?? null,
+    year: changes.year ?? null,
+    bodyStyle: changes.bodyStyle ?? null,
+    engine: changes.engine ?? null,
+    transmission: changes.transmission ?? null,
+    fuelType: changes.fuelType ?? null,
   };
+}
+
+function validateUpdateVehicleInput(input: UpdateVehicleInput): VehicleFieldChanges {
+  const changes = normalizeVehicleFields(input);
+  if (Object.keys(changes).length === 0) {
+    throw new VehicleServiceError('VALIDATION_ERROR', 'At least one vehicle field is required');
+  }
+  return changes;
 }
 
 function validateOptionalAuditReason(reason: string | null | undefined): string | null {
@@ -276,6 +346,103 @@ function validateOptionalAuditReason(reason: string | null | undefined): string 
   return normalized;
 }
 
+const ACTIVE_MEMBERSHIP_CRITERIA = {
+  status: 'ACTIVE',
+  suspendedAt: null,
+  revokedAt: null,
+} as const;
+
+/**
+ * Canonical ownership invariant: Vehicle.ownerUserId MUST match exactly one ACTIVE,
+ * unrevoked, unsuspended OWNER Membership. `ownerMemberships` must contain every unrevoked
+ * OWNER membership of the vehicle.
+ */
+function isCanonicalOwnershipConsistent(
+  vehicle: VehicleRecord,
+  ownerMemberships: readonly MembershipRecord[],
+): boolean {
+  const ownerRecord = ownerMemberships[0];
+  return (
+    ownerMemberships.length === 1 &&
+    ownerRecord !== undefined &&
+    ownerRecord.status === 'ACTIVE' &&
+    ownerRecord.suspendedAt === null &&
+    ownerRecord.revokedAt === null &&
+    ownerRecord.userId.equals(vehicle.ownerUserId)
+  );
+}
+
+function auditOwnershipInconsistency(
+  audit: VehicleAuditLogger,
+  vehicleId: Types.ObjectId,
+  actorUserId: Types.ObjectId | undefined,
+): void {
+  audit({
+    action: 'vehicle.ownership_inconsistency',
+    actorUserId: actorUserId ? String(actorUserId) : 'system',
+    vehicleId: String(vehicleId),
+    outcome: 'denied',
+    reason: 'canonical_owner_mismatch',
+  });
+}
+
+async function loadOwnerMembershipsByVehicle(
+  vehicleIds: readonly Types.ObjectId[],
+  session?: ClientSession,
+): Promise<Map<string, MembershipRecord[]>> {
+  const ownersByVehicle = new Map<string, MembershipRecord[]>();
+  if (vehicleIds.length === 0) {
+    return ownersByVehicle;
+  }
+  const owners = (await MembershipModel.find({
+    vehicleId: { $in: vehicleIds },
+    role: 'OWNER',
+    revokedAt: null,
+  })
+    .session(session ?? null)
+    .lean()) as MembershipRecord[];
+  for (const owner of owners) {
+    const key = String(owner.vehicleId);
+    const group = ownersByVehicle.get(key) ?? [];
+    group.push(owner);
+    ownersByVehicle.set(key, group);
+  }
+  return ownersByVehicle;
+}
+
+/**
+ * Loads a vehicle in any lifecycle state and verifies canonical ownership consistency.
+ * Any discrepancy fails closed and returns null.
+ */
+async function loadVerifiedVehicle(
+  vehicleId: Types.ObjectId,
+  options: {
+    status?: Vehicle['status'];
+    session?: ClientSession;
+    audit?: VehicleAuditLogger;
+    actorUserId?: Types.ObjectId;
+  } = {},
+): Promise<VehicleRecord | null> {
+  const audit = options.audit ?? defaultAuditLogger;
+  const vehicle = (await VehicleModel.findOne({
+    _id: vehicleId,
+    ...(options.status ? { status: options.status } : {}),
+  })
+    .session(options.session ?? null)
+    .lean()) as VehicleRecord | null;
+  if (!vehicle) {
+    return null;
+  }
+
+  const ownersByVehicle = await loadOwnerMembershipsByVehicle([vehicleId], options.session);
+  if (!isCanonicalOwnershipConsistent(vehicle, ownersByVehicle.get(String(vehicleId)) ?? [])) {
+    auditOwnershipInconsistency(audit, vehicleId, options.actorUserId);
+    return null;
+  }
+
+  return vehicle;
+}
+
 /**
  * Loads an ACTIVE vehicle and verifies canonical ownership consistency:
  * Vehicle.ownerUserId MUST match a single ACTIVE, unrevoked, unsuspended OWNER Membership.
@@ -288,50 +455,8 @@ export async function loadVerifiedActiveVehicle(
     audit?: VehicleAuditLogger;
     actorUserId?: Types.ObjectId;
   } = {},
-): Promise<(Vehicle & { _id: Types.ObjectId }) | null> {
-  const audit = options.audit ?? defaultAuditLogger;
-  const vehicleQuery = VehicleModel.findOne({ _id: vehicleId, status: 'ACTIVE' });
-  if (options.session) {
-    vehicleQuery.session(options.session);
-  }
-  const vehicle = (await vehicleQuery.lean()) as (Vehicle & { _id: Types.ObjectId }) | null;
-  if (!vehicle) {
-    return null;
-  }
-
-  const ownerMembershipsQuery = MembershipModel.find({
-    vehicleId,
-    role: 'OWNER',
-    revokedAt: null,
-  });
-  if (options.session) {
-    ownerMembershipsQuery.session(options.session);
-  }
-  const ownerMemberships = (await ownerMembershipsQuery.lean()) as Array<
-    Membership & { _id: Types.ObjectId }
-  >;
-
-  const ownerRecord = ownerMemberships[0];
-  const isConsistent =
-    ownerMemberships.length === 1 &&
-    ownerRecord !== undefined &&
-    ownerRecord.status === 'ACTIVE' &&
-    ownerRecord.suspendedAt === null &&
-    ownerRecord.revokedAt === null &&
-    ownerRecord.userId.equals(vehicle.ownerUserId);
-
-  if (!isConsistent) {
-    audit({
-      action: 'vehicle.ownership_inconsistency',
-      actorUserId: options.actorUserId ? String(options.actorUserId) : 'system',
-      vehicleId: String(vehicleId),
-      outcome: 'denied',
-      reason: 'canonical_owner_mismatch',
-    });
-    return null;
-  }
-
-  return vehicle;
+): Promise<VehicleRecord | null> {
+  return loadVerifiedVehicle(vehicleId, { ...options, status: 'ACTIVE' });
 }
 
 /**
@@ -370,31 +495,11 @@ async function lockVerifiedActiveVehicle(
     return null;
   }
 
-  const ownerMemberships = (await MembershipModel.find({
-    vehicleId,
-    role: 'OWNER',
-    revokedAt: null,
-  })
-    .session(session)
-    .lean()) as Array<Membership & { _id: Types.ObjectId }>;
-
+  const ownerMemberships =
+    (await loadOwnerMembershipsByVehicle([vehicleId], session)).get(String(vehicleId)) ?? [];
   const ownerRecord = ownerMemberships[0];
-  const isConsistent =
-    ownerMemberships.length === 1 &&
-    ownerRecord !== undefined &&
-    ownerRecord.status === 'ACTIVE' &&
-    ownerRecord.suspendedAt === null &&
-    ownerRecord.revokedAt === null &&
-    ownerRecord.userId.equals(lockedVehicle.ownerUserId);
-
-  if (!isConsistent) {
-    audit({
-      action: 'vehicle.ownership_inconsistency',
-      actorUserId: options.actorUserId ? String(options.actorUserId) : 'system',
-      vehicleId: String(vehicleId),
-      outcome: 'denied',
-      reason: 'canonical_owner_mismatch',
-    });
+  if (!ownerRecord || !isCanonicalOwnershipConsistent(lockedVehicle, ownerMemberships)) {
+    auditOwnershipInconsistency(audit, vehicleId, options.actorUserId);
     return null;
   }
 
@@ -518,72 +623,24 @@ export async function evaluateVehiclePermission(
   const membership = (await MembershipModel.findOne({
     vehicleId: input.vehicleId,
     userId: input.userId,
-    status: 'ACTIVE',
-    suspendedAt: null,
-    revokedAt: null,
-  }).lean()) as (Membership & { _id: Types.ObjectId }) | null;
+    ...ACTIVE_MEMBERSHIP_CRITERIA,
+  }).lean()) as MembershipRecord | null;
 
-  if (!membership) {
-    return { allowed: false, reason: 'MEMBERSHIP_INACTIVE_OR_MISSING' };
+  const request: PermissionRequest = {
+    permission: input.permission,
+    scopeType,
+    scopeResourceId,
+    channel,
+  };
+  const decision = decideMembershipPermission(vehicle, membership, input.userId, request);
+  if (decision.kind === 'DECIDED') {
+    return decision.result;
   }
-
-  if (membership.role === 'OWNER') {
-    if (!vehicle.ownerUserId.equals(input.userId)) {
-      return { allowed: false, reason: 'OWNERSHIP_MISMATCH' };
-    }
-    if (channel === 'BLE_OFFLINE') {
-      return { allowed: false, reason: 'BLE_OWNER_GRANT_REQUIRED' };
-    }
-    return {
-      allowed: true,
-      reason: 'ALLOWED',
-      source: 'OWNER_ROLE',
-      membershipId: membership._id,
-    };
-  }
-
-  if (vehicle.ownerUserId.equals(input.userId)) {
-    // Owner without OWNER role indicates corrupted state; fail closed.
-    return { allowed: false, reason: 'OWNERSHIP_MISMATCH' };
-  }
-
-  if (isOwnerReservedPermission(input.permission)) {
-    return { allowed: false, reason: 'OWNER_PERMISSION_FORBIDDEN' };
-  }
-
-  if (
-    scopeType === 'VEHICLE' &&
-    channel === 'ONLINE' &&
-    membership.permissions.includes(input.permission)
-  ) {
-    return {
-      allowed: true,
-      reason: 'ALLOWED',
-      source: 'MEMBERSHIP_PERMISSION',
-      membershipId: membership._id,
-    };
-  }
-
-  if (!isAccessGrantPermissionForScope(scopeType, input.permission)) {
-    return { allowed: false, reason: 'PERMISSION_NOT_GRANTED' };
-  }
-
-  const allowedChannels: AccessGrantChannel[] =
-    channel === 'BLE_OFFLINE' ? ['BLE_OFFLINE', 'ANY'] : ['ONLINE', 'ANY'];
 
   const grant = (await AccessGrantModel.findOne({
     vehicleId: input.vehicleId,
-    membershipId: membership._id,
-    subjectUserId: input.userId,
-    scopeType,
-    scopeResourceId: scopeType === 'VEHICLE' ? null : scopeResourceId,
-    channel: { $in: allowedChannels },
-    status: 'ACTIVE',
-    revokedAt: null,
-    expiredAt: null,
-    startsAt: { $lte: now },
-    $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
-    permissions: input.permission,
+    membershipId: decision.membershipId,
+    ...activeAccessGrantCriteria(input.userId, request, now),
   }).lean()) as (AccessGrant & { _id: Types.ObjectId }) | null;
 
   if (!grant) {
@@ -594,9 +651,183 @@ export async function evaluateVehiclePermission(
     allowed: true,
     reason: 'ALLOWED',
     source: 'ACCESS_GRANT',
-    membershipId: membership._id,
+    membershipId: decision.membershipId,
     grantId: grant._id,
   };
+}
+
+interface PermissionRequest {
+  permission: string;
+  scopeType: AccessGrantScopeType;
+  scopeResourceId: Types.ObjectId | null;
+  channel: 'ONLINE' | 'BLE_OFFLINE';
+}
+
+type MembershipPermissionDecision =
+  | { kind: 'DECIDED'; result: PermissionEvaluationResult }
+  | { kind: 'ACCESS_GRANT_REQUIRED'; membershipId: Types.ObjectId };
+
+/**
+ * Single source of truth for membership-level authorization over an already verified,
+ * ownership-consistent ACTIVE vehicle. When only an AccessGrant can still authorize the
+ * request, the caller must look it up with `activeAccessGrantCriteria`.
+ */
+function decideMembershipPermission(
+  vehicle: VehicleRecord,
+  membership: MembershipRecord | null,
+  userId: Types.ObjectId,
+  request: PermissionRequest,
+): MembershipPermissionDecision {
+  const decided = (result: PermissionEvaluationResult): MembershipPermissionDecision => ({
+    kind: 'DECIDED',
+    result,
+  });
+
+  if (!membership) {
+    return decided({ allowed: false, reason: 'MEMBERSHIP_INACTIVE_OR_MISSING' });
+  }
+
+  if (membership.role === 'OWNER') {
+    if (!vehicle.ownerUserId.equals(userId)) {
+      return decided({ allowed: false, reason: 'OWNERSHIP_MISMATCH' });
+    }
+    if (request.channel === 'BLE_OFFLINE') {
+      return decided({ allowed: false, reason: 'BLE_OWNER_GRANT_REQUIRED' });
+    }
+    return decided({
+      allowed: true,
+      reason: 'ALLOWED',
+      source: 'OWNER_ROLE',
+      membershipId: membership._id,
+    });
+  }
+
+  if (vehicle.ownerUserId.equals(userId)) {
+    // Owner without OWNER role indicates corrupted state; fail closed.
+    return decided({ allowed: false, reason: 'OWNERSHIP_MISMATCH' });
+  }
+
+  if (isOwnerReservedPermission(request.permission)) {
+    return decided({ allowed: false, reason: 'OWNER_PERMISSION_FORBIDDEN' });
+  }
+
+  if (
+    request.scopeType === 'VEHICLE' &&
+    request.channel === 'ONLINE' &&
+    membership.permissions.includes(request.permission)
+  ) {
+    return decided({
+      allowed: true,
+      reason: 'ALLOWED',
+      source: 'MEMBERSHIP_PERMISSION',
+      membershipId: membership._id,
+    });
+  }
+
+  if (!isAccessGrantPermissionForScope(request.scopeType, request.permission)) {
+    return decided({ allowed: false, reason: 'PERMISSION_NOT_GRANTED' });
+  }
+
+  return { kind: 'ACCESS_GRANT_REQUIRED', membershipId: membership._id };
+}
+
+/** AccessGrant filter shared by single and batched evaluation (vehicle/membership excluded). */
+function activeAccessGrantCriteria(userId: Types.ObjectId, request: PermissionRequest, now: Date) {
+  const allowedChannels: AccessGrantChannel[] =
+    request.channel === 'BLE_OFFLINE' ? ['BLE_OFFLINE', 'ANY'] : ['ONLINE', 'ANY'];
+  return {
+    subjectUserId: userId,
+    scopeType: request.scopeType,
+    scopeResourceId: request.scopeType === 'VEHICLE' ? null : request.scopeResourceId,
+    channel: { $in: allowedChannels },
+    status: 'ACTIVE' as const,
+    revokedAt: null,
+    expiredAt: null,
+    startsAt: { $lte: now },
+    $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
+    permissions: request.permission,
+  };
+}
+
+/**
+ * Effective online read access to a vehicle: canonical OWNER, or MEMBER holding
+ * `vehicle:read` / `vehicle:manage` directly, or a current VEHICLE-scoped ONLINE/ANY
+ * AccessGrant with `vehicle:read` bound to the current membership. DEVICE, MODULE, and
+ * BLE_OFFLINE grants never confer vehicle read access.
+ */
+const VEHICLE_READ_PERMISSIONS = ['vehicle:read', 'vehicle:manage'] as const;
+
+interface VehicleAccessCandidate {
+  vehicle: VehicleRecord;
+  membership: MembershipRecord;
+}
+
+/**
+ * Batched read authorization over ownership-consistent ACTIVE vehicles. Applies the same
+ * `decideMembershipPermission` / `activeAccessGrantCriteria` rules as
+ * `evaluateVehiclePermission`, with at most one AccessGrant query per read permission.
+ * Input order is preserved.
+ */
+async function filterReadableVehicleCandidates(
+  userId: Types.ObjectId,
+  candidates: readonly VehicleAccessCandidate[],
+  now: Date,
+  session?: ClientSession,
+): Promise<VehicleAccessCandidate[]> {
+  const readable = new Set<VehicleAccessCandidate>();
+  const pendingByPermission = new Map<string, VehicleAccessCandidate[]>();
+
+  for (const candidate of candidates) {
+    for (const permission of VEHICLE_READ_PERMISSIONS) {
+      const decision = decideMembershipPermission(candidate.vehicle, candidate.membership, userId, {
+        permission,
+        scopeType: 'VEHICLE',
+        scopeResourceId: null,
+        channel: 'ONLINE',
+      });
+      if (decision.kind === 'DECIDED') {
+        if (decision.result.allowed) {
+          readable.add(candidate);
+          break;
+        }
+        continue;
+      }
+      const pending = pendingByPermission.get(permission) ?? [];
+      pending.push(candidate);
+      pendingByPermission.set(permission, pending);
+    }
+  }
+
+  for (const [permission, pending] of pendingByPermission) {
+    const unresolved = pending.filter((candidate) => !readable.has(candidate));
+    if (unresolved.length === 0) {
+      continue;
+    }
+    const grants = (await AccessGrantModel.find(
+      {
+        vehicleId: { $in: unresolved.map((candidate) => candidate.vehicle._id) },
+        membershipId: { $in: unresolved.map((candidate) => candidate.membership._id) },
+        ...activeAccessGrantCriteria(
+          userId,
+          { permission, scopeType: 'VEHICLE', scopeResourceId: null, channel: 'ONLINE' },
+          now,
+        ),
+      },
+      { vehicleId: 1, membershipId: 1 },
+    )
+      .session(session ?? null)
+      .lean()) as Array<Pick<AccessGrant, 'vehicleId' | 'membershipId'>>;
+    const grantKeys = new Set(
+      grants.map((grant) => `${String(grant.vehicleId)}:${String(grant.membershipId)}`),
+    );
+    for (const candidate of unresolved) {
+      if (grantKeys.has(`${String(candidate.vehicle._id)}:${String(candidate.membership._id)}`)) {
+        readable.add(candidate);
+      }
+    }
+  }
+
+  return candidates.filter((candidate) => readable.has(candidate));
 }
 
 export async function canAccessVehicle(
@@ -677,145 +908,446 @@ export async function listOwnedVehicles(
     return [];
   }
 
-  const vehicleIds = candidates.map((vehicle) => vehicle._id);
-  const ownerMemberships = (await MembershipModel.find({
-    vehicleId: { $in: vehicleIds },
-    role: 'OWNER',
-    revokedAt: null,
-  }).lean()) as Array<Membership & { _id: Types.ObjectId }>;
+  const ownersByVehicle = await loadOwnerMembershipsByVehicle(
+    candidates.map((vehicle) => vehicle._id),
+  );
+  return candidates.filter(
+    (vehicle) =>
+      vehicle.ownerUserId.equals(userId) &&
+      isCanonicalOwnershipConsistent(vehicle, ownersByVehicle.get(String(vehicle._id)) ?? []),
+  );
+}
 
-  const ownersByVehicle = new Map<string, Array<Membership & { _id: Types.ObjectId }>>();
-  for (const membership of ownerMemberships) {
-    const key = String(membership.vehicleId);
-    const group = ownersByVehicle.get(key) ?? [];
-    group.push(membership);
-    ownersByVehicle.set(key, group);
-  }
+export const DEFAULT_VEHICLE_PAGE_LIMIT = 20;
+export const MAX_VEHICLE_PAGE_LIMIT = 100;
+const MAX_VEHICLE_CURSOR_LENGTH = 256;
+const VEHICLE_CURSOR_VERSION = 1;
 
-  return candidates.filter((vehicle) => {
-    const owners = ownersByVehicle.get(String(vehicle._id)) ?? [];
-    const owner = owners[0];
-    return (
-      owners.length === 1 &&
-      owner !== undefined &&
-      owner.status === 'ACTIVE' &&
-      owner.suspendedAt === null &&
-      owner.revokedAt === null &&
-      owner.userId.equals(userId)
-    );
-  });
+type VehicleListRoleFilter = MembershipRole | 'ALL';
+
+interface VehicleListPosition {
+  createdAt: Date;
+  vehicleId: Types.ObjectId;
+}
+
+const vehicleListCursorPayloadSchema = z.strictObject({
+  v: z.literal(VEHICLE_CURSOR_VERSION),
+  u: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
+  r: z.enum(['ALL', ...MEMBERSHIP_ROLES]),
+  c: z.string().max(32),
+  i: z.string().regex(/^[a-f0-9]{24}$/),
+});
+
+/** Binds a cursor to its user without exposing the raw identifier. Not a secret. */
+function vehicleCursorUserBinding(userId: Types.ObjectId): string {
+  return createHash('sha256')
+    .update(`pichu:vehicle-list-cursor:v${VEHICLE_CURSOR_VERSION}:${String(userId)}`)
+    .digest('base64url')
+    .slice(0, 22);
+}
+
+function invalidVehicleCursor(): VehicleServiceError {
+  return new VehicleServiceError('VALIDATION_ERROR', 'Invalid pagination cursor');
 }
 
 /**
- * Prepared domain query returning all ACTIVE, ownership-consistent vehicles
- * where the user holds an ACTIVE Membership (OWNER or MEMBER), isolated per vehicle.
+ * Keyset cursor `(vehicle.createdAt, vehicle._id)` encoded as base64url JSON. It is neither
+ * encrypted nor signed and never grants access: authorization is re-evaluated on each page.
  */
-export async function listAccessibleVehicles(userId: Types.ObjectId): Promise<
-  Array<{
-    vehicle: Vehicle & { _id: Types.ObjectId };
-    membership: Membership & { _id: Types.ObjectId };
-  }>
-> {
-  const activeMemberships = (await MembershipModel.find({
+function encodeVehicleListCursor(
+  userId: Types.ObjectId,
+  role: VehicleListRoleFilter,
+  position: VehicleListPosition,
+): string {
+  const payload = {
+    v: VEHICLE_CURSOR_VERSION,
+    u: vehicleCursorUserBinding(userId),
+    r: role,
+    c: position.createdAt.toISOString(),
+    i: String(position.vehicleId),
+  };
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+}
+
+function decodeVehicleListCursor(
+  cursor: string,
+  userId: Types.ObjectId,
+  role: VehicleListRoleFilter,
+): VehicleListPosition {
+  if (
+    typeof cursor !== 'string' ||
+    cursor.length < 1 ||
+    cursor.length > MAX_VEHICLE_CURSOR_LENGTH ||
+    !/^[A-Za-z0-9_-]+$/.test(cursor)
+  ) {
+    throw invalidVehicleCursor();
+  }
+  const bytes = Buffer.from(cursor, 'base64url');
+  if (bytes.toString('base64url') !== cursor) {
+    throw invalidVehicleCursor();
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch {
+    throw invalidVehicleCursor();
+  }
+  const parsed = vehicleListCursorPayloadSchema.safeParse(decoded);
+  if (!parsed.success) {
+    throw invalidVehicleCursor();
+  }
+  const createdAt = new Date(parsed.data.c);
+  if (Number.isNaN(createdAt.getTime()) || createdAt.toISOString() !== parsed.data.c) {
+    throw invalidVehicleCursor();
+  }
+  if (parsed.data.u !== vehicleCursorUserBinding(userId) || parsed.data.r !== role) {
+    throw invalidVehicleCursor();
+  }
+  return { createdAt, vehicleId: Types.ObjectId.createFromHexString(parsed.data.i) };
+}
+
+export interface ListAccessibleVehiclesOptions {
+  limit?: number;
+  cursor?: string;
+  role?: MembershipRole;
+  now?: Date;
+}
+
+export interface AccessibleVehicle {
+  vehicle: VehicleRecord;
+  membership: MembershipRecord;
+  role: MembershipRole;
+}
+
+export interface AccessibleVehiclePage {
+  items: AccessibleVehicle[];
+  nextCursor: string | null;
+}
+
+interface MembershipWithVehicle extends MembershipRecord {
+  vehicle: VehicleRecord;
+}
+
+/** Upper bound for one scan batch when discarded entries force the batch to grow. */
+const MAX_VEHICLE_SCAN_BATCH = 4 * MAX_VEHICLE_PAGE_LIMIT + 1;
+
+/**
+ * Server-side scan of the user's memberships ordered by `(vehicle.createdAt, vehicle._id)`.
+ * Besides the keyset, it applies a read prefilter that is never stricter than
+ * `decideMembershipPermission` + `activeAccessGrantCriteria` (the final decision is still
+ * made in `filterReadableVehicleCandidates`), so entries are only discarded after the scan
+ * on concurrent changes or corrupted ownership.
+ */
+function accessibleVehicleBatchPipeline(
+  userId: Types.ObjectId,
+  role: VehicleListRoleFilter,
+  position: VehicleListPosition | null,
+  batchSize: number,
+  now: Date,
+): PipelineStage[] {
+  return [
+    // membership_user_status_vehicle_idx { userId, status, vehicleId }
+    {
+      $match: {
+        userId,
+        ...ACTIVE_MEMBERSHIP_CRITERIA,
+        ...(role === 'ALL' ? {} : { role }),
+      },
+    },
+    // Primary-key lookup per membership; only ACTIVE vehicles with a valid keyset timestamp.
+    {
+      $lookup: {
+        from: VehicleModel.collection.collectionName,
+        localField: 'vehicleId',
+        foreignField: '_id',
+        pipeline: [{ $match: { status: 'ACTIVE', createdAt: { $type: 'date' } } }],
+        as: 'vehicle',
+      },
+    },
+    { $unwind: '$vehicle' },
+    ...(position
+      ? [
+          {
+            $match: {
+              $or: [
+                { 'vehicle.createdAt': { $gt: position.createdAt } },
+                {
+                  'vehicle.createdAt': position.createdAt,
+                  'vehicle._id': { $gt: position.vehicleId },
+                },
+              ],
+            },
+          },
+        ]
+      : []),
+    // OWNER memberships require vehicle.ownerUserId === userId; MEMBER ones require the opposite.
+    {
+      $match: {
+        $expr: {
+          $cond: [
+            { $eq: ['$role', 'OWNER'] },
+            { $eq: ['$vehicle.ownerUserId', '$userId'] },
+            { $ne: ['$vehicle.ownerUserId', '$userId'] },
+          ],
+        },
+      },
+    },
+    // access_grant_membership_status_idx { membershipId, status }; at most one grant per entry.
+    {
+      $lookup: {
+        from: AccessGrantModel.collection.collectionName,
+        localField: '_id',
+        foreignField: 'membershipId',
+        pipeline: [
+          {
+            $match: {
+              status: 'ACTIVE',
+              scopeType: 'VEHICLE',
+              channel: { $in: ['ONLINE', 'ANY'] },
+              permissions: { $in: [...VEHICLE_READ_PERMISSIONS] },
+              revokedAt: null,
+              expiredAt: null,
+              startsAt: { $lte: now },
+              $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
+            },
+          },
+          { $limit: 1 },
+          { $project: { _id: 1 } },
+        ],
+        as: 'readGrantProbe',
+      },
+    },
+    {
+      $match: {
+        $or: [
+          { role: 'OWNER' },
+          { permissions: { $in: [...VEHICLE_READ_PERMISSIONS] } },
+          { 'readGrantProbe.0': { $exists: true } },
+        ],
+      },
+    },
+    // $sort followed by $limit is a bounded top-k sort (batchSize documents in memory).
+    { $sort: { 'vehicle.createdAt': 1, 'vehicle._id': 1 } },
+    { $limit: batchSize },
+    { $project: { readGrantProbe: 0 } },
+  ];
+}
+
+/**
+ * Keyset-paginated list of ACTIVE, ownership-consistent vehicles the user can read, ordered by
+ * `vehicle.createdAt ASC, vehicle._id ASC`. Memberships are scanned server-side in bounded
+ * batches (`limit + 1`, doubling up to `MAX_VEHICLE_SCAN_BATCH` only after discards) with a
+ * constant number of queries per batch; inconsistent or unreadable entries are skipped and
+ * the next cursor is the last delivered authorized vehicle.
+ * Pages are not an immutable snapshot: concurrent changes between pages are reflected.
+ */
+export async function listAccessibleVehicles(
+  userId: Types.ObjectId,
+  options: ListAccessibleVehiclesOptions = {},
+): Promise<AccessibleVehiclePage> {
+  const limit = options.limit ?? DEFAULT_VEHICLE_PAGE_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_VEHICLE_PAGE_LIMIT) {
+    throw new VehicleServiceError('VALIDATION_ERROR', 'Invalid pagination limit');
+  }
+  if (options.role !== undefined && !MEMBERSHIP_ROLES.includes(options.role)) {
+    throw new VehicleServiceError('VALIDATION_ERROR', 'Invalid role filter');
+  }
+  const role: VehicleListRoleFilter = options.role ?? 'ALL';
+  let position =
+    options.cursor === undefined ? null : decodeVehicleListCursor(options.cursor, userId, role);
+  const now = options.now ?? new Date();
+  let batchSize = limit + 1;
+  const authorized: AccessibleVehicle[] = [];
+
+  while (authorized.length <= limit) {
+    const batch = await MembershipModel.aggregate<MembershipWithVehicle>(
+      accessibleVehicleBatchPipeline(userId, role, position, batchSize, now),
+    );
+    if (batch.length === 0) {
+      break;
+    }
+
+    const ownersByVehicle = await loadOwnerMembershipsByVehicle(
+      batch.map((entry) => entry.vehicle._id),
+    );
+    const consistent: VehicleAccessCandidate[] = [];
+    for (const { vehicle, ...membership } of batch) {
+      if (isCanonicalOwnershipConsistent(vehicle, ownersByVehicle.get(String(vehicle._id)) ?? [])) {
+        consistent.push({ vehicle, membership });
+      }
+    }
+    const readable = await filterReadableVehicleCandidates(userId, consistent, now);
+    for (const candidate of readable) {
+      authorized.push({ ...candidate, role: candidate.membership.role });
+    }
+
+    const lastScanned = batch[batch.length - 1]!;
+    position = { createdAt: lastScanned.vehicle.createdAt, vehicleId: lastScanned.vehicle._id };
+    if (batch.length < batchSize) {
+      break;
+    }
+    if (readable.length < batch.length) {
+      batchSize = Math.min(batchSize * 2, MAX_VEHICLE_SCAN_BATCH);
+    }
+  }
+
+  const items = authorized.slice(0, limit);
+  const lastDelivered = items[items.length - 1];
+  const nextCursor =
+    authorized.length > limit && lastDelivered
+      ? encodeVehicleListCursor(userId, role, {
+          createdAt: lastDelivered.vehicle.createdAt,
+          vehicleId: lastDelivered.vehicle._id,
+        })
+      : null;
+  return { items, nextCursor };
+}
+
+/**
+ * Relationship between an actor and a vehicle, resolved fail-closed. Inexistent,
+ * ownership-inconsistent, and non-readable vehicles all collapse into `NONE`.
+ */
+type VehicleRelation =
+  | { kind: 'OWNER'; vehicle: VehicleRecord; membership: MembershipRecord }
+  | { kind: 'READER'; vehicle: VehicleRecord; membership: MembershipRecord }
+  | { kind: 'ARCHIVED_OWNER'; vehicle: VehicleRecord }
+  | { kind: 'NONE' };
+
+async function resolveVehicleRelation(
+  vehicleId: Types.ObjectId,
+  userId: Types.ObjectId,
+  options: { now?: Date; audit?: VehicleAuditLogger } = {},
+): Promise<VehicleRelation> {
+  const vehicle = await loadVerifiedVehicle(vehicleId, {
+    audit: options.audit,
+    actorUserId: userId,
+  });
+  if (!vehicle) {
+    return { kind: 'NONE' };
+  }
+  if (vehicle.status === 'ARCHIVED') {
+    return vehicle.ownerUserId.equals(userId)
+      ? { kind: 'ARCHIVED_OWNER', vehicle }
+      : { kind: 'NONE' };
+  }
+  if (vehicle.status !== 'ACTIVE') {
+    return { kind: 'NONE' };
+  }
+
+  const membership = (await MembershipModel.findOne({
+    vehicleId,
     userId,
-    status: 'ACTIVE',
-    suspendedAt: null,
-    revokedAt: null,
-  }).lean()) as Array<Membership & { _id: Types.ObjectId }>;
-
-  if (activeMemberships.length === 0) {
-    return [];
+    ...ACTIVE_MEMBERSHIP_CRITERIA,
+  }).lean()) as MembershipRecord | null;
+  if (!membership) {
+    return { kind: 'NONE' };
   }
-
-  const vehicleIds = activeMemberships.map((membership) => membership.vehicleId);
-  const [vehicles, ownerMemberships] = await Promise.all([
-    VehicleModel.find({ _id: { $in: vehicleIds }, status: 'ACTIVE' })
-      .sort({ createdAt: 1, _id: 1 })
-      .lean() as Promise<Array<Vehicle & { _id: Types.ObjectId }>>,
-    MembershipModel.find({
-      vehicleId: { $in: vehicleIds },
-      role: 'OWNER',
-      revokedAt: null,
-    }).lean() as Promise<Array<Membership & { _id: Types.ObjectId }>>,
-  ]);
-
-  const membershipByVehicle = new Map<string, Membership & { _id: Types.ObjectId }>();
-  for (const membership of activeMemberships) {
-    membershipByVehicle.set(String(membership.vehicleId), membership);
+  const [readable] = await filterReadableVehicleCandidates(
+    userId,
+    [{ vehicle, membership }],
+    options.now ?? new Date(),
+  );
+  if (!readable) {
+    return { kind: 'NONE' };
   }
+  return membership.role === 'OWNER'
+    ? { kind: 'OWNER', vehicle, membership }
+    : { kind: 'READER', vehicle, membership };
+}
 
-  const ownersByVehicle = new Map<string, Array<Membership & { _id: Types.ObjectId }>>();
-  for (const owner of ownerMemberships) {
-    const key = String(owner.vehicleId);
-    const list = ownersByVehicle.get(key) ?? [];
-    list.push(owner);
-    ownersByVehicle.set(key, list);
+type OwnerMutationAction = 'vehicle.update' | 'vehicle.archive';
+
+/**
+ * Central translation of non-owner relations into domain errors for owner-only mutations:
+ * no visibility → NOT_FOUND, legitimate reader → FORBIDDEN, archived owner → CONFLICT.
+ * Ownership inconsistencies are never disclosed.
+ */
+function denyOwnerMutation(
+  relation: Exclude<VehicleRelation, { kind: 'OWNER' }>,
+  context: {
+    action: OwnerMutationAction;
+    vehicleId: Types.ObjectId;
+    actorUserId: Types.ObjectId;
+    audit: VehicleAuditLogger;
+  },
+): never {
+  const error =
+    relation.kind === 'READER'
+      ? new VehicleServiceError(
+          'FORBIDDEN',
+          'Only the canonical vehicle owner may perform this operation',
+        )
+      : relation.kind === 'ARCHIVED_OWNER'
+        ? new VehicleServiceError('CONFLICT', 'Archived vehicles cannot be modified')
+        : new VehicleServiceError('NOT_FOUND', 'Vehicle not found');
+  context.audit({
+    action: context.action,
+    actorUserId: String(context.actorUserId),
+    vehicleId: String(context.vehicleId),
+    outcome: error.code === 'CONFLICT' ? 'conflict' : 'denied',
+    reason: relation.kind === 'READER' ? 'not_canonical_owner' : relation.kind.toLowerCase(),
+  });
+  throw error;
+}
+
+/**
+ * Detail lookup with effective read authorization. Inexistent, archived, inconsistent, and
+ * non-readable vehicles uniformly raise NOT_FOUND.
+ */
+export async function getAccessibleVehicle(
+  vehicleId: Types.ObjectId,
+  userId: Types.ObjectId,
+  options: { now?: Date; audit?: VehicleAuditLogger } = {},
+): Promise<AccessibleVehicle> {
+  const relation = await resolveVehicleRelation(vehicleId, userId, options);
+  if (relation.kind !== 'OWNER' && relation.kind !== 'READER') {
+    throw new VehicleServiceError('NOT_FOUND', 'Vehicle not found');
   }
-
-  const accessible: Array<{
-    vehicle: Vehicle & { _id: Types.ObjectId };
-    membership: Membership & { _id: Types.ObjectId };
-  }> = [];
-
-  for (const vehicle of vehicles) {
-    const key = String(vehicle._id);
-    const membership = membershipByVehicle.get(key);
-    const owners = ownersByVehicle.get(key) ?? [];
-    const owner = owners[0];
-    if (
-      !membership ||
-      owners.length !== 1 ||
-      !owner ||
-      owner.status !== 'ACTIVE' ||
-      owner.suspendedAt !== null ||
-      owner.revokedAt !== null ||
-      !owner.userId.equals(vehicle.ownerUserId)
-    ) {
-      continue;
-    }
-
-    if (membership.role === 'OWNER' && !vehicle.ownerUserId.equals(userId)) {
-      continue;
-    }
-    if (membership.role !== 'OWNER' && vehicle.ownerUserId.equals(userId)) {
-      continue;
-    }
-
-    accessible.push({ vehicle, membership });
-  }
-
-  return accessible;
+  return {
+    vehicle: relation.vehicle,
+    membership: relation.membership,
+    role: relation.membership.role,
+  };
 }
 
 export async function getVehicleForUser(
   vehicleId: Types.ObjectId,
   userId: Types.ObjectId,
-): Promise<(Vehicle & { _id: Types.ObjectId }) | null> {
-  const vehicle = await loadVerifiedActiveVehicle(vehicleId, { actorUserId: userId });
+): Promise<VehicleRecord | null> {
+  const relation = await resolveVehicleRelation(vehicleId, userId);
+  return relation.kind === 'OWNER' || relation.kind === 'READER' ? relation.vehicle : null;
+}
+
+/**
+ * Read-only invitation authorization mirroring the in-transaction check of `inviteMember`:
+ * the canonical OWNER, or an ACTIVE MEMBER holding `vehicle:manage` or `invitation:create`.
+ */
+async function authorizeInvitationIssuer(
+  vehicleId: Types.ObjectId,
+  inviterUserId: Types.ObjectId,
+  audit: VehicleAuditLogger,
+): Promise<'ALLOWED' | 'DENIED' | 'VEHICLE_UNAVAILABLE'> {
+  const vehicle = await loadVerifiedActiveVehicle(vehicleId, {
+    audit,
+    actorUserId: inviterUserId,
+  });
   if (!vehicle) {
-    return null;
+    return 'VEHICLE_UNAVAILABLE';
   }
-
-  const membership = await MembershipModel.findOne({
+  if (vehicle.ownerUserId.equals(inviterUserId)) {
+    return 'ALLOWED';
+  }
+  const membership = (await MembershipModel.findOne({
     vehicleId,
-    userId,
-    status: 'ACTIVE',
-    suspendedAt: null,
-    revokedAt: null,
-  }).lean();
-
-  if (!membership) {
-    return null;
-  }
-
-  if (membership.role === 'OWNER' && !vehicle.ownerUserId.equals(userId)) {
-    return null;
-  }
-  if (membership.role !== 'OWNER' && vehicle.ownerUserId.equals(userId)) {
-    return null;
-  }
-
-  return vehicle;
+    userId: inviterUserId,
+    role: 'MEMBER',
+    ...ACTIVE_MEMBERSHIP_CRITERIA,
+  }).lean()) as MembershipRecord | null;
+  return membership !== null &&
+    (membership.permissions.includes('vehicle:manage') ||
+      membership.permissions.includes('invitation:create'))
+    ? 'ALLOWED'
+    : 'DENIED';
 }
 
 export async function inviteMember(
@@ -849,8 +1381,24 @@ export async function inviteMember(
     );
   }
 
+  const preAuthorization = await authorizeInvitationIssuer(vehicleId, inviterUserId, audit);
+  if (preAuthorization !== 'ALLOWED') {
+    if (preAuthorization === 'DENIED') {
+      audit({
+        action: 'invitation.create',
+        actorUserId: String(inviterUserId),
+        vehicleId: String(vehicleId),
+        targetId: String(inviteeUserId),
+        outcome: 'denied',
+        reason: 'insufficient_permissions',
+      });
+    }
+    return null;
+  }
+
   // Persist transition of any elapsed PENDING invitations BEFORE starting an abortable
   // transaction so EXPIRED history is preserved even if domain validation/conflicts fail.
+  // Only reached by authorized issuers; the transaction re-checks authorization under lock.
   await InvitationModel.updateMany(
     {
       vehicleId,
@@ -1864,32 +2412,137 @@ export async function expireElapsedAccessGrants(
   return result.modifiedCount;
 }
 
+/**
+ * Owner-only partial update of descriptive vehicle fields. Authorization is resolved before any
+ * write; the transaction then locks the ACTIVE vehicle and its canonical OWNER membership so a
+ * concurrent archive either serializes before (→ CONFLICT) or after this update.
+ */
+export async function updateVehicle(input: {
+  vehicleId: Types.ObjectId;
+  actorUserId: Types.ObjectId;
+  changes: UpdateVehicleInput;
+  now?: Date;
+  audit?: VehicleAuditLogger;
+}): Promise<VehicleRecord> {
+  const audit = input.audit ?? defaultAuditLogger;
+  const now = input.now ?? new Date();
+  const changes = validateUpdateVehicleInput(input.changes);
+  const context = {
+    action: 'vehicle.update' as const,
+    vehicleId: input.vehicleId,
+    actorUserId: input.actorUserId,
+    audit,
+  };
+
+  const relation = await resolveVehicleRelation(input.vehicleId, input.actorUserId, {
+    now,
+    audit,
+  });
+  if (relation.kind !== 'OWNER') {
+    denyOwnerMutation(relation, context);
+  }
+
+  let updated: VehicleRecord;
+  try {
+    updated = await runInVehicleTransaction(async (session) => {
+      const locked = await lockVerifiedActiveVehicle(input.vehicleId, session, {
+        now,
+        audit,
+        actorUserId: input.actorUserId,
+      });
+      if (!locked || !locked.ownerUserId.equals(input.actorUserId)) {
+        throw new TransactionAbortDomainError('REJECT_NULL', 'Vehicle state changed');
+      }
+
+      const result = (await VehicleModel.findOneAndUpdate(
+        { _id: input.vehicleId, ownerUserId: input.actorUserId, status: 'ACTIVE' },
+        { $set: { ...changes, updatedByUserId: input.actorUserId } },
+        { returnDocument: 'after', runValidators: true, session },
+      ).lean()) as VehicleRecord | null;
+      if (!result) {
+        throw new TransactionAbortDomainError('REJECT_NULL', 'Vehicle state changed');
+      }
+      return result;
+    });
+  } catch (error) {
+    if (error instanceof TransactionAbortDomainError && error.code === 'REJECT_NULL') {
+      const current = await resolveVehicleRelation(input.vehicleId, input.actorUserId, {
+        now,
+        audit,
+      });
+      if (current.kind !== 'OWNER') {
+        denyOwnerMutation(current, context);
+      }
+      throw new VehicleServiceError(
+        'CONFLICT',
+        'Concurrent state change prevented updating vehicle',
+      );
+    }
+    throw error;
+  }
+
+  audit({
+    action: 'vehicle.update',
+    actorUserId: String(input.actorUserId),
+    vehicleId: String(input.vehicleId),
+    outcome: 'success',
+  });
+  return updated;
+}
+
+export interface ArchiveVehicleResult {
+  vehicle: VehicleRecord;
+  /** True when the vehicle was already archived; the original archive record is returned. */
+  alreadyArchived: boolean;
+}
+
+/**
+ * Owner-only logical archive. Idempotent: archiving an already ARCHIVED vehicle returns the
+ * original record without overwriting archivedAt, archivedByUserId, or archiveReason.
+ * Memberships and history are preserved; within the same transaction, elapsed PENDING
+ * invitations and AccessGrants become EXPIRED and the remaining ones are REVOKED.
+ */
 export async function archiveVehicle(input: {
   vehicleId: Types.ObjectId;
   actorUserId: Types.ObjectId;
   reason?: string | null;
   now?: Date;
   audit?: VehicleAuditLogger;
-}): Promise<(Vehicle & { _id: Types.ObjectId }) | null> {
+}): Promise<ArchiveVehicleResult> {
   const audit = input.audit ?? defaultAuditLogger;
   const now = input.now ?? new Date();
+  if (typeof input.reason === 'string' && containsControlCharacter(input.reason)) {
+    throw new VehicleServiceError('VALIDATION_ERROR', 'Invalid audit reason');
+  }
   const reason = validateOptionalAuditReason(input.reason);
+  const context = {
+    action: 'vehicle.archive' as const,
+    vehicleId: input.vehicleId,
+    actorUserId: input.actorUserId,
+    audit,
+  };
 
+  const relation = await resolveVehicleRelation(input.vehicleId, input.actorUserId, {
+    now,
+    audit,
+  });
+  if (relation.kind === 'ARCHIVED_OWNER') {
+    return { vehicle: relation.vehicle, alreadyArchived: true };
+  }
+  if (relation.kind !== 'OWNER') {
+    denyOwnerMutation(relation, context);
+  }
+
+  let archived: VehicleRecord;
   try {
-    const archived = await runInVehicleTransaction(async (session) => {
-      const verified = await loadVerifiedActiveVehicle(input.vehicleId, {
-        session,
-        actorUserId: input.actorUserId,
+    archived = await runInVehicleTransaction(async (session) => {
+      const locked = await lockVerifiedActiveVehicle(input.vehicleId, session, {
+        now,
         audit,
+        actorUserId: input.actorUserId,
       });
-      if (!verified) {
-        return null;
-      }
-      if (!verified.ownerUserId.equals(input.actorUserId)) {
-        throw new TransactionAbortDomainError(
-          'FORBIDDEN',
-          'Only the canonical vehicle owner may archive the vehicle',
-        );
+      if (!locked || !locked.ownerUserId.equals(input.actorUserId)) {
+        throw new TransactionAbortDomainError('REJECT_NULL', 'Vehicle state changed');
       }
 
       const updatedVehicle = (await VehicleModel.findOneAndUpdate(
@@ -1908,22 +2561,21 @@ export async function archiveVehicle(input: {
           },
         },
         { returnDocument: 'after', runValidators: true, session },
-      ).lean()) as (Vehicle & { _id: Types.ObjectId }) | null;
+      ).lean()) as VehicleRecord | null;
 
       if (!updatedVehicle) {
-        throw new TransactionAbortDomainError(
-          'CONFLICT',
-          'Concurrent state change prevented archiving vehicle',
-        );
+        throw new TransactionAbortDomainError('REJECT_NULL', 'Vehicle state changed');
       }
 
       const cascadeReason = reason ?? 'vehicle_archived';
 
       await InvitationModel.updateMany(
-        {
-          vehicleId: input.vehicleId,
-          status: 'PENDING',
-        },
+        { vehicleId: input.vehicleId, status: 'PENDING', expiresAt: { $lte: now } },
+        { $set: { status: 'EXPIRED', expiredAt: now } },
+        { session },
+      );
+      await InvitationModel.updateMany(
+        { vehicleId: input.vehicleId, status: 'PENDING' },
         {
           $set: {
             status: 'REVOKED',
@@ -1936,6 +2588,15 @@ export async function archiveVehicle(input: {
         { session },
       );
 
+      await AccessGrantModel.updateMany(
+        {
+          vehicleId: input.vehicleId,
+          status: 'ACTIVE',
+          expiresAt: { $ne: null, $lte: now },
+        },
+        { $set: { status: 'EXPIRED', expiredAt: now } },
+        { session },
+      );
       await AccessGrantModel.updateMany(
         {
           vehicleId: input.vehicleId,
@@ -1956,22 +2617,32 @@ export async function archiveVehicle(input: {
 
       return updatedVehicle;
     });
-
-    if (archived) {
-      audit({
-        action: 'vehicle.archive',
-        actorUserId: String(input.actorUserId),
-        vehicleId: String(input.vehicleId),
-        outcome: 'success',
-        reason: reason ?? undefined,
-      });
-    }
-
-    return archived;
   } catch (error) {
-    if (error instanceof TransactionAbortDomainError && error.code !== 'REJECT_NULL') {
-      throw new VehicleServiceError(error.code, error.message);
+    if (error instanceof TransactionAbortDomainError && error.code === 'REJECT_NULL') {
+      const current = await resolveVehicleRelation(input.vehicleId, input.actorUserId, {
+        now,
+        audit,
+      });
+      if (current.kind === 'ARCHIVED_OWNER') {
+        return { vehicle: current.vehicle, alreadyArchived: true };
+      }
+      if (current.kind !== 'OWNER') {
+        denyOwnerMutation(current, context);
+      }
+      throw new VehicleServiceError(
+        'CONFLICT',
+        'Concurrent state change prevented archiving vehicle',
+      );
     }
     throw error;
   }
+
+  audit({
+    action: 'vehicle.archive',
+    actorUserId: String(input.actorUserId),
+    vehicleId: String(input.vehicleId),
+    outcome: 'success',
+    reason: reason ?? undefined,
+  });
+  return { vehicle: archived, alreadyArchived: false };
 }

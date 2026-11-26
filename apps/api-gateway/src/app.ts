@@ -24,9 +24,12 @@ import {
   refreshRequestBodySchema,
   emailVerificationBodySchema,
   verificationResendBodySchema,
+  vehicleArchiveBodySchema,
+  vehicleBodyJsonSchema,
   vehicleCreateBodySchema,
   vehicleIdParamsInputSchema,
   vehicleListQueryInputSchema,
+  vehicleUpdateBodySchema,
   vehicleErrorResponseSchema,
 } from './schemas/gateway.schema.js';
 import { proxyRequest, ProxyRequestError } from './lib/proxy.js';
@@ -39,10 +42,12 @@ import { GatewayJwtError, verifyGatewayAccessToken } from './security/jwt.js';
 import {
   invitationAcceptResponseSchema,
   invitationCreateResponseSchema,
+  vehicleArchiveResponseSchema,
   vehicleCreateResponseSchema,
   vehicleDetailResponseSchema,
   vehicleDeviceRegistrationResponseSchema,
   vehicleListResponseSchema,
+  vehicleUpdateResponseSchema,
   authenticatedUserResponseSchema,
   acceptedResponseSchema,
   deviceSummarySchema,
@@ -60,9 +65,15 @@ const vehicleResponseExample = {
   name: 'Mazda 3',
   make: 'Mazda',
   model: '3',
+  generation: 'BL',
+  trim: 's',
   year: 2011,
+  bodyStyle: 'sedan',
   engine: '2.0',
+  transmission: 'automatic',
+  fuelType: 'gasoline',
   ownerUserId: '507f1f77bcf86cd799439012',
+  role: 'OWNER',
 };
 const vehicleErrorResponse = jsonSchema(vehicleErrorResponseSchema);
 function vehicleErrorResponseWithExample(error: string, message: string) {
@@ -74,6 +85,18 @@ function vehicleErrorResponseWithExample(error: string, message: string) {
 
 const vehicleNotFoundErrorResponse = {
   ...vehicleErrorResponseWithExample('NOT_FOUND', 'Requested resource not found'),
+};
+const vehicleOwnerOnlyErrorResponse = {
+  ...vehicleErrorResponseWithExample(
+    'FORBIDDEN',
+    'Only the canonical vehicle owner may perform this operation',
+  ),
+  description:
+    'Email not verified (EMAIL_NOT_VERIFIED) or caller can read the vehicle but is not its ' +
+    'canonical owner (FORBIDDEN)',
+};
+const vehicleConflictErrorResponse = {
+  ...vehicleErrorResponseWithExample('CONFLICT', 'Archived vehicles cannot be modified'),
 };
 const vehicleCommonErrors = {
   400: vehicleErrorResponseWithExample('VALIDATION_ERROR', 'Invalid request'),
@@ -324,7 +347,7 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
       reply.header('access-control-allow-origin', origin);
       reply.header('vary', 'Origin');
       reply.header('access-control-allow-credentials', 'true');
-      reply.header('access-control-allow-methods', 'GET,POST,DELETE,OPTIONS');
+      reply.header('access-control-allow-methods', 'GET,POST,PATCH,DELETE,OPTIONS');
       reply.header('access-control-allow-headers', 'authorization,content-type,x-request-id');
       reply.header('access-control-expose-headers', 'x-request-id,retry-after');
     }
@@ -548,6 +571,8 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
             authorization,
             idempotencyKey,
           });
+          // Node's HTTP client does not frame DELETE bodies by default; declare the length.
+          if (method !== 'GET') headers['content-length'] = String(bodyBytes.length);
           let response;
           try {
             response = await proxyRequest({
@@ -888,7 +913,7 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
           tags: ['Vehicles'],
           summary: 'Create vehicle (verified email required)',
           security: [{ bearerAuth: [] }],
-          body: jsonSchema(vehicleCreateBodySchema),
+          body: vehicleBodyJsonSchema(jsonSchema(vehicleCreateBodySchema)),
           response: {
             ...vehicleCommonErrors,
             201: {
@@ -925,7 +950,11 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
             ...vehicleCommonErrors,
             200: {
               ...jsonSchema(vehicleListResponseSchema),
-              example: { vehicles: [vehicleResponseExample], requestId: 'request-1' },
+              example: {
+                vehicles: [vehicleResponseExample],
+                page: { nextCursor: null },
+                requestId: 'request-1',
+              },
             },
           },
         },
@@ -940,6 +969,7 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
         const query = new URLSearchParams({ userId: userId ?? '' });
         if (parsed.data.limit !== undefined) query.set('limit', String(parsed.data.limit));
         if (parsed.data.cursor !== undefined) query.set('cursor', parsed.data.cursor);
+        if (parsed.data.role !== undefined) query.set('role', parsed.data.role);
         return proxyVehicle(request, reply, 'GET', `/vehicles?${query.toString()}`);
       },
     );
@@ -957,7 +987,7 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
             404: vehicleNotFoundErrorResponse,
             200: {
               ...jsonSchema(vehicleDetailResponseSchema),
-              example: { ...vehicleResponseExample, requestId: 'request-1' },
+              example: { ...vehicleResponseExample, role: 'MEMBER', requestId: 'request-1' },
             },
           },
         },
@@ -974,6 +1004,100 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
           reply,
           'GET',
           `/vehicles/${params.data.vehicleId}?userId=${userId ?? ''}`,
+        );
+      },
+    );
+
+    app.patch<{ Params: { vehicleId: string } }>(
+      '/api/vehicles/:vehicleId',
+      {
+        schema: {
+          tags: ['Vehicles'],
+          summary: 'Update vehicle fields (canonical owner only, verified email required)',
+          description:
+            'Partial update: omitted fields are preserved, null clears optional fields, and ' +
+            'name cannot be null. At least one field is required.',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(vehicleIdParamsInputSchema),
+          body: vehicleBodyJsonSchema(jsonSchema(vehicleUpdateBodySchema)),
+          response: {
+            ...vehicleCommonErrors,
+            403: vehicleOwnerOnlyErrorResponse,
+            404: vehicleNotFoundErrorResponse,
+            409: vehicleConflictErrorResponse,
+            200: {
+              ...jsonSchema(vehicleUpdateResponseSchema),
+              example: {
+                vehicleId: vehicleResponseExample.id,
+                message: 'Vehicle updated',
+                data: { ...vehicleResponseExample, trim: 'i Touring', engine: null },
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = vehicleIdParamsInputSchema.safeParse(request.params);
+        const body = vehicleUpdateBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid vehicle data',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'PATCH',
+          `/vehicles/${params.data.vehicleId}`,
+          body.data,
+        );
+      },
+    );
+
+    app.delete<{ Params: { vehicleId: string } }>(
+      '/api/vehicles/:vehicleId',
+      {
+        schema: {
+          tags: ['Vehicles'],
+          summary: 'Archive vehicle (canonical owner only, verified email required)',
+          description:
+            'Logical, idempotent archive. The body is optional; `{ "reason": "..." }` may be ' +
+            'sent as application/json. Repeating the request returns the original archive ' +
+            'record. Archiving blocks new Vehicle-evaluated authorizations and device linking ' +
+            'but does not delete Device records or revoke already issued BLE credentials.',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(vehicleIdParamsInputSchema),
+          response: {
+            ...vehicleCommonErrors,
+            403: vehicleOwnerOnlyErrorResponse,
+            404: vehicleNotFoundErrorResponse,
+            409: vehicleConflictErrorResponse,
+            200: {
+              ...jsonSchema(vehicleArchiveResponseSchema),
+              example: {
+                vehicleId: vehicleResponseExample.id,
+                status: 'ARCHIVED',
+                archivedAt: '2026-11-26T12:00:00.000Z',
+                message: 'Vehicle archived',
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = vehicleIdParamsInputSchema.safeParse(request.params);
+        const body = vehicleArchiveBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid vehicle archive request',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'DELETE',
+          `/vehicles/${params.data.vehicleId}`,
+          body.data ?? {},
         );
       },
     );

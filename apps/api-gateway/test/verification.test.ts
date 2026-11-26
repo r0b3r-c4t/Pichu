@@ -45,7 +45,7 @@ test('unverified accounts are blocked across Vehicle, invitation and Device rout
   let resourceCalls = 0;
   const app = createApp({
     env: environment(),
-    fetchImpl: async (url) => {
+    fetchImpl: async (url, init) => {
       const path = String(url);
       if (path.endsWith('/auth/me'))
         return new Response(
@@ -73,10 +73,41 @@ test('unverified accounts are blocked across Vehicle, invitation and Device rout
           { status: 200, headers: { 'content-type': 'application/json' } },
         );
       if (path.includes('/vehicles?'))
-        return new Response(JSON.stringify({ vehicles: [] }), {
+        return new Response(JSON.stringify({ vehicles: [], page: { nextCursor: null } }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
+      if (init?.method === 'PATCH')
+        return new Response(
+          JSON.stringify({
+            vehicleId,
+            data: {
+              id: vehicleId,
+              name: 'Mazda',
+              make: null,
+              model: null,
+              generation: null,
+              trim: null,
+              year: null,
+              bodyStyle: null,
+              engine: null,
+              transmission: null,
+              fuelType: null,
+              ownerUserId: userId,
+              role: 'OWNER',
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      if (init?.method === 'DELETE')
+        return new Response(
+          JSON.stringify({
+            vehicleId,
+            status: 'ARCHIVED',
+            archivedAt: '2026-11-26T12:00:00.000Z',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
       return new Response(JSON.stringify({ vehicleId }), {
         status: 201,
         headers: { 'content-type': 'application/json' },
@@ -89,6 +120,9 @@ test('unverified accounts are blocked across Vehicle, invitation and Device rout
     { method: 'POST' as const, url: '/api/vehicles', payload: { name: 'Mazda' } },
     { method: 'GET' as const, url: '/api/vehicles' },
     { method: 'GET' as const, url: `/api/vehicles/${vehicleId}` },
+    { method: 'PATCH' as const, url: `/api/vehicles/${vehicleId}`, payload: { name: 'Daily' } },
+    { method: 'DELETE' as const, url: `/api/vehicles/${vehicleId}` },
+    { method: 'DELETE' as const, url: `/api/vehicles/${vehicleId}`, payload: { reason: 'Sold' } },
     {
       method: 'POST' as const,
       url: `/api/vehicles/${vehicleId}/invitations`,
@@ -141,7 +175,21 @@ test('unverified accounts are blocked across Vehicle, invitation and Device rout
   });
   assert.equal(device.statusCode, 200);
   assert.equal(device.json().status, 'ACTIVE');
-  assert.equal(resourceCalls, 3);
+  const update = await app.inject({
+    method: 'PATCH',
+    url: `/api/vehicles/${vehicleId}`,
+    headers,
+    payload: { name: 'Mazda' },
+  });
+  assert.equal(update.statusCode, 200);
+  const archive = await app.inject({
+    method: 'DELETE',
+    url: `/api/vehicles/${vehicleId}`,
+    headers,
+  });
+  assert.equal(archive.statusCode, 200);
+  assert.equal(archive.json().status, 'ARCHIVED');
+  assert.equal(resourceCalls, 5);
 });
 
 test('invalid JWT stays 401 and an unavailable profile fails closed', async (context) => {
