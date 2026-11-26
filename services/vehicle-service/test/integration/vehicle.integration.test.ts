@@ -38,6 +38,7 @@ import {
   createVerifiedExternalResourceBinding,
   evaluateVehiclePermission,
   expireElapsedAccessGrants,
+  getAccessibleVehicle,
   getVehicleForUser,
   inviteMember,
   listAccessibleVehicles,
@@ -47,6 +48,7 @@ import {
   revokeInvitation,
   revokeMembership,
   suspendMembership,
+  updateVehicle,
   VehicleServiceError,
 } from '../../src/services/vehicle.service.js';
 import { setupVehicleTestAuth } from '../v2-fixture.js';
@@ -218,7 +220,7 @@ test('2. Multi-vehicle ownership, multi-vehicle membership, and strict cross-veh
   await acceptInvitation(invB1._id, sharedMember);
 
   const accessibleToShared = await listAccessibleVehicles(sharedMember);
-  assert.equal(accessibleToShared.length, 2);
+  assert.equal(accessibleToShared.items.length, 2);
 
   // Isolation: sharedMember has device:link on A1, NOT on B1, and zero access on A2
   assert.equal(await canLinkDeviceToVehicle(vehicleA1._id, sharedMember), true);
@@ -972,7 +974,8 @@ test('9. Archived vehicles revoke pending invitations and active grants and deny
     actorUserId: ownerId,
     reason: 'Vehicle sold',
   });
-  assert.equal(archived?.status, 'ARCHIVED');
+  assert.equal(archived.vehicle.status, 'ARCHIVED');
+  assert.equal(archived.alreadyArchived, false);
   assert.equal((await InvitationModel.findById(invPending._id))?.status, 'REVOKED');
   assert.equal((await AccessGrantModel.findById(activeGrant._id))?.status, 'REVOKED');
 
@@ -982,7 +985,7 @@ test('9. Archived vehicles revoke pending invitations and active grants and deny
   assert.equal(await canLinkDeviceToVehicle(vehicle._id, memberId), false);
   assert.equal(await getVehicleForUser(vehicle._id, ownerId), null);
   assert.equal((await listOwnedVehicles(ownerId)).length, 0);
-  assert.equal((await listAccessibleVehicles(memberId)).length, 0);
+  assert.equal((await listAccessibleVehicles(memberId)).items.length, 0);
   assert.equal(
     await inviteMember(vehicle._id, ownerId, new Types.ObjectId(), ['vehicle:read']),
     null,
@@ -1301,6 +1304,1150 @@ test('10b. Cross-document concurrent integrity: AccessGrant vs revokeMembership,
     assert.equal(await canAccessVehicle(vehicle._id, inviteeCreateRace), false);
     assert.equal(await canAccessVehicle(vehicle._id, inviteeAcceptRace), false);
     assert.equal(await getVehicleForUser(vehicle._id, inviteeAcceptRace), null);
+  }
+});
+
+async function rejectsWithCode(work: () => Promise<unknown>, code: string): Promise<void> {
+  await assert.rejects(
+    work,
+    (err: unknown) => err instanceof VehicleServiceError && err.code === code,
+    `Expected ${code}`,
+  );
+}
+
+async function addAcceptedMember(
+  vehicleId: Types.ObjectId,
+  ownerId: Types.ObjectId,
+  permissions: string[],
+): Promise<{ memberId: Types.ObjectId; membershipId: Types.ObjectId }> {
+  const memberId = new Types.ObjectId();
+  const invitation = await inviteMember(vehicleId, ownerId, memberId, permissions);
+  assert.ok(invitation);
+  const membership = await acceptInvitation(invitation._id, memberId);
+  assert.ok(membership);
+  return { memberId, membershipId: membership._id };
+}
+
+async function vehiclePersistenceSnapshot(vehicleId: Types.ObjectId): Promise<string> {
+  const [vehicle, memberships, invitations, grants] = await Promise.all([
+    VehicleModel.findById(vehicleId).lean(),
+    MembershipModel.find({ vehicleId }).sort({ _id: 1 }).lean(),
+    InvitationModel.find({ vehicleId }).sort({ _id: 1 }).lean(),
+    AccessGrantModel.find({ vehicleId }).sort({ _id: 1 }).lean(),
+  ]);
+  return JSON.stringify({ vehicle, memberships, invitations, grants });
+}
+
+async function insertRawPendingInvitation(
+  vehicleId: Types.ObjectId,
+  inviterUserId: Types.ObjectId,
+  expiresAt: Date,
+): Promise<Types.ObjectId> {
+  const _id = new Types.ObjectId();
+  await InvitationModel.collection.insertOne({
+    _id,
+    vehicleId,
+    inviterUserId,
+    inviteeUserId: new Types.ObjectId(),
+    targetRole: 'MEMBER',
+    permissions: ['vehicle:read'],
+    status: 'PENDING',
+    expiresAt,
+    acceptedAt: null,
+    acceptedByUserId: null,
+    revokedAt: null,
+    revokedByUserId: null,
+    revokeReason: null,
+    expiredAt: null,
+    updatedByUserId: null,
+    createdAt: new Date(expiresAt.getTime() - 60_000),
+    updatedAt: new Date(expiresAt.getTime() - 60_000),
+  });
+  return _id;
+}
+
+async function insertRawActiveGrant(input: {
+  vehicleId: Types.ObjectId;
+  membershipId: Types.ObjectId;
+  subjectUserId: Types.ObjectId;
+  grantedByUserId: Types.ObjectId;
+  permissions: string[];
+  expiresAt: Date | null;
+  channel?: 'ONLINE' | 'ANY';
+}): Promise<Types.ObjectId> {
+  const _id = new Types.ObjectId();
+  const created = new Date(Date.now() - 120_000);
+  await AccessGrantModel.collection.insertOne({
+    _id,
+    vehicleId: input.vehicleId,
+    membershipId: input.membershipId,
+    subjectUserId: input.subjectUserId,
+    scopeType: 'VEHICLE',
+    scopeResourceId: null,
+    channel: input.channel ?? 'ONLINE',
+    permissions: input.permissions,
+    status: 'ACTIVE',
+    startsAt: created,
+    expiresAt: input.expiresAt,
+    grantedByUserId: input.grantedByUserId,
+    updatedByUserId: null,
+    revokedAt: null,
+    revokedByUserId: null,
+    revokeReason: null,
+    expiredAt: null,
+    createdAt: created,
+    updatedAt: created,
+  });
+  return _id;
+}
+
+test('12. TKT-011 create/update validation and PATCH semantics are strict, closed, and side-effect free on rejection', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, {
+    name: 'Daily Driver',
+    make: 'Mazda',
+    model: '3',
+    generation: 'BL',
+    trim: 's',
+    year: 2011,
+    bodyStyle: 'sedan',
+    engine: '2.0 MZR',
+    transmission: 'automatic',
+    fuelType: 'gasoline',
+  });
+  const before = await VehicleModel.findById(vehicle._id).lean();
+  assert.ok(before);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  const updated = await updateVehicle({
+    vehicleId: vehicle._id,
+    actorUserId: ownerId,
+    changes: { name: '  Weekend Car  ', trim: null, year: 2012 },
+  });
+  assert.equal(updated.name, 'Weekend Car');
+  assert.equal(updated.trim, null);
+  assert.equal(updated.year, 2012);
+  assert.equal(updated.make, 'Mazda');
+  assert.equal(updated.model, '3');
+  assert.equal(updated.generation, 'BL');
+  assert.equal(updated.bodyStyle, 'sedan');
+  assert.equal(updated.engine, '2.0 MZR');
+  assert.equal(updated.transmission, 'automatic');
+  assert.equal(updated.fuelType, 'gasoline');
+  assert.equal(updated.status, 'ACTIVE');
+  assert.equal(updated.updatedByUserId?.equals(ownerId), true);
+  assert.equal(updated.createdByUserId.equals(ownerId), true);
+  assert.equal(updated.ownerUserId.equals(ownerId), true);
+  assert.ok(updated.updatedAt.getTime() > before.updatedAt.getTime());
+  assert.equal(updated.createdAt.getTime(), before.createdAt.getTime());
+
+  const cleared = await updateVehicle({
+    vehicleId: vehicle._id,
+    actorUserId: ownerId,
+    changes: {
+      make: null,
+      model: null,
+      generation: null,
+      year: null,
+      bodyStyle: null,
+      engine: null,
+      transmission: null,
+      fuelType: null,
+    },
+  });
+  assert.equal(cleared.name, 'Weekend Car');
+  for (const field of ['make', 'model', 'generation', 'trim', 'year', 'bodyStyle'] as const) {
+    assert.equal(cleared[field], null, `${field} cleared`);
+  }
+  for (const field of ['engine', 'transmission', 'fuelType'] as const) {
+    assert.equal(cleared[field], null, `${field} cleared`);
+  }
+
+  const snapshot = await vehiclePersistenceSnapshot(vehicle._id);
+  const invalidChanges: unknown[] = [
+    {},
+    { userId: ownerId },
+    { name: null },
+    { name: '   ' },
+    { name: 'x'.repeat(121) },
+    { make: '' },
+    { make: '\tMazda' },
+    { model: 'Mazda 3\n' },
+    { trim: 'x\u007f' },
+    { engine: 'x'.repeat(81) },
+    { year: 1885 },
+    { year: 2101 },
+    { year: 2011.5 },
+    { year: '2011' },
+    { ownerUserId: new Types.ObjectId() },
+    { status: 'ARCHIVED' },
+    { archivedAt: new Date() },
+    { createdByUserId: ownerId },
+  ];
+  for (const changes of invalidChanges) {
+    await rejectsWithCode(
+      () =>
+        updateVehicle({
+          vehicleId: vehicle._id,
+          actorUserId: ownerId,
+          changes: changes as never,
+        }),
+      'VALIDATION_ERROR',
+    );
+  }
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), snapshot);
+
+  const invalidCreates: unknown[] = [
+    { name: '\tCar' },
+    { name: 'Car\r' },
+    { name: '' },
+    { name: 'Car', make: ' ' },
+    { name: 'Car', fuelType: 'gas\u0000' },
+    { name: 'Car', engine: 'x'.repeat(81) },
+    { name: 'Car', bodyStyle: 'x'.repeat(61) },
+    { name: 'Car', userId: ownerId },
+    { name: 'Car', status: 'ARCHIVED' },
+  ];
+  for (const input of invalidCreates) {
+    await rejectsWithCode(() => createVehicle(ownerId, input as never), 'VALIDATION_ERROR');
+  }
+  assert.equal(await VehicleModel.countDocuments({}), 1);
+  assert.equal(await MembershipModel.countDocuments({}), 1);
+
+  // No single-vehicle limit and no brand assumptions: the same owner may hold many vehicles.
+  for (const name of ['Second Car', 'Third Car', 'Fourth Car']) {
+    await createVehicle(ownerId, { name });
+  }
+  assert.equal((await listOwnedVehicles(ownerId)).length, 4);
+});
+
+test('13. TKT-011 owner-only mutations: MEMBER with vehicle:update/manage gets FORBIDDEN, no visibility gets NOT_FOUND, no side effects', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Protected Family SUV' });
+  const updater = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read', 'vehicle:update']);
+  const manager = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:manage']);
+  const grantUpdater = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: grantUpdater.membershipId,
+    subjectUserId: grantUpdater.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:update'],
+  });
+  const noRead = await addAcceptedMember(vehicle._id, ownerId, ['device:read']);
+  const outsider = new Types.ObjectId();
+  const elapsedInvitationId = await insertRawPendingInvitation(
+    vehicle._id,
+    ownerId,
+    new Date(Date.now() - 60_000),
+  );
+
+  assert.equal((await getAccessibleVehicle(vehicle._id, ownerId)).role, 'OWNER');
+  assert.equal((await getAccessibleVehicle(vehicle._id, updater.memberId)).role, 'MEMBER');
+  assert.equal((await getAccessibleVehicle(vehicle._id, manager.memberId)).role, 'MEMBER');
+  await rejectsWithCode(() => getAccessibleVehicle(vehicle._id, noRead.memberId), 'NOT_FOUND');
+  await rejectsWithCode(() => getAccessibleVehicle(vehicle._id, outsider), 'NOT_FOUND');
+
+  const snapshot = await vehiclePersistenceSnapshot(vehicle._id);
+  for (const reader of [updater, manager, grantUpdater]) {
+    await rejectsWithCode(
+      () =>
+        updateVehicle({
+          vehicleId: vehicle._id,
+          actorUserId: reader.memberId,
+          changes: { name: 'Hijacked' },
+        }),
+      'FORBIDDEN',
+    );
+    await rejectsWithCode(
+      () => archiveVehicle({ vehicleId: vehicle._id, actorUserId: reader.memberId }),
+      'FORBIDDEN',
+    );
+  }
+  for (const invisible of [noRead.memberId, outsider]) {
+    await rejectsWithCode(
+      () =>
+        updateVehicle({
+          vehicleId: vehicle._id,
+          actorUserId: invisible,
+          changes: { name: 'Hijacked' },
+        }),
+      'NOT_FOUND',
+    );
+    await rejectsWithCode(
+      () => archiveVehicle({ vehicleId: vehicle._id, actorUserId: invisible }),
+      'NOT_FOUND',
+    );
+  }
+  const missingVehicleId = new Types.ObjectId();
+  await rejectsWithCode(
+    () =>
+      updateVehicle({ vehicleId: missingVehicleId, actorUserId: ownerId, changes: { name: 'X' } }),
+    'NOT_FOUND',
+  );
+  await rejectsWithCode(
+    () => archiveVehicle({ vehicleId: missingVehicleId, actorUserId: ownerId }),
+    'NOT_FOUND',
+  );
+  await rejectsWithCode(() => getAccessibleVehicle(missingVehicleId, ownerId), 'NOT_FOUND');
+
+  // Rejections never touch Vehicle, memberships, grants, or elapsed invitations.
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), snapshot);
+  assert.equal((await InvitationModel.findById(elapsedInvitationId).lean())?.status, 'PENDING');
+
+  // Canonical ownership inconsistency: the owner itself sees NOT_FOUND everywhere (fail closed).
+  await MembershipModel.collection.updateOne(
+    { vehicleId: vehicle._id, role: 'OWNER' },
+    { $set: { status: 'SUSPENDED', suspendedAt: new Date(), suspendedByUserId: ownerId } },
+  );
+  const corruptedSnapshot = await vehiclePersistenceSnapshot(vehicle._id);
+  await rejectsWithCode(() => getAccessibleVehicle(vehicle._id, ownerId), 'NOT_FOUND');
+  await rejectsWithCode(() => getAccessibleVehicle(vehicle._id, updater.memberId), 'NOT_FOUND');
+  await rejectsWithCode(
+    () => updateVehicle({ vehicleId: vehicle._id, actorUserId: ownerId, changes: { name: 'X' } }),
+    'NOT_FOUND',
+  );
+  await rejectsWithCode(
+    () => archiveVehicle({ vehicleId: vehicle._id, actorUserId: ownerId }),
+    'NOT_FOUND',
+  );
+  await rejectsWithCode(
+    () =>
+      updateVehicle({
+        vehicleId: vehicle._id,
+        actorUserId: updater.memberId,
+        changes: { name: 'X' },
+      }),
+    'NOT_FOUND',
+  );
+  assert.equal((await listAccessibleVehicles(ownerId)).items.length, 0);
+  assert.equal((await listAccessibleVehicles(updater.memberId)).items.length, 0);
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), corruptedSnapshot);
+});
+
+test('14. TKT-011 read access: only current VEHICLE ONLINE/ANY grants with vehicle:read bound to the current membership confer visibility', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Grant Matrix Coupe' });
+  const member = await addAcceptedMember(vehicle._id, ownerId, ['device:read']);
+  const now = new Date();
+
+  const isVisible = async (at: Date = new Date()): Promise<boolean> => {
+    const listed = (await listAccessibleVehicles(member.memberId, { now: at })).items.some((item) =>
+      item.vehicle._id.equals(vehicle._id),
+    );
+    const detail = await getAccessibleVehicle(vehicle._id, member.memberId, { now: at }).then(
+      () => true,
+      (err: unknown) => {
+        assert.ok(err instanceof VehicleServiceError && err.code === 'NOT_FOUND');
+        return false;
+      },
+    );
+    const evaluated = await evaluateVehiclePermission({
+      vehicleId: vehicle._id,
+      userId: member.memberId,
+      permission: 'vehicle:read',
+      now: at,
+    });
+    assert.equal(listed, detail, 'list and detail must agree');
+    assert.equal(detail, evaluated.allowed, 'detail must agree with evaluateVehiclePermission');
+    return detail;
+  };
+
+  assert.equal(await isVisible(), false);
+  const deviceId = new Types.ObjectId();
+  await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'DEVICE',
+    scopeResourceId: deviceId,
+    channel: 'ONLINE',
+    permissions: ['device:read'],
+  });
+  await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'MODULE',
+    scopeResourceId: new Types.ObjectId(),
+    channel: 'ONLINE',
+    permissions: ['module:read'],
+  });
+  await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'BLE_OFFLINE',
+    permissions: ['vehicle:read'],
+    expiresAt: new Date(now.getTime() + 3_600_000),
+  });
+  await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:update'],
+  });
+  await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:read'],
+    startsAt: new Date(now.getTime() + 3_600_000),
+  });
+  // Stale binding: an ACTIVE grant for this user/vehicle but a different (non-current) membership.
+  await insertRawActiveGrant({
+    vehicleId: vehicle._id,
+    membershipId: new Types.ObjectId(),
+    subjectUserId: member.memberId,
+    grantedByUserId: ownerId,
+    permissions: ['vehicle:read'],
+    expiresAt: null,
+  });
+  assert.equal(await isVisible(), false, 'DEVICE/MODULE/BLE_OFFLINE/future/stale grants deny');
+
+  const anyGrant = await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ANY',
+    permissions: ['vehicle:read'],
+    expiresAt: new Date(now.getTime() + 60_000),
+  });
+  assert.equal(await isVisible(), true, 'VEHICLE ANY grant with vehicle:read confers read');
+  assert.equal((await getAccessibleVehicle(vehicle._id, member.memberId)).role, 'MEMBER');
+  assert.equal(
+    await isVisible(new Date(now.getTime() + 120_000)),
+    false,
+    'elapsed grant no longer confers read even before it is marked EXPIRED',
+  );
+  await revokeAccessGrant({
+    vehicleId: vehicle._id,
+    grantId: anyGrant._id,
+    actorUserId: ownerId,
+  });
+  assert.equal(await isVisible(), false);
+
+  const onlineGrant = await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:read'],
+  });
+  assert.equal(await isVisible(), true);
+  await suspendMembership({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    actorUserId: ownerId,
+  });
+  assert.equal(await isVisible(), false, 'suspended membership denies even with a live grant');
+  await reactivateMembership({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    actorUserId: ownerId,
+  });
+  assert.equal(
+    (await AccessGrantModel.findById(onlineGrant._id).lean())?.status === 'ACTIVE',
+    await isVisible(),
+  );
+});
+
+test('15. TKT-011 keyset pagination: stable order, identical timestamps, skipped inconsistencies, bound cursors, and per-page reauthorization', async () => {
+  await resetVehicleCollections();
+  const userId = new Types.ObjectId();
+  const otherOwner = new Types.ObjectId();
+  const base = Date.parse('2026-01-01T00:00:00.000Z');
+  const sameInstant = new Date(base + 1_000);
+
+  const setCreatedAt = async (vehicleId: Types.ObjectId, createdAt: Date) => {
+    await VehicleModel.collection.updateOne({ _id: vehicleId }, { $set: { createdAt } });
+  };
+
+  const owned: Array<Types.ObjectId> = [];
+  for (let index = 0; index < 5; index += 1) {
+    const created = await createVehicle(userId, { name: `Owned ${index}` });
+    owned.push(created._id);
+  }
+  // Three owned vehicles share exactly the same createdAt (ties broken by _id).
+  await setCreatedAt(owned[0]!, new Date(base + 3_000));
+  await setCreatedAt(owned[1]!, sameInstant);
+  await setCreatedAt(owned[2]!, sameInstant);
+  await setCreatedAt(owned[3]!, sameInstant);
+  await setCreatedAt(owned[4]!, new Date(base + 6_000));
+
+  const shared: Array<{ vehicleId: Types.ObjectId; membershipId: Types.ObjectId }> = [];
+  for (let index = 0; index < 3; index += 1) {
+    const created = await createVehicle(otherOwner, { name: `Shared ${index}` });
+    const invitation = await inviteMember(created._id, otherOwner, userId, ['vehicle:read']);
+    assert.ok(invitation);
+    const membership = await acceptInvitation(invitation._id, userId);
+    assert.ok(membership);
+    shared.push({ vehicleId: created._id, membershipId: membership._id });
+    await setCreatedAt(created._id, new Date(base + 2_000 + index * 2_000));
+  }
+
+  // Interleaved non-visible records: archived, ownership-inconsistent, and shared without read.
+  const archived = await createVehicle(userId, { name: 'Archived Owned' });
+  await setCreatedAt(archived._id, new Date(base + 2_500));
+  await archiveVehicle({ vehicleId: archived._id, actorUserId: userId });
+  const inconsistent = await createVehicle(userId, { name: 'Inconsistent Owned' });
+  await setCreatedAt(inconsistent._id, sameInstant);
+  await VehicleModel.collection.updateOne(
+    { _id: inconsistent._id },
+    { $set: { ownerUserId: new Types.ObjectId() } },
+  );
+  const noRead = await createVehicle(otherOwner, { name: 'Shared Without Read' });
+  const noReadInvitation = await inviteMember(noRead._id, otherOwner, userId, ['device:read']);
+  assert.ok(noReadInvitation);
+  await acceptInvitation(noReadInvitation._id, userId);
+  await setCreatedAt(noRead._id, new Date(base + 4_500));
+
+  const visible = await VehicleModel.find({
+    _id: { $in: [...owned, ...shared.map((entry) => entry.vehicleId)] },
+  })
+    .sort({ createdAt: 1, _id: 1 })
+    .lean();
+  const expectedOrder = visible.map((vehicle) => String(vehicle._id));
+  assert.equal(expectedOrder.length, 8);
+
+  const collect = async (limit: number, role?: 'OWNER' | 'MEMBER') => {
+    const ids: string[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    for (;;) {
+      const page = await listAccessibleVehicles(userId, { limit, cursor, role });
+      pages += 1;
+      assert.ok(page.items.length <= limit);
+      for (const item of page.items) {
+        assert.equal(item.role, item.membership.role);
+        ids.push(String(item.vehicle._id));
+      }
+      if (page.nextCursor === null) break;
+      assert.equal(page.items.length, limit, 'non-final pages are full');
+      assert.ok(page.nextCursor.length <= 256);
+      cursor = page.nextCursor;
+      assert.ok(pages < 50);
+    }
+    return { ids, pages };
+  };
+
+  for (const limit of [1, 2, 3, 7, 8, 100]) {
+    const { ids, pages } = await collect(limit);
+    assert.deepEqual(ids, expectedOrder, `limit ${limit} keeps order without omissions`);
+    assert.equal(new Set(ids).size, ids.length);
+    assert.equal(pages, Math.max(1, Math.ceil(expectedOrder.length / limit)));
+  }
+  const defaultPage = await listAccessibleVehicles(userId);
+  assert.equal(defaultPage.items.length, 8);
+  assert.equal(defaultPage.nextCursor, null);
+
+  const ownedOnly = await collect(2, 'OWNER');
+  assert.deepEqual(
+    ownedOnly.ids,
+    expectedOrder.filter((id) => owned.some((ownedId) => String(ownedId) === id)),
+  );
+  const sharedOnly = await collect(1, 'MEMBER');
+  assert.deepEqual(
+    sharedOnly.ids,
+    expectedOrder.filter((id) => shared.some((entry) => String(entry.vehicleId) === id)),
+  );
+
+  for (const limit of [0, 101, 1.5, Number.NaN]) {
+    await rejectsWithCode(() => listAccessibleVehicles(userId, { limit }), 'VALIDATION_ERROR');
+  }
+
+  // Cursor binding and validation.
+  const firstPage = await listAccessibleVehicles(userId, { limit: 2 });
+  assert.ok(firstPage.nextCursor);
+  const validCursor = firstPage.nextCursor;
+  await rejectsWithCode(
+    () => listAccessibleVehicles(otherOwner, { limit: 2, cursor: validCursor }),
+    'VALIDATION_ERROR',
+  );
+  await rejectsWithCode(
+    () => listAccessibleVehicles(userId, { limit: 2, cursor: validCursor, role: 'OWNER' }),
+    'VALIDATION_ERROR',
+  );
+  const payload = JSON.parse(Buffer.from(validCursor, 'base64url').toString('utf8')) as Record<
+    string,
+    unknown
+  >;
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const invalidCursors = [
+    'not base64!',
+    'a'.repeat(257),
+    Buffer.from('not json').toString('base64url'),
+    encode({ ...payload, v: 2 }),
+    encode({ ...payload, extra: true }),
+    encode({ ...payload, c: 'bogus' }),
+    encode({ ...payload, c: '2026-01-01T00:00:01Z' }),
+    encode({ ...payload, i: 'zzzz' }),
+    encode({ ...payload, r: 'OWNER' }),
+    encode({ ...payload, u: 'A'.repeat(22) }),
+    encode([payload]),
+    `${validCursor}A`,
+  ];
+  for (const cursor of invalidCursors) {
+    await rejectsWithCode(
+      () => listAccessibleVehicles(userId, { limit: 2, cursor }),
+      'VALIDATION_ERROR',
+    );
+  }
+
+  // Authorization is re-evaluated on every page: revoke a membership and a grant between pages.
+  const memberPage1 = await listAccessibleVehicles(userId, { limit: 1, role: 'MEMBER' });
+  assert.equal(String(memberPage1.items[0]?.vehicle._id), String(shared[0]!.vehicleId));
+  await revokeMembership({
+    vehicleId: shared[1]!.vehicleId,
+    membershipId: shared[1]!.membershipId,
+    actorUserId: otherOwner,
+  });
+  assert.ok(memberPage1.nextCursor);
+  const memberPage2 = await listAccessibleVehicles(userId, {
+    limit: 1,
+    role: 'MEMBER',
+    cursor: memberPage1.nextCursor,
+  });
+  assert.equal(String(memberPage2.items[0]?.vehicle._id), String(shared[2]!.vehicleId));
+  assert.equal(memberPage2.nextCursor, null);
+
+  const grantReader = await addAcceptedMember(noRead._id, otherOwner, ['device:read']);
+  const grant = await createAccessGrant({
+    vehicleId: noRead._id,
+    membershipId: grantReader.membershipId,
+    subjectUserId: grantReader.memberId,
+    actorUserId: otherOwner,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:read'],
+  });
+  const earlierVehicle = await createVehicle(otherOwner, { name: 'Earlier Shared Vehicle' });
+  const earlierInvitation = await inviteMember(
+    earlierVehicle._id,
+    otherOwner,
+    grantReader.memberId,
+    ['vehicle:read'],
+  );
+  assert.ok(earlierInvitation);
+  await acceptInvitation(earlierInvitation._id, grantReader.memberId);
+  await setCreatedAt(earlierVehicle._id, new Date(base + 500));
+  const grantPage1 = await listAccessibleVehicles(grantReader.memberId, { limit: 1 });
+  assert.equal(String(grantPage1.items[0]?.vehicle._id), String(earlierVehicle._id));
+  assert.ok(grantPage1.nextCursor, 'grant-visible vehicle is announced as the next page');
+  await revokeAccessGrant({ vehicleId: noRead._id, grantId: grant._id, actorUserId: otherOwner });
+  const grantPage2 = await listAccessibleVehicles(grantReader.memberId, {
+    limit: 1,
+    cursor: grantPage1.nextCursor,
+  });
+  assert.equal(grantPage2.items.length, 0, 'a cursor never carries authorization forward');
+  assert.equal(grantPage2.nextCursor, null);
+
+  // Query plan: the bounded membership scan uses the existing user/status index (no new index).
+  const explain = (await MembershipModel.collection
+    .aggregate([
+      { $match: { userId, status: 'ACTIVE', suspendedAt: null, revokedAt: null } },
+      {
+        $lookup: {
+          from: VehicleModel.collection.collectionName,
+          localField: 'vehicleId',
+          foreignField: '_id',
+          pipeline: [{ $match: { status: 'ACTIVE', createdAt: { $type: 'date' } } }],
+          as: 'vehicle',
+        },
+      },
+      { $unwind: '$vehicle' },
+      { $sort: { 'vehicle.createdAt': 1, 'vehicle._id': 1 } },
+      { $limit: 3 },
+    ])
+    .explain('queryPlanner')) as unknown;
+  assert.match(JSON.stringify(explain), /membership_user_status_vehicle_idx/);
+});
+
+test('16. TKT-011 archive: idempotent DELETE keeps the original record, cascades within the transaction, and preserves memberships', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Retiring Wagon' });
+  const member = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read', 'device:link']);
+  const pending = await inviteMember(vehicle._id, ownerId, new Types.ObjectId(), ['vehicle:read']);
+  assert.ok(pending);
+  const elapsedInvitationId = await insertRawPendingInvitation(
+    vehicle._id,
+    ownerId,
+    new Date(Date.now() - 60_000),
+  );
+  const activeGrant = await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:update'],
+  });
+  const elapsedGrantId = await insertRawActiveGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    grantedByUserId: ownerId,
+    permissions: ['device:read'],
+    expiresAt: new Date(Date.now() - 30_000),
+  });
+
+  const beforeDenied = await vehiclePersistenceSnapshot(vehicle._id);
+  await rejectsWithCode(
+    () => archiveVehicle({ vehicleId: vehicle._id, actorUserId: member.memberId }),
+    'FORBIDDEN',
+  );
+  await rejectsWithCode(
+    () => archiveVehicle({ vehicleId: vehicle._id, actorUserId: ownerId, reason: 'bad\treason' }),
+    'VALIDATION_ERROR',
+  );
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), beforeDenied);
+
+  const archivedAt = new Date();
+  const first = await archiveVehicle({
+    vehicleId: vehicle._id,
+    actorUserId: ownerId,
+    reason: '  Vehicle sold  ',
+    now: archivedAt,
+  });
+  assert.equal(first.alreadyArchived, false);
+  assert.equal(first.vehicle.status, 'ARCHIVED');
+  assert.equal(first.vehicle.archivedAt?.getTime(), archivedAt.getTime());
+  assert.equal(first.vehicle.archivedByUserId?.equals(ownerId), true);
+  assert.equal(first.vehicle.archiveReason, 'Vehicle sold');
+  assert.equal(first.vehicle.updatedByUserId?.equals(ownerId), true);
+
+  const pendingAfter = await InvitationModel.findById(pending._id).lean();
+  assert.equal(pendingAfter?.status, 'REVOKED');
+  assert.equal(pendingAfter?.revokeReason, 'Vehicle sold');
+  const elapsedAfter = await InvitationModel.findById(elapsedInvitationId).lean();
+  assert.equal(elapsedAfter?.status, 'EXPIRED');
+  assert.equal(elapsedAfter?.expiredAt?.getTime(), archivedAt.getTime());
+  assert.equal(elapsedAfter?.revokedAt, null);
+  assert.equal((await AccessGrantModel.findById(activeGrant._id).lean())?.status, 'REVOKED');
+  const elapsedGrant = await AccessGrantModel.findById(elapsedGrantId).lean();
+  assert.equal(elapsedGrant?.status, 'EXPIRED');
+  assert.equal(elapsedGrant?.revokedAt, null);
+  assert.equal(
+    await MembershipModel.countDocuments({ vehicleId: vehicle._id, status: 'ACTIVE' }),
+    2,
+  );
+  assert.equal(await VehicleModel.countDocuments({ _id: vehicle._id }), 1);
+
+  const afterArchive = await vehiclePersistenceSnapshot(vehicle._id);
+  const repeated = await archiveVehicle({
+    vehicleId: vehicle._id,
+    actorUserId: ownerId,
+    reason: 'Different reason',
+    now: new Date(archivedAt.getTime() + 60_000),
+  });
+  assert.equal(repeated.alreadyArchived, true);
+  assert.equal(repeated.vehicle.archivedAt?.getTime(), archivedAt.getTime());
+  assert.equal(repeated.vehicle.archiveReason, 'Vehicle sold');
+  const repeatedWithoutReason = await archiveVehicle({
+    vehicleId: vehicle._id,
+    actorUserId: ownerId,
+  });
+  assert.equal(repeatedWithoutReason.alreadyArchived, true);
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), afterArchive);
+
+  // Archived: GET → NOT_FOUND, PATCH by owner → CONFLICT, others → NOT_FOUND; nothing changes.
+  await rejectsWithCode(() => getAccessibleVehicle(vehicle._id, ownerId), 'NOT_FOUND');
+  await rejectsWithCode(() => getAccessibleVehicle(vehicle._id, member.memberId), 'NOT_FOUND');
+  await rejectsWithCode(
+    () => updateVehicle({ vehicleId: vehicle._id, actorUserId: ownerId, changes: { name: 'X' } }),
+    'CONFLICT',
+  );
+  await rejectsWithCode(
+    () =>
+      updateVehicle({
+        vehicleId: vehicle._id,
+        actorUserId: member.memberId,
+        changes: { name: 'X' },
+      }),
+    'NOT_FOUND',
+  );
+  await rejectsWithCode(
+    () => archiveVehicle({ vehicleId: vehicle._id, actorUserId: member.memberId }),
+    'NOT_FOUND',
+  );
+  await rejectsWithCode(
+    () => archiveVehicle({ vehicleId: vehicle._id, actorUserId: new Types.ObjectId() }),
+    'NOT_FOUND',
+  );
+  assert.equal((await listAccessibleVehicles(ownerId)).items.length, 0);
+  assert.equal(await canLinkDeviceToVehicle(vehicle._id, member.memberId), false);
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), afterArchive);
+
+  // Archived owner branch also verifies canonical ownership: corruption collapses to NOT_FOUND.
+  await MembershipModel.collection.updateOne(
+    { vehicleId: vehicle._id, role: 'OWNER' },
+    { $set: { userId: new Types.ObjectId() } },
+  );
+  await rejectsWithCode(
+    () => archiveVehicle({ vehicleId: vehicle._id, actorUserId: ownerId }),
+    'NOT_FOUND',
+  );
+  await rejectsWithCode(
+    () => updateVehicle({ vehicleId: vehicle._id, actorUserId: ownerId, changes: { name: 'X' } }),
+    'NOT_FOUND',
+  );
+});
+
+test('17. TKT-011 concurrency: simultaneous DELETE requests archive once and all return the winner record', async () => {
+  await resetVehicleCollections();
+  for (let round = 0; round < 5; round += 1) {
+    const ownerId = new Types.ObjectId();
+    const vehicle = await createVehicle(ownerId, { name: `Double Archive #${round}` });
+    const results = await Promise.allSettled(
+      ['first', 'second', 'third'].map((reason) =>
+        archiveVehicle({ vehicleId: vehicle._id, actorUserId: ownerId, reason }),
+      ),
+    );
+    const fulfilled = results.flatMap((result) =>
+      result.status === 'fulfilled' ? [result.value] : [],
+    );
+    assert.equal(fulfilled.length, 3, 'concurrent DELETE requests all resolve idempotently');
+    const winners = fulfilled.filter((result) => !result.alreadyArchived);
+    assert.equal(winners.length, 1, 'exactly one request performs the archive');
+    const persisted = await VehicleModel.findById(vehicle._id).lean();
+    assert.equal(persisted?.status, 'ARCHIVED');
+    assert.equal(persisted?.archiveReason, winners[0]?.vehicle.archiveReason);
+    for (const result of fulfilled) {
+      assert.equal(result.vehicle.archivedAt?.getTime(), persisted?.archivedAt?.getTime());
+      assert.equal(result.vehicle.archiveReason, persisted?.archiveReason);
+    }
+  }
+});
+
+/**
+ * Opens a real transaction that writes the vehicle document and keeps it uncommitted, so any
+ * concurrent transactional write on that vehicle hits WriteConflict until `commit()`.
+ */
+async function holdVehicleWrite(
+  vehicleId: Types.ObjectId,
+  update: Record<string, unknown>,
+): Promise<{ commit: () => Promise<void> }> {
+  const session = await mongoose.startSession();
+  session.startTransaction({ readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } });
+  await VehicleModel.updateOne({ _id: vehicleId }, { $set: update }, { session });
+  return {
+    commit: async () => {
+      await session.commitTransaction();
+      await session.endSession();
+    },
+  };
+}
+
+async function stillPendingAfter(work: Promise<unknown>, ms: number): Promise<boolean> {
+  const timeout = Symbol('timeout');
+  const winner = await Promise.race([
+    work.then(
+      () => 'settled',
+      () => 'settled',
+    ),
+    new Promise((resolve) => setTimeout(() => resolve(timeout), ms)),
+  ]);
+  return winner === timeout;
+}
+
+test('17b. TKT-011 deterministic PATCH/DELETE interleavings re-validate ownership and state inside the transaction', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+
+  // Sequential: PATCH ok → DELETE ok → PATCH rejected → repeated DELETE keeps original audit.
+  const sequential = await createVehicle(ownerId, { name: 'Sequential Sedan' });
+  const patched = await updateVehicle({
+    vehicleId: sequential._id,
+    actorUserId: ownerId,
+    changes: { trim: 'Touring' },
+  });
+  assert.equal(patched.trim, 'Touring');
+  const archivedAt = new Date();
+  const archived = await archiveVehicle({
+    vehicleId: sequential._id,
+    actorUserId: ownerId,
+    reason: 'Original reason',
+    now: archivedAt,
+  });
+  assert.equal(archived.alreadyArchived, false);
+  assert.equal(archived.vehicle.trim, 'Touring');
+  await rejectsWithCode(
+    () =>
+      updateVehicle({ vehicleId: sequential._id, actorUserId: ownerId, changes: { trim: 'X' } }),
+    'CONFLICT',
+  );
+  const repeated = await archiveVehicle({
+    vehicleId: sequential._id,
+    actorUserId: ownerId,
+    reason: 'Later reason',
+  });
+  assert.equal(repeated.alreadyArchived, true);
+  assert.equal(repeated.vehicle.archivedAt?.getTime(), archivedAt.getTime());
+  assert.equal(repeated.vehicle.archiveReason, 'Original reason');
+  assert.equal((await VehicleModel.findById(sequential._id).lean())?.trim, 'Touring');
+
+  const archiveFields = (reason: string, at: Date) => ({
+    status: 'ARCHIVED',
+    archivedAt: at,
+    archivedByUserId: ownerId,
+    archiveReason: reason,
+    updatedByUserId: ownerId,
+  });
+
+  // DELETE in flight ‖ PATCH: the pre-check passes (vehicle still ACTIVE), the PATCH blocks on
+  // the write barrier and, once DELETE commits, the in-transaction re-check rejects it.
+  const patchAfterDelete = await createVehicle(ownerId, { name: 'Barrier Coupe' });
+  const firstArchiveAt = new Date();
+  const inflightDelete = await holdVehicleWrite(
+    patchAfterDelete._id,
+    archiveFields('In-flight delete', firstArchiveAt),
+  );
+  const blockedPatch = updateVehicle({
+    vehicleId: patchAfterDelete._id,
+    actorUserId: ownerId,
+    changes: { name: 'Should never apply' },
+  });
+  blockedPatch.catch(() => undefined);
+  assert.equal(await stillPendingAfter(blockedPatch, 400), true, 'PATCH waits on the barrier');
+  await inflightDelete.commit();
+  await rejectsWithCode(() => blockedPatch, 'CONFLICT');
+  const afterBlockedPatch = await VehicleModel.findById(patchAfterDelete._id).lean();
+  assert.equal(afterBlockedPatch?.name, 'Barrier Coupe');
+  assert.equal(afterBlockedPatch?.status, 'ARCHIVED');
+  assert.equal(afterBlockedPatch?.archiveReason, 'In-flight delete');
+
+  // DELETE in flight ‖ DELETE: the second DELETE returns the winner's original audit record.
+  const doubleDelete = await createVehicle(ownerId, { name: 'Barrier Wagon' });
+  const winnerAt = new Date();
+  const inflightWinner = await holdVehicleWrite(
+    doubleDelete._id,
+    archiveFields('Winner reason', winnerAt),
+  );
+  const blockedDelete = archiveVehicle({
+    vehicleId: doubleDelete._id,
+    actorUserId: ownerId,
+    reason: 'Loser reason',
+  });
+  blockedDelete.catch(() => undefined);
+  assert.equal(await stillPendingAfter(blockedDelete, 400), true, 'DELETE waits on the barrier');
+  await inflightWinner.commit();
+  const loser = await blockedDelete;
+  assert.equal(loser.alreadyArchived, true);
+  assert.equal(loser.vehicle.archivedAt?.getTime(), winnerAt.getTime());
+  assert.equal(loser.vehicle.archiveReason, 'Winner reason');
+  assert.equal(
+    (await VehicleModel.findById(doubleDelete._id).lean())?.archiveReason,
+    'Winner reason',
+  );
+
+  // PATCH in flight ‖ DELETE: DELETE serializes after the PATCH and archives the patched state.
+  const deleteAfterPatch = await createVehicle(ownerId, { name: 'Barrier Hatch' });
+  const inflightPatch = await holdVehicleWrite(deleteAfterPatch._id, {
+    name: 'Patched In Flight',
+    updatedByUserId: ownerId,
+  });
+  const blockedArchive = archiveVehicle({
+    vehicleId: deleteAfterPatch._id,
+    actorUserId: ownerId,
+    reason: 'After patch',
+  });
+  blockedArchive.catch(() => undefined);
+  assert.equal(await stillPendingAfter(blockedArchive, 400), true, 'DELETE waits on the barrier');
+  await inflightPatch.commit();
+  const archivedAfterPatch = await blockedArchive;
+  assert.equal(archivedAfterPatch.alreadyArchived, false);
+  assert.equal(archivedAfterPatch.vehicle.name, 'Patched In Flight');
+  assert.equal(archivedAfterPatch.vehicle.status, 'ARCHIVED');
+  assert.equal(archivedAfterPatch.vehicle.archiveReason, 'After patch');
+});
+
+test('18. TKT-011 inviteMember authorizes before persisting expirations: unauthorized callers mutate nothing', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Invitation Guard Van' });
+  const reader = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const delegate = await addAcceptedMember(vehicle._id, ownerId, ['invitation:create']);
+  const outsider = new Types.ObjectId();
+  const elapsedInvitee = new Types.ObjectId();
+  const elapsedInvitationId = new Types.ObjectId();
+  const elapsedAt = new Date(Date.now() - 60_000);
+  await InvitationModel.collection.insertOne({
+    _id: elapsedInvitationId,
+    vehicleId: vehicle._id,
+    inviterUserId: ownerId,
+    inviteeUserId: elapsedInvitee,
+    targetRole: 'MEMBER',
+    permissions: ['vehicle:read'],
+    status: 'PENDING',
+    expiresAt: elapsedAt,
+    acceptedAt: null,
+    acceptedByUserId: null,
+    revokedAt: null,
+    revokedByUserId: null,
+    revokeReason: null,
+    expiredAt: null,
+    updatedByUserId: null,
+    createdAt: new Date(elapsedAt.getTime() - 60_000),
+    updatedAt: new Date(elapsedAt.getTime() - 60_000),
+  });
+
+  const snapshot = await vehiclePersistenceSnapshot(vehicle._id);
+  for (const unauthorized of [outsider, reader.memberId]) {
+    assert.equal(
+      await inviteMember(vehicle._id, unauthorized, elapsedInvitee, ['vehicle:read']),
+      null,
+    );
+  }
+  assert.equal(
+    await inviteMember(new Types.ObjectId(), ownerId, elapsedInvitee, ['vehicle:read']),
+    null,
+  );
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), snapshot);
+  assert.equal((await InvitationModel.findById(elapsedInvitationId).lean())?.status, 'PENDING');
+
+  // Authorized issuers keep the durable expiration semantics of TKT-010.
+  const issued = await inviteMember(vehicle._id, delegate.memberId, elapsedInvitee, [
+    'vehicle:read',
+  ]);
+  assert.ok(issued);
+  const expired = await InvitationModel.findById(elapsedInvitationId).lean();
+  assert.equal(expired?.status, 'EXPIRED');
+  assert.ok(expired?.expiredAt instanceof Date);
+  assert.equal(issued.status, 'PENDING');
+  assert.notEqual(String(issued._id), String(elapsedInvitationId));
+});
+
+test('19. TKT-011 listing cost: constant queries per page, read prefilter avoids rescans, bounded batch growth on discards', async () => {
+  await resetVehicleCollections();
+  const userId = new Types.ObjectId();
+  const otherOwner = new Types.ObjectId();
+  const base = Date.parse('2026-02-01T00:00:00.000Z');
+  const setCreatedAt = (vehicleId: Types.ObjectId, offset: number) =>
+    VehicleModel.collection.updateOne(
+      { _id: vehicleId },
+      { $set: { createdAt: new Date(base + offset) } },
+    );
+
+  // 30 shared vehicles without read access interleaved with 6 readable ones.
+  const readable: string[] = [];
+  for (let index = 0; index < 36; index += 1) {
+    const vehicle = await createVehicle(otherOwner, { name: `Fleet ${index}` });
+    const canRead = index % 6 === 5;
+    const invitation = await inviteMember(vehicle._id, otherOwner, userId, [
+      canRead ? 'vehicle:read' : 'device:read',
+    ]);
+    assert.ok(invitation);
+    await acceptInvitation(invitation._id, userId);
+    await setCreatedAt(vehicle._id, index * 1_000);
+    if (canRead) readable.push(String(vehicle._id));
+  }
+
+  const counters = { aggregate: 0, membershipFind: 0, grantFind: 0 };
+  const originalAggregate = MembershipModel.aggregate;
+  const originalMembershipFind = MembershipModel.find;
+  const originalGrantFind = AccessGrantModel.find;
+  const countCalls = async <T>(work: () => Promise<T>): Promise<T> => {
+    counters.aggregate = 0;
+    counters.membershipFind = 0;
+    counters.grantFind = 0;
+    return work();
+  };
+  MembershipModel.aggregate = function (this: unknown, ...args: unknown[]) {
+    counters.aggregate += 1;
+    return (originalAggregate as (...input: unknown[]) => unknown).apply(this, args);
+  } as typeof MembershipModel.aggregate;
+  MembershipModel.find = function (this: unknown, ...args: unknown[]) {
+    counters.membershipFind += 1;
+    return (originalMembershipFind as (...input: unknown[]) => unknown).apply(this, args);
+  } as typeof MembershipModel.find;
+  AccessGrantModel.find = function (this: unknown, ...args: unknown[]) {
+    counters.grantFind += 1;
+    return (originalGrantFind as (...input: unknown[]) => unknown).apply(this, args);
+  } as typeof AccessGrantModel.find;
+
+  try {
+    const collected: string[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await countCalls(() => listAccessibleVehicles(userId, { limit: 2, cursor }));
+      assert.equal(counters.aggregate, 1, 'non-readable memberships are filtered in one scan');
+      assert.ok(counters.membershipFind <= 1, 'owner memberships resolved in one batched query');
+      assert.ok(counters.grantFind <= 2, 'grants resolved with at most one query per permission');
+      collected.push(...page.items.map((item) => String(item.vehicle._id)));
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    assert.deepEqual(collected, readable);
+
+    // Ownership corruption is only detectable after the scan: discards grow the batch (bounded).
+    const owner = new Types.ObjectId();
+    const corrupted: Types.ObjectId[] = [];
+    for (let index = 0; index < 12; index += 1) {
+      const vehicle = await createVehicle(owner, { name: `Corrupted ${index}` });
+      await setCreatedAt(vehicle._id, -100_000 + index);
+      await MembershipModel.collection.insertOne({
+        vehicleId: vehicle._id,
+        userId: new Types.ObjectId(),
+        role: 'OWNER',
+        permissions: [],
+        status: 'SUSPENDED',
+        sourceInvitationId: null,
+        suspendedAt: new Date(),
+        suspendedByUserId: owner,
+        revokedAt: null,
+        revokedByUserId: null,
+        revokeReason: null,
+        updatedByUserId: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      corrupted.push(vehicle._id);
+    }
+    const healthy: string[] = [];
+    for (let index = 0; index < 3; index += 1) {
+      const vehicle = await createVehicle(owner, { name: `Healthy ${index}` });
+      await setCreatedAt(vehicle._id, -50_000 + index);
+      healthy.push(String(vehicle._id));
+    }
+    const page = await countCalls(() => listAccessibleVehicles(owner, { limit: 2 }));
+    assert.deepEqual(
+      page.items.map((item) => String(item.vehicle._id)),
+      healthy.slice(0, 2),
+    );
+    assert.ok(page.nextCursor);
+    assert.equal(counters.aggregate, 3, 'batches of 3, 6 and 12 cover 12 discards');
+    const rest = await listAccessibleVehicles(owner, { limit: 2, cursor: page.nextCursor });
+    assert.deepEqual(
+      rest.items.map((item) => String(item.vehicle._id)),
+      healthy.slice(2),
+    );
+    assert.equal(rest.nextCursor, null);
+    assert.equal(corrupted.length, 12);
+  } finally {
+    MembershipModel.aggregate = originalAggregate;
+    MembershipModel.find = originalMembershipFind;
+    AccessGrantModel.find = originalGrantFind;
   }
 });
 
@@ -1798,6 +2945,261 @@ test('11. End-to-end Gateway -> Vehicle -> Identity/Device over real HTTPS, HMAC
     });
     assert.equal(first.status, 201);
     assert.equal(replay.status, 401);
+    const probeVehicleId = (first.body as { vehicleId: string }).vehicleId;
+
+    // TKT-011: the five public vehicle endpoints over Gateway -> HTTPS + HMAC v2 -> Vehicle.
+    const gw = async (
+      method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
+      pathAndQuery: string,
+      jwt: string,
+      body?: unknown,
+    ) => {
+      const response = await fetch(`${gatewayUrl}${pathAndQuery}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${jwt}`,
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+      return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+    };
+
+    const ownerList = await gw('GET', '/api/vehicles?limit=1', ownerJwt);
+    assert.equal(ownerList.status, 200);
+    const ownerListVehicles = ownerList.body.vehicles as Array<Record<string, unknown>>;
+    assert.equal(ownerListVehicles.length, 1);
+    assert.equal(ownerListVehicles[0]?.role, 'OWNER');
+    const ownerCursor = (ownerList.body.page as { nextCursor: string | null }).nextCursor;
+    assert.ok(ownerCursor);
+    const ownerList2 = await gw(
+      'GET',
+      `/api/vehicles?limit=1&cursor=${encodeURIComponent(ownerCursor)}`,
+      ownerJwt,
+    );
+    assert.equal(ownerList2.status, 200);
+    assert.equal((ownerList2.body.page as { nextCursor: string | null }).nextCursor, null);
+    assert.deepEqual(
+      [...ownerListVehicles, ...(ownerList2.body.vehicles as Array<Record<string, unknown>>)]
+        .map((vehicle) => vehicle.id)
+        .sort(),
+      [vehicleId, probeVehicleId].sort(),
+    );
+    const stolenCursor = await gw(
+      'GET',
+      `/api/vehicles?limit=1&cursor=${encodeURIComponent(ownerCursor)}`,
+      inviteeJwt,
+    );
+    assert.equal(stolenCursor.status, 400);
+
+    const memberList = await gw('GET', '/api/vehicles?role=MEMBER', inviteeJwt);
+    assert.equal(memberList.status, 200);
+    assert.deepEqual(
+      (memberList.body.vehicles as Array<Record<string, unknown>>).map((v) => [v.id, v.role]),
+      [[vehicleId, 'MEMBER']],
+    );
+    const memberAsOwner = await gw('GET', '/api/vehicles?role=OWNER', inviteeJwt);
+    assert.deepEqual(memberAsOwner.body.vehicles, []);
+
+    const ownerPatch = await gw('PATCH', `/api/vehicles/${vehicleId}`, ownerJwt, {
+      trim: '  Limited  ',
+      engine: null,
+    });
+    assert.equal(ownerPatch.status, 200);
+    const patchedData = ownerPatch.body.data as Record<string, unknown>;
+    assert.equal(patchedData.trim, 'Limited');
+    assert.equal(patchedData.engine, null);
+    assert.equal(patchedData.make, 'Hyundai');
+    assert.equal(patchedData.role, 'OWNER');
+    for (const invalid of [{}, { userId: inviteeId }, { name: null }, { status: 'ARCHIVED' }]) {
+      assert.equal(
+        (await gw('PATCH', `/api/vehicles/${vehicleId}`, ownerJwt, invalid)).status,
+        400,
+      );
+    }
+
+    const memberDetail = await gw('GET', `/api/vehicles/${vehicleId}`, inviteeJwt);
+    assert.equal(memberDetail.status, 200);
+    assert.equal(memberDetail.body.role, 'MEMBER');
+    assert.equal(memberDetail.body.trim, 'Limited');
+    const memberPatch = await gw('PATCH', `/api/vehicles/${vehicleId}`, inviteeJwt, {
+      name: 'Hijacked',
+    });
+    assert.equal(memberPatch.status, 403);
+    assert.equal(memberPatch.body.error, 'FORBIDDEN');
+    const memberDelete = await gw('DELETE', `/api/vehicles/${vehicleId}`, inviteeJwt);
+    assert.equal(memberDelete.status, 403);
+
+    const outsiderDetail = await gw('GET', `/api/vehicles/${probeVehicleId}`, inviteeJwt);
+    const outsiderPatch = await gw('PATCH', `/api/vehicles/${probeVehicleId}`, inviteeJwt, {
+      name: 'Hijacked',
+    });
+    const outsiderDelete = await gw('DELETE', `/api/vehicles/${probeVehicleId}`, inviteeJwt);
+    const missing = await gw('GET', `/api/vehicles/${String(new Types.ObjectId())}`, ownerJwt);
+    for (const notFound of [outsiderDetail, outsiderPatch, outsiderDelete, missing]) {
+      assert.equal(notFound.status, 404);
+      assert.equal(notFound.body.error, 'NOT_FOUND');
+      assert.equal(notFound.body.message, 'Vehicle not found');
+    }
+
+    // Manipulated internal requests directly against Vehicle HTTPS.
+    const signedDirect = (
+      method: 'PATCH' | 'DELETE',
+      target: string,
+      bodyObject: Record<string, unknown>,
+      jwt: string,
+      signedBodyObject: Record<string, unknown> = bodyObject,
+    ) => {
+      const at = Date.now();
+      const headers = {
+        'x-internal-auth-version': '2' as const,
+        'x-service-name': 'api-gateway' as const,
+        'x-service-audience': 'vehicle-service' as const,
+        'x-service-key-id': gwVehKey.keyId,
+        'x-contract-version': 'v1' as const,
+        'x-timestamp': String(at),
+        'x-nonce': generateNonce(),
+        'x-request-id': randomUUID(),
+        'x-internal-deadline': String(at + 5_000),
+        authorization: `Bearer ${jwt}`,
+        'content-type': 'application/json' as const,
+      };
+      const body = Buffer.from(JSON.stringify(bodyObject));
+      const signature = signRequest(
+        {
+          environment: 'test',
+          sender: 'api-gateway',
+          audience: 'vehicle-service',
+          keyring: [gwVehKey],
+          now: at,
+        },
+        headers,
+        { method, target, body: Buffer.from(JSON.stringify(signedBodyObject)) },
+      );
+      return () =>
+        httpsJsonRequest({
+          url: `https://localhost:${ports.vehicle}${target}`,
+          method,
+          headers: {
+            ...headers,
+            'x-signature': signature,
+            'content-length': String(body.length),
+          },
+          body,
+          timeoutMs: 5_000,
+          tls: { caPath: caCert, servername: 'localhost' },
+        });
+    };
+    const tamperedBody = await signedDirect(
+      'PATCH',
+      `/vehicles/${vehicleId}`,
+      { userId: ownerId, name: 'Tampered' },
+      ownerJwt,
+      { userId: ownerId, name: 'Signed' },
+    )();
+    assert.equal(tamperedBody.status, 401);
+    const identityMismatch = await signedDirect(
+      'PATCH',
+      `/vehicles/${vehicleId}`,
+      { userId: inviteeId, name: 'Mismatch' },
+      ownerJwt,
+    )();
+    assert.equal(identityMismatch.status, 403);
+    const impersonatedOwner = await signedDirect(
+      'DELETE',
+      `/vehicles/${vehicleId}`,
+      { userId: ownerId },
+      inviteeJwt,
+    )();
+    assert.equal(impersonatedOwner.status, 403);
+    const directPatch = signedDirect(
+      'PATCH',
+      `/vehicles/${vehicleId}`,
+      { userId: ownerId, generation: 'NE1' },
+      ownerJwt,
+    );
+    assert.equal((await directPatch()).status, 200);
+    assert.equal((await directPatch()).status, 401, 'replayed PATCH is rejected');
+    const afterManipulation = await gw('GET', `/api/vehicles/${vehicleId}`, ownerJwt);
+    assert.equal(afterManipulation.body.name, 'Gateway Hyundai Ioniq 5');
+    assert.equal(afterManipulation.body.generation, 'NE1');
+    assert.equal(afterManipulation.body.status, undefined);
+
+    // Multibyte bodies: Content-Length and the HMAC v2 signature cover the exact UTF-8 bytes.
+    const multibyte = 'Automática — Ñandú 🚗 東京';
+    const multibytePatch = await gw('PATCH', `/api/vehicles/${vehicleId}`, ownerJwt, {
+      transmission: multibyte,
+    });
+    assert.equal(multibytePatch.status, 200);
+    assert.equal((multibytePatch.body.data as Record<string, unknown>).transmission, multibyte);
+    assert.equal((await VehicleModel.findById(vehicleId).lean())?.transmission, multibyte);
+
+    // Same trimmed-length outcome at the Gateway and directly at Vehicle.
+    const padded = (length: number) => `   ${'b'.repeat(length)}   `;
+    const gatewayPaddedOk = await gw('PATCH', `/api/vehicles/${vehicleId}`, ownerJwt, {
+      bodyStyle: padded(60),
+    });
+    const directPaddedOk = await signedDirect(
+      'PATCH',
+      `/vehicles/${vehicleId}`,
+      { userId: ownerId, bodyStyle: padded(60) },
+      ownerJwt,
+    )();
+    assert.equal(gatewayPaddedOk.status, 200);
+    assert.equal(directPaddedOk.status, 200);
+    assert.equal((await VehicleModel.findById(vehicleId).lean())?.bodyStyle, 'b'.repeat(60));
+    const gatewayPaddedTooLong = await gw('PATCH', `/api/vehicles/${vehicleId}`, ownerJwt, {
+      bodyStyle: padded(61),
+    });
+    const directPaddedTooLong = await signedDirect(
+      'PATCH',
+      `/vehicles/${vehicleId}`,
+      { userId: ownerId, bodyStyle: padded(61) },
+      ownerJwt,
+    )();
+    assert.equal(gatewayPaddedTooLong.status, 400);
+    assert.equal(directPaddedTooLong.status, 400);
+    assert.equal((await VehicleModel.findById(vehicleId).lean())?.bodyStyle, 'b'.repeat(60));
+
+    // DELETE without body, then repeated DELETE with a reason: idempotent and unchanged.
+    const archiveNoBody = await gw('DELETE', `/api/vehicles/${probeVehicleId}`, ownerJwt);
+    assert.equal(archiveNoBody.status, 200);
+    assert.equal(archiveNoBody.body.status, 'ARCHIVED');
+    assert.equal(archiveNoBody.body.message, 'Vehicle archived');
+    const archiveAgain = await gw('DELETE', `/api/vehicles/${probeVehicleId}`, ownerJwt, {
+      reason: 'Second attempt',
+    });
+    assert.equal(archiveAgain.status, 200);
+    assert.equal(archiveAgain.body.archivedAt, archiveNoBody.body.archivedAt);
+    assert.equal(archiveAgain.body.message, 'Vehicle already archived');
+    assert.equal(
+      (await gw('DELETE', `/api/vehicles/${vehicleId}`, ownerJwt, { reason: 'bad\treason' }))
+        .status,
+      400,
+    );
+    const archiveWithReason = await gw('DELETE', `/api/vehicles/${vehicleId}`, ownerJwt, {
+      reason: 'Vendido a un amigo — Ñandú 🚗',
+    });
+    assert.equal(archiveWithReason.status, 200);
+    const archivedVehicle = await VehicleModel.findById(vehicleId).lean();
+    assert.equal(archivedVehicle?.archiveReason, 'Vendido a un amigo — Ñandú 🚗');
+    assert.equal(
+      (await VehicleModel.findById(probeVehicleId).lean())?.archiveReason,
+      null,
+      'repeated DELETE does not overwrite the original archive reason',
+    );
+
+    const archivedDetail = await gw('GET', `/api/vehicles/${vehicleId}`, ownerJwt);
+    assert.equal(archivedDetail.status, 404);
+    const archivedPatch = await gw('PATCH', `/api/vehicles/${vehicleId}`, ownerJwt, {
+      name: 'Too late',
+    });
+    assert.equal(archivedPatch.status, 409);
+    assert.equal(archivedPatch.body.error, 'CONFLICT');
+    const memberArchivedDelete = await gw('DELETE', `/api/vehicles/${vehicleId}`, inviteeJwt);
+    assert.equal(memberArchivedDelete.status, 404);
+    const listAfterArchive = await gw('GET', '/api/vehicles', ownerJwt);
+    assert.deepEqual(listAfterArchive.body.vehicles, []);
 
     // Also verify MongoNonceStore.assertReady() passes against the real vehicle_db
     const nonceStore = new MongoNonceStore(() => mongoose.connection.db as never);

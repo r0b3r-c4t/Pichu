@@ -7,10 +7,13 @@ import { createVehicleTestApp, v2Headers } from './v2-fixture.js';
 import {
   invitationPublicData,
   membershipPublicData,
+  vehicleAccessPublicData,
+  vehicleArchivePublicData,
+  vehicleOwnerPublicData,
   vehiclePublicData,
 } from '../src/schemas/vehicle-response.schema.js';
 
-test('vehicle DTO uses persisted values and excludes MongoDB, audit, and extended internal fields', () => {
+test('vehicle DTO uses persisted values and excludes MongoDB, audit, and internal fields', () => {
   const id = new Types.ObjectId();
   const ownerUserId = new Types.ObjectId();
   const persisted = {
@@ -40,13 +43,38 @@ test('vehicle DTO uses persisted values and excludes MongoDB, audit, and extende
     name: 'Persisted Touring Hatchback',
     make: 'Honda',
     model: 'Civic',
+    generation: 'FK7',
+    trim: 'Sport',
     year: 2019,
+    bodyStyle: 'hatchback',
     engine: '1.5 Turbo',
+    transmission: 'cvt',
+    fuelType: 'gasoline',
   });
   assert.equal(JSON.stringify(result).includes('private'), false);
   assert.equal(JSON.stringify(result).includes('__v'), false);
   assert.equal(JSON.stringify(result).includes('createdByUserId'), false);
   assert.equal(JSON.stringify(result).includes('status'), false);
+  assert.equal(JSON.stringify(result).includes('role'), false);
+
+  assert.deepEqual(vehicleAccessPublicData(persisted, 'MEMBER'), { ...result, role: 'MEMBER' });
+  assert.deepEqual(vehicleOwnerPublicData(persisted), { ...result, role: 'OWNER' });
+  assert.throws(() => vehicleAccessPublicData(persisted, 'ADMIN'));
+
+  const legacy = vehiclePublicData({ _id: id, ownerUserId, name: 'Legacy' });
+  assert.equal(legacy.generation, null);
+  assert.equal(legacy.fuelType, null);
+
+  const archivedAt = new Date('2026-11-26T12:00:00.000Z');
+  assert.deepEqual(
+    vehicleArchivePublicData({
+      _id: id,
+      status: 'ARCHIVED',
+      archivedAt,
+    }),
+    { vehicleId: String(id), status: 'ARCHIVED', archivedAt: archivedAt.toISOString() },
+  );
+  assert.throws(() => vehicleArchivePublicData({ _id: id, status: 'ACTIVE', archivedAt: null }));
 });
 
 test('invitation and membership DTOs expose only persisted public state', () => {
@@ -111,6 +139,169 @@ test('Vehicle Swagger exposes the public result schemas and examples', async (co
   assert.ok(document.paths['/health/ready'].get.responses['200']);
   assert.ok(document.paths['/vehicles/{vehicleId}/invitations'].post.responses['201']);
   assert.ok(document.paths['/vehicles/{vehicleId}/devices/link'].post.responses['201']);
+
+  const list = document.paths['/vehicles'].get.responses['200'].content?.['application/json'];
+  assert.ok(list?.schema.properties?.page);
+  const item = document.paths['/vehicles/{vehicleId}'];
+  assert.ok(item?.get.responses['404']);
+  for (const method of ['patch', 'delete']) {
+    const operation = item?.[method];
+    assert.ok(operation?.responses['200'], `${method} 200 documented`);
+    assert.ok(operation?.responses['403'], `${method} 403 documented`);
+    assert.ok(operation?.responses['404'], `${method} 404 documented`);
+    assert.ok(operation?.responses['409'], `${method} 409 documented`);
+  }
+  const updateData = item?.patch.responses['200'].content?.['application/json'];
+  assert.ok(updateData?.schema.properties?.data);
+});
+
+function verifiedIdentityFetch(calls: { count: number }) {
+  return async () => {
+    calls.count += 1;
+    return new Response(JSON.stringify({ verified: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+}
+
+test('Vehicle PATCH and DELETE reject invalid internal payloads before identity or persistence', async (context) => {
+  const identityCalls = { count: 0 };
+  context.mock.method(globalThis, 'fetch', verifiedIdentityFetch(identityCalls));
+  let writes = 0;
+  context.mock.method(VehicleModel, 'findOneAndUpdate', () => {
+    writes += 1;
+    throw new Error('persistence must not be reached');
+  });
+  const app = createVehicleTestApp();
+  context.after(async () => app.close());
+  const vehicleId = String(new Types.ObjectId());
+  const userId = String(new Types.ObjectId());
+
+  const cases: Array<{ method: 'PATCH' | 'DELETE'; url: string; body?: unknown }> = [
+    { method: 'PATCH', url: `/vehicles/${vehicleId}`, body: { userId } },
+    { method: 'PATCH', url: `/vehicles/${vehicleId}`, body: { name: 'Car' } },
+    { method: 'PATCH', url: `/vehicles/${vehicleId}`, body: { userId, name: null } },
+    { method: 'PATCH', url: `/vehicles/${vehicleId}`, body: { userId, name: ' ' } },
+    { method: 'PATCH', url: `/vehicles/${vehicleId}`, body: { userId, make: '\tMazda' } },
+    { method: 'PATCH', url: `/vehicles/${vehicleId}`, body: { userId, status: 'ARCHIVED' } },
+    { method: 'PATCH', url: `/vehicles/${vehicleId}`, body: { userId, ownerUserId: userId } },
+    { method: 'PATCH', url: '/vehicles/aaaaaaaaaaaa', body: { userId, name: 'Car' } },
+    { method: 'DELETE', url: `/vehicles/${vehicleId}` },
+    { method: 'DELETE', url: `/vehicles/${vehicleId}`, body: {} },
+    { method: 'DELETE', url: `/vehicles/${vehicleId}`, body: { userId, reason: '' } },
+    { method: 'DELETE', url: `/vehicles/${vehicleId}`, body: { userId, reason: 'Sold\n' } },
+    { method: 'DELETE', url: `/vehicles/${vehicleId}`, body: { userId, status: 'ARCHIVED' } },
+  ];
+  for (const [index, attempt] of cases.entries()) {
+    const payload =
+      attempt.body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(attempt.body));
+    const requestId = `invalid-${index}`;
+    const response = await app.inject({
+      method: attempt.method,
+      url: attempt.url,
+      headers: v2Headers(payload, attempt.method, attempt.url, { requestId }),
+      ...(payload.length ? { payload } : {}),
+    });
+    assert.equal(response.statusCode, 400, `${attempt.method} ${JSON.stringify(attempt.body)}`);
+    assert.equal(response.json().error, 'VALIDATION_ERROR');
+    assert.equal(response.json().requestId, requestId);
+  }
+
+  const createAttempts = [
+    { userId, name: 'Mazda\n3' },
+    { userId, name: '   ' },
+    { userId, name: 'Car', status: 'ARCHIVED' },
+    { userId, name: 'Car', ownerUserId: userId },
+  ];
+  for (const body of createAttempts) {
+    const payload = Buffer.from(JSON.stringify(body));
+    const response = await app.inject({
+      method: 'POST',
+      url: '/vehicles',
+      headers: v2Headers(payload, 'POST', '/vehicles'),
+      payload,
+    });
+    assert.equal(response.statusCode, 400, JSON.stringify(body));
+  }
+
+  for (const target of [
+    `/vehicles?userId=${userId}&cursor=abc%2B`,
+    `/vehicles?userId=${userId}&role=ADMIN`,
+    `/vehicles?userId=${userId}&limit=0`,
+    `/vehicles?userId=${userId}&cursor=${'a'.repeat(257)}`,
+    `/vehicles/${vehicleId}?userId=${userId}&extra=1`,
+  ]) {
+    const response = await app.inject({
+      method: 'GET',
+      url: target,
+      headers: v2Headers(Buffer.alloc(0), 'GET', target),
+    });
+    assert.equal(response.statusCode, 400, target);
+  }
+
+  assert.equal(identityCalls.count, 0);
+  assert.equal(writes, 0);
+});
+
+test('Vehicle rejects manipulated internal PATCH and DELETE requests before any handler effect', async (context) => {
+  const identityCalls = { count: 0 };
+  context.mock.method(globalThis, 'fetch', verifiedIdentityFetch(identityCalls));
+  const app = createVehicleTestApp();
+  context.after(async () => app.close());
+  const vehicleId = String(new Types.ObjectId());
+  const userId = String(new Types.ObjectId());
+  const target = `/vehicles/${vehicleId}`;
+  const body = Buffer.from(JSON.stringify({ userId, name: 'Signed name' }));
+
+  const tamperedBody = await app.inject({
+    method: 'PATCH',
+    url: target,
+    headers: v2Headers(body, 'PATCH', target),
+    payload: Buffer.from(
+      JSON.stringify({ userId: String(new Types.ObjectId()), name: 'Signed name' }),
+    ),
+  });
+  assert.equal(tamperedBody.statusCode, 401);
+
+  const methodSwap = await app.inject({
+    method: 'DELETE',
+    url: target,
+    headers: v2Headers(body, 'PATCH', target),
+    payload: body,
+  });
+  assert.equal(methodSwap.statusCode, 401);
+
+  const otherTarget = `/vehicles/${String(new Types.ObjectId())}`;
+  const targetSwap = await app.inject({
+    method: 'PATCH',
+    url: otherTarget,
+    headers: v2Headers(body, 'PATCH', target),
+    payload: body,
+  });
+  assert.equal(targetSwap.statusCode, 401);
+
+  const unsigned = await app.inject({
+    method: 'DELETE',
+    url: target,
+    headers: { 'content-type': 'application/json' },
+    payload: Buffer.from(JSON.stringify({ userId })),
+  });
+  assert.equal(unsigned.statusCode >= 400 && unsigned.statusCode < 500, true);
+
+  const replayHeaders = v2Headers(body, 'PATCH', target);
+  context.mock.method(VehicleModel, 'findOne', () => {
+    throw new Error('stop after admission');
+  });
+  await app.inject({ method: 'PATCH', url: target, headers: replayHeaders, payload: body });
+  const replay = await app.inject({
+    method: 'PATCH',
+    url: target,
+    headers: replayHeaders,
+    payload: body,
+  });
+  assert.equal(replay.statusCode, 401);
+  assert.equal(identityCalls.count, 1);
 });
 
 test('vehicle creation responds with the persisted public resource', async (context) => {

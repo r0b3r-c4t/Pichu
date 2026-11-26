@@ -2,12 +2,22 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { z } from 'zod';
 import mongoose, { Types } from 'mongoose';
 import {
+  internalVehicleArchiveRequestSchema,
+  internalVehicleCreateRequestSchema,
+  internalVehicleGetQuerySchema,
+  internalVehicleListQuerySchema,
+  internalVehicleUpdateRequestSchema,
+  vehicleParamsSchema,
+} from '@pichu/contracts';
+import {
   acceptInvitation,
+  archiveVehicle,
   canLinkDeviceToVehicle,
   createVehicle,
-  getVehicleForUser,
+  getAccessibleVehicle,
   inviteMember,
-  listOwnedVehicles,
+  listAccessibleVehicles,
+  updateVehicle,
   VehicleServiceError,
   type VehicleAuditLogger,
 } from './services/vehicle.service.js';
@@ -22,7 +32,9 @@ import { docsRoutes } from './routes/docs.js';
 import {
   invitationPublicData,
   membershipPublicData,
-  vehiclePublicData,
+  vehicleAccessPublicData,
+  vehicleArchivePublicData,
+  vehicleOwnerPublicData,
 } from './schemas/vehicle-response.schema.js';
 import { checkDatabaseConnection } from './database/connection.js';
 import { assertCriticalVehicleIndexes } from './database/bootstrap.js';
@@ -108,29 +120,13 @@ function sendDomainError(reply: FastifyReply, request: FastifyRequest, error: Ve
   });
 }
 
-const vehicleCreateInputSchema = z.strictObject({
-  userId: z.string().regex(/^[a-f0-9]{24}$/),
-  name: z.string().trim().min(1).max(120),
-  make: z.string().trim().max(80).nullable().optional(),
-  model: z.string().trim().max(80).nullable().optional(),
-  generation: z.string().trim().max(60).nullable().optional(),
-  trim: z.string().trim().max(80).nullable().optional(),
-  year: z.number().int().min(1886).max(2100).nullable().optional(),
-  bodyStyle: z.string().trim().max(60).nullable().optional(),
-  engine: z.string().trim().max(80).nullable().optional(),
-  transmission: z.string().trim().max(60).nullable().optional(),
-  fuelType: z.string().trim().max(60).nullable().optional(),
-});
-
-const vehicleListQueryInputSchema = z.strictObject({
-  userId: z.string().regex(/^[a-f0-9]{24}$/),
-  limit: z.coerce.number().int().min(1).max(100).optional(),
-  cursor: z.string().trim().min(1).max(256).optional(),
-});
-
-const vehicleGetQueryInputSchema = z.strictObject({
-  userId: z.string().regex(/^[a-f0-9]{24}$/),
-});
+function sendValidationError(reply: FastifyReply, request: FastifyRequest, message: string) {
+  return reply.code(400).send({
+    error: 'VALIDATION_ERROR',
+    message,
+    requestId: responseRequestId(request),
+  });
+}
 
 const invitationCreateInputSchema = z.strictObject({
   inviterUserId: z.string().regex(/^[a-f0-9]{24}$/),
@@ -213,9 +209,9 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
       '/vehicles',
       { config: { internalOperation: 'vehicleCreate' } },
       async (request, reply) => {
-        const parsed = vehicleCreateInputSchema.safeParse(request.body);
+        const parsed = internalVehicleCreateRequestSchema.safeParse(request.body);
         if (!parsed.success) {
-          return reply.code(400).send({ message: 'Invalid vehicle data' });
+          return sendValidationError(reply, request, 'Invalid vehicle data');
         }
         const runtime = resolveRuntimeConfig();
         const clientConfig = buildOutboundClientConfig(runtime);
@@ -223,14 +219,15 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
           return;
         }
 
+        const { userId, ...fields } = parsed.data;
         try {
-          const vehicle = await createVehicle(new Types.ObjectId(parsed.data.userId), parsed.data, {
+          const vehicle = await createVehicle(new Types.ObjectId(userId), fields, {
             audit: createRequestAuditLogger(request),
           });
           return reply.code(201).send({
             vehicleId: String(vehicle._id),
             message: 'Vehicle created',
-            data: vehiclePublicData(vehicle),
+            data: vehicleOwnerPublicData(vehicle),
             requestId: responseRequestId(request),
           });
         } catch (error) {
@@ -246,17 +243,32 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
       '/vehicles',
       { config: { internalOperation: 'vehicleList' } },
       async (request, reply) => {
-        const parsed = vehicleListQueryInputSchema.safeParse(request.query);
+        const parsed = internalVehicleListQuerySchema.safeParse(request.query);
         if (!parsed.success) {
-          return reply.code(400).send({ message: 'Invalid user id' });
+          return sendValidationError(reply, request, 'Invalid vehicle query');
         }
         const runtime = resolveRuntimeConfig();
         const clientConfig = buildOutboundClientConfig(runtime);
         if (!(await requireVerifiedEmail(request, reply, parsed.data.userId, clientConfig))) {
           return;
         }
-        const vehicles = await listOwnedVehicles(new Types.ObjectId(parsed.data.userId));
-        return { vehicles: vehicles.map(vehiclePublicData), requestId: responseRequestId(request) };
+        try {
+          const page = await listAccessibleVehicles(new Types.ObjectId(parsed.data.userId), {
+            limit: parsed.data.limit,
+            cursor: parsed.data.cursor,
+            role: parsed.data.role,
+          });
+          return {
+            vehicles: page.items.map((item) => vehicleAccessPublicData(item.vehicle, item.role)),
+            page: { nextCursor: page.nextCursor },
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
       },
     );
 
@@ -264,23 +276,106 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
       '/vehicles/:vehicleId',
       { config: { internalOperation: 'vehicleGet' } },
       async (request, reply) => {
-        const parsed = vehicleGetQueryInputSchema.safeParse(request.query);
-        if (!parsed.success || !Types.ObjectId.isValid(request.params.vehicleId)) {
-          return reply.code(400).send({ message: 'Invalid vehicle request' });
+        const params = vehicleParamsSchema.safeParse(request.params);
+        const parsed = internalVehicleGetQuerySchema.safeParse(request.query);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid vehicle request');
         }
         const runtime = resolveRuntimeConfig();
         const clientConfig = buildOutboundClientConfig(runtime);
         if (!(await requireVerifiedEmail(request, reply, parsed.data.userId, clientConfig))) {
           return;
         }
-        const vehicle = await getVehicleForUser(
-          new Types.ObjectId(request.params.vehicleId),
-          new Types.ObjectId(parsed.data.userId),
-        );
-        if (!vehicle) {
-          return reply.code(404).send({ message: 'Vehicle not found' });
+        try {
+          const accessible = await getAccessibleVehicle(
+            new Types.ObjectId(params.data.vehicleId),
+            new Types.ObjectId(parsed.data.userId),
+            { audit: createRequestAuditLogger(request) },
+          );
+          return {
+            ...vehicleAccessPublicData(accessible.vehicle, accessible.role),
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
         }
-        return { ...vehiclePublicData(vehicle), requestId: responseRequestId(request) };
+      },
+    );
+
+    scope.patch<{ Params: { vehicleId: string } }>(
+      '/vehicles/:vehicleId',
+      { config: { internalOperation: 'vehicleUpdate' } },
+      async (request, reply) => {
+        const params = vehicleParamsSchema.safeParse(request.params);
+        const parsed = internalVehicleUpdateRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid vehicle data');
+        }
+        const runtime = resolveRuntimeConfig();
+        const clientConfig = buildOutboundClientConfig(runtime);
+        if (!(await requireVerifiedEmail(request, reply, parsed.data.userId, clientConfig))) {
+          return;
+        }
+
+        const { userId, ...changes } = parsed.data;
+        try {
+          const vehicle = await updateVehicle({
+            vehicleId: new Types.ObjectId(params.data.vehicleId),
+            actorUserId: new Types.ObjectId(userId),
+            changes,
+            audit: createRequestAuditLogger(request),
+          });
+          return {
+            vehicleId: String(vehicle._id),
+            message: 'Vehicle updated',
+            data: vehicleOwnerPublicData(vehicle),
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
+      },
+    );
+
+    scope.delete<{ Params: { vehicleId: string } }>(
+      '/vehicles/:vehicleId',
+      { config: { internalOperation: 'vehicleArchive' } },
+      async (request, reply) => {
+        const params = vehicleParamsSchema.safeParse(request.params);
+        const parsed = internalVehicleArchiveRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid vehicle archive request');
+        }
+        const runtime = resolveRuntimeConfig();
+        const clientConfig = buildOutboundClientConfig(runtime);
+        if (!(await requireVerifiedEmail(request, reply, parsed.data.userId, clientConfig))) {
+          return;
+        }
+
+        try {
+          const result = await archiveVehicle({
+            vehicleId: new Types.ObjectId(params.data.vehicleId),
+            actorUserId: new Types.ObjectId(parsed.data.userId),
+            reason: parsed.data.reason,
+            audit: createRequestAuditLogger(request),
+          });
+          return {
+            ...vehicleArchivePublicData(result.vehicle),
+            message: result.alreadyArchived ? 'Vehicle already archived' : 'Vehicle archived',
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
       },
     );
 
@@ -531,6 +626,16 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
         vehicleCreate: { method: 'POST', route: '/vehicles', senders: ['api-gateway'] },
         vehicleList: { method: 'GET', route: '/vehicles', senders: ['api-gateway'] },
         vehicleGet: { method: 'GET', route: '/vehicles/:vehicleId', senders: ['api-gateway'] },
+        vehicleUpdate: {
+          method: 'PATCH',
+          route: '/vehicles/:vehicleId',
+          senders: ['api-gateway'],
+        },
+        vehicleArchive: {
+          method: 'DELETE',
+          route: '/vehicles/:vehicleId',
+          senders: ['api-gateway'],
+        },
         invitationCreate: {
           method: 'POST',
           route: '/vehicles/:vehicleId/invitations',

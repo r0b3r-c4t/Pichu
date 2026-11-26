@@ -183,7 +183,7 @@ test('gateway retries GET once with a new nonce and preserves request id/deadlin
             status: 503,
             headers: { 'content-type': 'application/json' },
           })
-        : new Response(JSON.stringify({ vehicles: [] }), {
+        : new Response(JSON.stringify({ vehicles: [], page: { nextCursor: null } }), {
             status: 200,
             headers: { 'content-type': 'application/json' },
           });
@@ -270,9 +270,15 @@ test('gateway preserves persisted public vehicle data and excludes private field
                 name: 'Persisted Mazda 3',
                 make: 'Mazda',
                 model: '3',
+                generation: null,
+                trim: null,
                 year: 2011,
+                bodyStyle: null,
                 engine: '2.0',
+                transmission: null,
+                fuelType: null,
                 ownerUserId: '507f1f77bcf86cd799439011',
+                role: 'OWNER',
                 __v: 4,
                 privateAuditNote: 'must not reach client',
               },
