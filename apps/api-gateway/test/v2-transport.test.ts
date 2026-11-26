@@ -106,3 +106,70 @@ test('Gateway rejects upstream redirects and does not fall back to v1', async ()
   assert.equal(response.statusCode, 502);
   assert.equal(response.body.includes('x-signature'), false);
 });
+
+test('Gateway derives inviterUserId from authenticated JWT when proxying invitation creation', async () => {
+  const secret = 'j'.repeat(32);
+  const vehicleId = '507f1f77bcf86cd799439013';
+  const inviteeUserId = '507f1f77bcf86cd799439014';
+  const invitationId = '507f1f77bcf86cd799439015';
+  let capturedBodyText: string | undefined;
+
+  const app = createApp({
+    env: env(secret),
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith('/auth/me')) return identityProfile();
+      capturedBodyText = await new Response(init?.body).text();
+      return new Response(
+        JSON.stringify({
+          invitationId,
+          status: 'PENDING',
+          message: 'Invitation created',
+          data: {
+            id: invitationId,
+            vehicleId,
+            inviteeUserId,
+            permissions: ['vehicle:read'],
+            status: 'PENDING',
+            expiresAt: '2026-12-01T00:00:00.000Z',
+          },
+          requestId: 'gateway-inv-1',
+        }),
+        { status: 201, headers: { 'content-type': 'application/json' } },
+      );
+    },
+  });
+
+  const authorization = `Bearer ${token(secret)}`;
+
+  // Public client attempting to supply inviterUserId must be rejected by strict schema
+  const spoofed = await app.inject({
+    method: 'POST',
+    url: `/api/vehicles/${vehicleId}/invitations`,
+    headers: { authorization },
+    payload: {
+      inviterUserId: inviteeUserId,
+      inviteeUserId,
+      permissions: ['vehicle:read'],
+    },
+  });
+  assert.equal(spoofed.statusCode, 400);
+
+  const valid = await app.inject({
+    method: 'POST',
+    url: `/api/vehicles/${vehicleId}/invitations`,
+    headers: { authorization, 'x-request-id': 'gateway-inv-1' },
+    payload: {
+      inviteeUserId,
+      permissions: ['vehicle:read'],
+    },
+  });
+  await app.close();
+
+  assert.equal(valid.statusCode, 201);
+  assert.ok(capturedBodyText);
+  assert.deepEqual(JSON.parse(capturedBodyText), {
+    inviteeUserId,
+    permissions: ['vehicle:read'],
+    inviterUserId: '507f1f77bcf86cd799439011',
+  });
+});

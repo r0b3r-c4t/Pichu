@@ -1,5 +1,11 @@
 import { z } from 'zod';
 import type { Types } from 'mongoose';
+import {
+  INVITATION_STATUSES,
+  MEMBERSHIP_ROLES,
+  type InvitationStatus,
+  type MembershipRole,
+} from '../models/vehicle-constants.js';
 
 const objectIdSchema = z.string().regex(/^[a-f0-9]{24}$/);
 
@@ -39,7 +45,7 @@ export const invitationPublicSchema = z.strictObject({
   vehicleId: objectIdSchema,
   inviteeUserId: objectIdSchema,
   permissions: z.array(z.string()),
-  status: z.enum(['PENDING', 'ACCEPTED', 'REVOKED', 'EXPIRED']),
+  status: z.enum(INVITATION_STATUSES),
   expiresAt: z.string().datetime(),
 });
 export type InvitationPublic = z.infer<typeof invitationPublicSchema>;
@@ -49,7 +55,7 @@ export function invitationPublicData(invitation: {
   vehicleId: Types.ObjectId;
   inviteeUserId: Types.ObjectId;
   permissions: string[];
-  status: string;
+  status: InvitationStatus | string;
   expiresAt: Date;
 }): InvitationPublic {
   return invitationPublicSchema.parse({
@@ -65,7 +71,7 @@ export function invitationPublicData(invitation: {
 export const membershipPublicSchema = z.strictObject({
   vehicleId: objectIdSchema,
   userId: objectIdSchema,
-  role: z.enum(['OWNER', 'MEMBER']),
+  role: z.enum(MEMBERSHIP_ROLES),
   permissions: z.array(z.string()),
 });
 export type MembershipPublic = z.infer<typeof membershipPublicSchema>;
@@ -73,7 +79,7 @@ export type MembershipPublic = z.infer<typeof membershipPublicSchema>;
 export function membershipPublicData(membership: {
   vehicleId: Types.ObjectId;
   userId: Types.ObjectId;
-  role: string;
+  role: MembershipRole | string;
   permissions: string[];
 }): MembershipPublic {
   return membershipPublicSchema.parse({

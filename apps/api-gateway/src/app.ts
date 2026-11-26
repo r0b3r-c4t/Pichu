@@ -508,6 +508,7 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
       path: string,
       body: unknown = {},
       serviceUrl = env.VEHICLE_SERVICE_URL,
+      actorField: 'userId' | 'inviterUserId' = 'userId',
     ) => {
       const requestId = getRequestId(request);
       const userId = extractUserId(request.headers.authorization, env.JWT_SECRET, env);
@@ -517,7 +518,7 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
       const payload =
         method === 'GET'
           ? {}
-          : { ...(typeof body === 'object' && body !== null ? body : {}), userId };
+          : { ...(typeof body === 'object' && body !== null ? body : {}), [actorField]: userId };
       const bodyBytes = method === 'GET' ? Buffer.alloc(0) : Buffer.from(JSON.stringify(payload));
       const deadline = Date.now() + 5000;
       const audience = serviceUrl === env.DEVICE_SERVICE_URL ? 'device-service' : 'vehicle-service';
@@ -1022,6 +1023,8 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
           'POST',
           `/vehicles/${params.data.vehicleId}/invitations`,
           body.data,
+          env.VEHICLE_SERVICE_URL,
+          'inviterUserId',
         );
       },
     );

@@ -1,15 +1,20 @@
-import { createApp } from './app.js';
+import { assertVehicleDatabaseReady, createApp } from './app.js';
 import { loadEnv, parseInternalKeyring } from './config/env.js';
 import { closeDatabase, connectDatabase } from './database/connection.js';
-import { ensureDevelopmentDatabaseSchema } from './database/bootstrap.js';
+import {
+  assertCriticalVehicleIndexes,
+  ensureDevelopmentDatabaseSchema,
+} from './database/bootstrap.js';
 import { ZodError } from 'zod';
 import mongoose from 'mongoose';
 import { MongoNonceStore, createNonceIndexes } from '@pichu/internal-auth-adapters/mongodb';
 import { readTlsServerOptions } from '@pichu/internal-auth-adapters/tls';
 
-function loadEnvironmentSafely() {
+function loadStartupConfiguration() {
   try {
-    return loadEnv();
+    const env = loadEnv();
+    const keyring = parseInternalKeyring(env);
+    return { env, keyring };
   } catch (error) {
     const issues =
       error instanceof ZodError
@@ -21,29 +26,42 @@ function loadEnvironmentSafely() {
   }
 }
 
-const env = loadEnvironmentSafely();
+const startup = loadStartupConfiguration();
 
-if (!env) {
+if (!startup) {
   process.exit(1);
 }
+
+const { env, keyring } = startup;
 
 const nonces = new MongoNonceStore(() => {
   if (!mongoose.connection.db) throw new Error('Vehicle database is not connected');
   return mongoose.connection.db;
 });
+
+const tlsEnabled = Boolean(env.TLS_CERT_PATH && env.TLS_KEY_PATH && env.TLS_CA_PATH);
+
 const app = createApp({
   internalAuth: {
     environment: env.INTERNAL_AUTH_ENVIRONMENT,
-    keyring: parseInternalKeyring(env),
+    keyring,
     nonces,
     bodyLimit: env.INTERNAL_AUTH_BODY_LIMIT,
   },
-  ...(env.TLS_CERT_PATH && env.TLS_KEY_PATH && env.TLS_CA_PATH
+  runtimeConfig: {
+    identityServiceUrl: env.IDENTITY_SERVICE_URL,
+    deviceServiceUrl: env.DEVICE_SERVICE_URL,
+    invitationTtlMs: env.INVITATION_TTL_SECONDS * 1_000,
+    tlsCaPath: env.TLS_CA_PATH,
+    outboundKeyring: keyring,
+  },
+  readinessCheck: () => assertVehicleDatabaseReady(mongoose),
+  ...(tlsEnabled
     ? {
         https: readTlsServerOptions({
-          certPath: env.TLS_CERT_PATH,
-          keyPath: env.TLS_KEY_PATH,
-          caPath: env.TLS_CA_PATH,
+          certPath: env.TLS_CERT_PATH!,
+          keyPath: env.TLS_KEY_PATH!,
+          caPath: env.TLS_CA_PATH!,
         }),
       }
     : {}),
@@ -93,15 +111,22 @@ try {
     );
     app.log.info({ phase: 'database-schema', status: 'ready' }, 'Startup phase completed');
   }
+
   if (!mongoose.connection.db) throw new Error('Vehicle database is not connected');
+  app.log.info({ phase: 'critical-indexes', status: 'verifying' }, 'Startup phase started');
+  await assertCriticalVehicleIndexes(mongoose.connection.db);
   await createNonceIndexes(mongoose.connection.db);
+  app.log.info({ phase: 'critical-indexes', status: 'ready' }, 'Startup phase completed');
+
   app.log.info({ phase: 'http-server', status: 'starting' }, 'Startup phase started');
   await app.listen({
     host: env.HOST,
     port: env.PORT,
   });
+  app.log.info({ phase: 'http-server', status: 'ready' }, 'Startup phase completed');
 
-  const documentationUrl = `http://${env.HOST}:${env.PORT}/docs`;
+  const scheme = tlsEnabled ? 'https' : 'http';
+  const documentationUrl = `${scheme}://${env.HOST}:${env.PORT}/docs`;
   console.log(`
 ┌──────────────────────────────────────────────┐
 │                 PICHU VEHICLE                │
