@@ -15,6 +15,8 @@
     "@fastify/swagger": "^9.9.3",
     "@fastify/swagger-ui": "^6.1.2",
     "@pichu/contracts": "workspace:*",
+    "@pichu/internal-auth": "workspace:*",
+    "@pichu/internal-auth-adapters": "workspace:*",
     "fastify": "^5.6.2",
     "zod": "^4.6.7"
   }

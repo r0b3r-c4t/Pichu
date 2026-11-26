@@ -1,4 +1,5 @@
 import Fastify, { LogController, type FastifyInstance } from 'fastify';
+import { Types } from 'mongoose';
 import cookie from '@fastify/cookie';
 import { healthRoutes } from './routes/health.js';
 import { createAuthRoutes } from './routes/auth.js';
@@ -15,12 +16,21 @@ import { LoginService } from './services/login.service.js';
 import { SessionService } from './services/session.service.js';
 import { JwtService } from './security/jwt.js';
 import { PasswordRecoveryService } from './services/password-recovery.service.js';
-
+import { UserModel } from './models/user.model.js';
+import {
+  getInternalPrincipal,
+  getInternalSignal,
+  internalAuthPlugin,
+} from '@pichu/internal-auth-adapters/fastify';
+import type { Keyring } from '@pichu/internal-auth';
+import type { NonceStore } from '@pichu/internal-auth-adapters/types';
+import type { ServerOptions } from 'node:https';
 import { docsRoutes } from './routes/docs.js';
 import { identityRequestId, installIdentityErrorResponses } from './routes/errors.js';
-import { UserProfileService } from './services/user-profile.service.js';
+import { UserProfileService, UserProfileServiceError } from './services/user-profile.service.js';
 
 export interface AppDependencies {
+  https?: ServerOptions;
   emailProvider?: EmailProvider;
   verificationUrl?: string;
   tokenTtlMs?: number;
@@ -33,11 +43,18 @@ export interface AppDependencies {
   cookieOrigin?: string;
   passwordRecoveryService?: PasswordRecoveryService;
   userProfileService?: UserProfileService;
+  internalAuth?: {
+    environment: 'development' | 'test' | 'staging' | 'production';
+    keyring: Keyring;
+    nonces: NonceStore;
+    bodyLimit?: number;
+  };
 }
 
 export function createApp(dependencies: AppDependencies = {}): FastifyInstance {
   const app = Fastify({
     logger: true,
+    ...(dependencies.https ? { https: dependencies.https } : {}),
     logController: new LogController({ disableRequestLogging: true }),
     genReqId: identityRequestId,
   });
@@ -91,6 +108,82 @@ export function createApp(dependencies: AppDependencies = {}): FastifyInstance {
   void app.register(healthRoutes);
   void app.register(docsRoutes);
   const userProfileService = dependencies.userProfileService ?? new UserProfileService();
+  if (dependencies.internalAuth) {
+    const internalAuth = dependencies.internalAuth;
+    void app.register(internalAuthPlugin, {
+      environment: internalAuth.environment,
+      audience: 'identity-service',
+      keyring: () => internalAuth.keyring,
+      nonces: internalAuth.nonces,
+      bodyLimit: internalAuth.bodyLimit,
+      policies: {
+        identityUserExists: {
+          method: 'GET',
+          route: '/internal/users/:userId/exists',
+          senders: ['vehicle-service'],
+        },
+        identityUserVerified: {
+          method: 'GET',
+          route: '/internal/users/:userId/verified',
+          senders: ['vehicle-service', 'device-service'],
+        },
+      },
+      routes: async (scope) => {
+        scope.get<{ Params: { userId: string } }>(
+          '/internal/users/:userId/exists',
+          { config: { internalOperation: 'identityUserExists' } },
+          async (request, reply) => {
+            const claims = await verifyInternalUser(
+              request,
+              dependencies.jwtService,
+              dependencies.sessionService,
+            );
+            if (!claims) return reply.code(401).send({ message: 'Internal request failed' });
+            if (!/^[a-f0-9]{24}$/.test(request.params.userId))
+              return reply.code(400).send({ message: 'Internal request failed' });
+            try {
+              request.log.debug(
+                { requestId: getInternalPrincipal(request).requestId },
+                'Internal identity lookup',
+              );
+              const exists = await UserModel.exists({ _id: request.params.userId });
+              return { exists: Boolean(exists) };
+            } catch {
+              getInternalSignal(request).throwIfAborted();
+              return reply.code(503).send({ message: 'Internal request failed' });
+            }
+          },
+        );
+        scope.get<{ Params: { userId: string } }>(
+          '/internal/users/:userId/verified',
+          { config: { internalOperation: 'identityUserVerified' } },
+          async (request, reply) => {
+            const sender = getInternalPrincipal(request).sender;
+            if (sender !== 'vehicle-service' && sender !== 'device-service')
+              return reply.code(403).send({ message: 'Internal request failed' });
+            const claims = await verifyInternalUser(
+              request,
+              dependencies.jwtService,
+              dependencies.sessionService,
+            );
+            if (!claims || claims.userId !== request.params.userId)
+              return reply.code(403).send({ message: 'Internal request failed' });
+            if (!/^[a-f0-9]{24}$/.test(request.params.userId))
+              return reply.code(400).send({ message: 'Internal request failed' });
+            try {
+              const verified = await userProfileService.isEmailVerified(request.params.userId);
+              getInternalSignal(request).throwIfAborted();
+              return { verified };
+            } catch (error) {
+              if (error instanceof UserProfileServiceError)
+                return reply.code(503).send({ message: 'Internal request failed' });
+              throw error;
+            }
+          },
+        );
+      },
+    });
+  }
   const registrationService =
     dependencies.registrationService ??
     (dependencies.emailProvider && dependencies.verificationUrl
@@ -134,4 +227,27 @@ export function createApp(dependencies: AppDependencies = {}): FastifyInstance {
     );
   }
   return app;
+}
+
+async function verifyInternalUser(
+  request: import('fastify').FastifyRequest,
+  jwtService: JwtService | undefined,
+  sessionService: SessionService | undefined,
+) {
+  const authorization = request.headers.authorization;
+  if (!jwtService || !sessionService || typeof authorization !== 'string') return undefined;
+  if (!authorization.startsWith('Bearer ') || authorization.length <= 'Bearer '.length)
+    return undefined;
+  try {
+    const claims = await jwtService.verifyAccessToken(authorization.slice('Bearer '.length));
+    if (!Types.ObjectId.isValid(claims.sessionId) || !Types.ObjectId.isValid(claims.userId))
+      return undefined;
+    const active = await sessionService.isSessionActive(
+      new Types.ObjectId(claims.sessionId),
+      new Types.ObjectId(claims.userId),
+    );
+    return active ? claims : undefined;
+  } catch {
+    return undefined;
+  }
 }

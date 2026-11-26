@@ -1,10 +1,14 @@
+import { httpsJsonRequest } from '@pichu/internal-auth-adapters/tls';
+
 export interface ProxyRequestOptions {
   url: string;
   method: string;
   body?: unknown;
   headers?: Record<string, string>;
+  bodyBytes?: Uint8Array;
   timeoutMs: number;
   fetchImpl?: typeof fetch;
+  tls?: { caPath: string; servername?: string };
 }
 
 export interface ProxyResponse {
@@ -32,15 +36,45 @@ function isAbortError(error: unknown): boolean {
 export async function proxyRequest(options: ProxyRequestOptions): Promise<ProxyResponse> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
-  const fetchImpl = options.fetchImpl ?? fetch;
+  const fetchImpl = options.fetchImpl;
 
   try {
+    if (!fetchImpl && !options.tls) throw new ProxyRequestError('network');
+    if (!fetchImpl) {
+      const response = await httpsJsonRequest({
+        url: options.url,
+        method: options.method,
+        headers: options.headers,
+        body:
+          options.bodyBytes ??
+          (options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))),
+        signal: controller.signal,
+        timeoutMs: options.timeoutMs,
+        tls: options.tls!,
+      });
+      if (response.status >= 300 && response.status < 400) throw new ProxyRequestError('network');
+      return {
+        status: response.status,
+        body: response.body,
+        contentType: response.headers['content-type'],
+        setCookies: response.headers['set-cookie']
+          ? response.headers['set-cookie'].split(', ')
+          : [],
+        retryAfter: response.headers['retry-after'],
+      };
+    }
     const response = await fetchImpl(options.url, {
       method: options.method,
       headers: options.headers,
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      body: (options.bodyBytes
+        ? Buffer.from(options.bodyBytes)
+        : options.body === undefined
+          ? undefined
+          : Buffer.from(JSON.stringify(options.body))) as BodyInit | undefined,
+      redirect: 'error',
       signal: controller.signal,
     });
+    if (response.status >= 300 && response.status < 400) throw new ProxyRequestError('network');
     const text = await response.text();
     if (text.length === 0) {
       return {
