@@ -9,7 +9,10 @@
     "start": "node dist/server.js",
     "lint": "eslint src",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "tsx --test test/*.test.ts"
+    "test": "tsx --test test/*.test.ts",
+    "test:integration": "tsx --test test/integration/*.integration.test.ts",
+    "migrate:device-foundation:preflight": "node --env-file=.env --import tsx src/scripts/device-foundation-migration.ts --preflight",
+    "migrate:device-foundation": "node --env-file=.env --import tsx src/scripts/device-foundation-migration.ts --apply"
   },
   "dependencies": {
     "@pichu/contracts": "workspace:*",

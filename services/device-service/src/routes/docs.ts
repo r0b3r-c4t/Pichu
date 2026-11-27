@@ -8,51 +8,38 @@ const document = {
   info: { title: 'PICHU Device Service', version: '0.1.0' },
   paths: {
     '/health': { get: { summary: 'Estado del servicio' } },
-    '/devices/{deviceId}/challenge': { post: { summary: 'Solicitar desafío BLE' } },
-    '/devices/{deviceId}/link': { post: { summary: 'Completar vinculación Ed25519' } },
+    '/health/ready': { get: { summary: 'Disponibilidad (MongoDB, índices, migración, nonces)' } },
     '/devices/{deviceId}': {
       get: { summary: 'Consultar dispositivo (Gateway HMAC y correo verificado)' },
     },
-    '/internal/devices/register': { post: { summary: 'Registrar dispositivo (HMAC)' } },
-    '/internal/devices/{deviceId}/rotate-key': { post: { summary: 'Rotar clave (HMAC)' } },
-    '/internal/devices/{deviceId}/revoke': { post: { summary: 'Revocar dispositivo (HMAC)' } },
+    '/internal/devices/register': {
+      post: { summary: 'Registrar dispositivo y su credencial Ed25519 (HMAC)' },
+    },
   },
 };
 
 const requestExamples: Record<string, unknown> = {
-  '/devices/{deviceId}/challenge': { identifier: 'esp32-mazda-3' },
-  '/devices/{deviceId}/link': {
-    challenge: 'desafio-base64url',
-    signature: 'firma-ed25519-base64url',
-  },
   '/internal/devices/register': {
     identifier: 'esp32-mazda-3',
-    publicKey: '-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----',
+    publicKey:
+      '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA45MvtrOX7j8UVh74F4GxZAyeEGjeMtA4e/FfWGi+z6Y=\n-----END PUBLIC KEY-----',
     vehicleId: '507f1f77bcf86cd799439011',
     userId: '507f1f77bcf86cd799439012',
   },
-  '/internal/devices/{deviceId}/rotate-key': {
-    publicKey: '-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----',
-  },
-  '/internal/devices/{deviceId}/revoke': { reason: 'device-replaced' },
 };
 const paths = document.paths as unknown as Record<string, Record<string, Record<string, unknown>>>;
 const deviceTags = [
   { name: 'Health', description: 'Estado del servicio' },
-  { name: 'Linking', description: 'Desafío y vinculación Ed25519' },
   { name: 'Devices', description: 'Metadatos del dispositivo' },
-  { name: 'Internal provisioning', description: 'Registro, claves y revocación interna' },
+  { name: 'Internal provisioning', description: 'Registro interno de dispositivos' },
 ];
 (document as unknown as { tags: typeof deviceTags }).tags = deviceTags;
 for (const [path, operations] of Object.entries(paths)) {
-  const tag =
-    path === '/health'
-      ? 'Health'
-      : path.startsWith('/internal/')
-        ? 'Internal provisioning'
-        : path.endsWith('/challenge') || path.endsWith('/link')
-          ? 'Linking'
-          : 'Devices';
+  const tag = path.startsWith('/health')
+    ? 'Health'
+    : path.startsWith('/internal/')
+      ? 'Internal provisioning'
+      : 'Devices';
   for (const operation of Object.values(operations)) operation.tags = [tag];
 }
 for (const operations of Object.values(paths))
@@ -108,8 +95,18 @@ for (const path of ['/devices/{deviceId}', '/internal/devices/register']) {
       ...(operation.responses as Record<string, unknown>),
       '401': { description: 'Autenticación interna requerida' },
       '403': verificationError,
+      '503': { description: 'Base de datos o Identity no disponibles' },
     };
   }
+}
+const registerOperation = paths['/internal/devices/register']?.post;
+if (registerOperation) {
+  registerOperation.responses = {
+    ...(registerOperation.responses as Record<string, unknown>),
+    '201': { description: 'Dispositivo PENDING y credencial ACTIVE creados atómicamente' },
+    '400': { description: 'Datos o clave pública SPKI Ed25519 inválidos' },
+    '409': { description: 'Identificador o clave ya registrados (incluidos revocados)' },
+  };
 }
 
 export const docsRoutes: FastifyPluginAsync = async (fastify) => {

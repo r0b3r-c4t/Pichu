@@ -7,7 +7,8 @@ export function createDatabaseService(client: Mongoose) {
     if (closing) await closing;
     if (client.connection.readyState === 1) return client;
     if (!connecting)
-      connecting = client.connect(url, { autoIndex: false }).catch((error) => {
+      // Collections and indexes are created only by the explicit bootstrap or migration.
+      connecting = client.connect(url, { autoIndex: false, autoCreate: false }).catch((error) => {
         connecting = undefined;
         throw error;
       });

@@ -1,15 +1,23 @@
 import { createApp } from './app.js';
 import { loadEnv, parseInternalKeyring } from './config/env.js';
 import { closeDatabase, connectDatabase } from './database/connection.js';
-import { ensureDevelopmentDatabaseSchema } from './database/bootstrap.js';
+import {
+  assertCriticalDeviceIndexes,
+  assertDeviceDatabaseReady,
+  assertDeviceFoundationMigrationRecorded,
+  ensureDevelopmentDatabaseSchema,
+} from './database/bootstrap.js';
+import { recordDeviceMigrationIfNothingToMigrate } from './database/migration.js';
 import { ZodError } from 'zod';
 import mongoose from 'mongoose';
 import { MongoNonceStore, createNonceIndexes } from '@pichu/internal-auth-adapters/mongodb';
 import { readTlsServerOptions } from '@pichu/internal-auth-adapters/tls';
 
-function loadEnvironmentSafely() {
+function loadStartupConfiguration() {
   try {
-    return loadEnv();
+    const env = loadEnv();
+    const keyring = parseInternalKeyring(env);
+    return { env, keyring };
   } catch (error) {
     const issues =
       error instanceof ZodError
@@ -21,12 +29,12 @@ function loadEnvironmentSafely() {
   }
 }
 
-const env = loadEnvironmentSafely();
+const startup = loadStartupConfiguration();
 
-if (!env) {
+if (!startup) {
   process.exit(1);
 }
-const keyring = parseInternalKeyring(env);
+const { env, keyring } = startup;
 const nonces = new MongoNonceStore(() => {
   if (!mongoose.connection.db) throw new Error('Device database is not connected');
   return mongoose.connection.db;
@@ -47,6 +55,7 @@ const app = createApp({
     nonces,
     bodyLimit: env.INTERNAL_AUTH_BODY_LIMIT,
   },
+  readinessCheck: () => assertDeviceDatabaseReady(mongoose),
 });
 
 function sanitizedErrorMessage(error: unknown): string {
@@ -86,15 +95,28 @@ try {
   await connectDatabase(env.DATABASE_URL);
   app.log.info({ phase: 'mongodb', status: 'connected' }, 'Startup phase completed');
 
+  const db = mongoose.connection.db;
+  if (!db) throw new Error('Device database is not connected');
+
   if (env.NODE_ENV !== 'production') {
     app.log.info({ phase: 'database-schema', status: 'verifying' }, 'Startup phase started');
     await ensureDevelopmentDatabaseSchema((message) =>
       app.log.info({ phase: 'database-schema' }, message),
     );
+    if (!(await recordDeviceMigrationIfNothingToMigrate(db))) {
+      app.log.warn(
+        { phase: 'database-migration' },
+        'Legacy device data requires the explicit TKT-014 migration; readiness stays unready',
+      );
+    }
     app.log.info({ phase: 'database-schema', status: 'ready' }, 'Startup phase completed');
   }
-  if (!mongoose.connection.db) throw new Error('Device database is not connected');
-  await createNonceIndexes(mongoose.connection.db);
+
+  app.log.info({ phase: 'critical-indexes', status: 'verifying' }, 'Startup phase started');
+  await assertCriticalDeviceIndexes(db);
+  if (env.NODE_ENV === 'production') await assertDeviceFoundationMigrationRecorded(db);
+  await createNonceIndexes(db);
+  app.log.info({ phase: 'critical-indexes', status: 'ready' }, 'Startup phase completed');
 
   app.log.info({ phase: 'http-server', status: 'starting' }, 'Startup phase started');
   await app.listen({

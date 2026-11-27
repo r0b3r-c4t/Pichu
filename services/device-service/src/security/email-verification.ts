@@ -30,13 +30,12 @@ export async function requireVerifiedEmail(
       Buffer.alloc(0),
       authorization,
     );
-    const url = `${process.env.IDENTITY_SERVICE_URL ?? 'http://127.0.0.1:3001'}${path}`;
     const response = await internalJsonRequest({
-      url,
+      url: `${env.IDENTITY_SERVICE_URL}${path}`,
       signal: AbortSignal.timeout(4_000),
       headers,
       timeoutMs: 4_000,
-      tls: { caPath: process.env.TLS_CA_PATH ?? '' },
+      tls: { caPath: env.TLS_CA_PATH ?? '' },
     });
     if (response.status < 200 || response.status >= 300)
       throw new Error('Verification lookup failed');
