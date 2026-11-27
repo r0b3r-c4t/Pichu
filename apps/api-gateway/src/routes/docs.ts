@@ -11,7 +11,8 @@ export const gatewayOpenApiOptions = {
       { name: 'Health', description: 'Estado del Gateway' },
       { name: 'Identity', description: 'Autenticación y recuperación' },
       { name: 'Vehicles', description: 'Operaciones públicas de vehículos' },
-      { name: 'Invitations', description: 'Invitaciones y membresías' },
+      { name: 'Invitations', description: 'Invitaciones emitidas y recibidas' },
+      { name: 'Members', description: 'Administración de membresías del vehículo' },
       { name: 'Devices', description: 'Dispositivos del usuario verificado' },
     ],
     components: {

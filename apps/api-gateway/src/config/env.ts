@@ -26,6 +26,11 @@ export const gatewayEnvSchema = z.strictObject({
   RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(10_000).default(100),
   RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().min(1).max(86_400).default(60),
   SENSITIVE_RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(10_000).default(20),
+  /** Invitation issuance per authenticated user (instance-local, on top of the global limit). */
+  INVITATION_RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(1_000).default(10),
+  INVITATION_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().min(1).max(86_400).default(60),
+  /** Complementary invitation issuance limit per client IP within the same window. */
+  INVITATION_IP_RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(10_000).default(30),
 });
 
 export type GatewayEnv = z.infer<typeof gatewayEnvSchema>;

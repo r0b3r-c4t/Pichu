@@ -14,6 +14,11 @@ export interface Invitation {
   vehicleId: Types.ObjectId;
   inviterUserId: Types.ObjectId;
   inviteeUserId: Types.ObjectId;
+  /**
+   * Membership through which the inviter issued the invitation. Absent (null) only on documents
+   * created before TKT-012; such documents are accepted solely when issued by the canonical owner.
+   */
+  issuerMembershipId: Types.ObjectId | null;
   targetRole: InvitationTargetRole;
   permissions: string[];
   status: InvitationStatus;
@@ -47,6 +52,12 @@ const invitationSchema = new Schema<Invitation>(
     inviteeUserId: {
       type: Schema.Types.ObjectId,
       required: true,
+      immutable: true,
+    },
+    issuerMembershipId: {
+      type: Schema.Types.ObjectId,
+      ref: 'Membership',
+      default: null,
       immutable: true,
     },
     targetRole: {

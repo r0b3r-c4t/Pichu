@@ -1,6 +1,16 @@
 import {
   invitationParamsSchema,
+  invitationRevokeParamsSchema,
+  invitationRevokeRequestSchema,
+  memberLeaveRequestSchema,
+  memberListQuerySchema,
+  memberParamsSchema,
+  memberPermissionsUpdateRequestSchema,
+  memberReactivateRequestSchema,
+  memberTransitionRequestSchema,
   publicInvitationCreateRequestSchema,
+  receivedInvitationListQuerySchema,
+  vehicleInvitationListQuerySchema,
   VEHICLE_TEXT_LIMITS,
   vehicleArchiveRequestSchema,
   vehicleCreateRequestSchema,
@@ -77,6 +87,17 @@ export const vehicleIdParamsInputSchema = vehicleParamsSchema;
 export const invitationIdParamsInputSchema = invitationParamsSchema;
 export const invitationCreateBodySchema = publicInvitationCreateRequestSchema;
 export const invitationAcceptBodySchema = z.strictObject({});
+export const vehicleInvitationListQueryInputSchema = vehicleInvitationListQuerySchema;
+export const receivedInvitationListQueryInputSchema = receivedInvitationListQuerySchema;
+export const invitationRevokeParamsInputSchema = invitationRevokeParamsSchema;
+/** Bodies of the following transitions are optional; a missing body equals `{}`. */
+export const invitationRevokeBodySchema = z.union([z.undefined(), invitationRevokeRequestSchema]);
+export const memberListQueryInputSchema = memberListQuerySchema;
+export const memberParamsInputSchema = memberParamsSchema;
+export const memberPermissionsUpdateBodySchema = memberPermissionsUpdateRequestSchema;
+export const memberTransitionBodySchema = z.union([z.undefined(), memberTransitionRequestSchema]);
+export const memberReactivateBodySchema = z.union([z.undefined(), memberReactivateRequestSchema]);
+export const memberLeaveBodySchema = memberLeaveRequestSchema;
 export const deviceLinkBodySchema = z.strictObject({
   deviceIdentifier: z.string().trim().min(1).max(128),
   publicKey: z.string().trim().min(32).max(4096),

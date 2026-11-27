@@ -1,10 +1,20 @@
 import { z } from 'zod';
 import type { Types } from 'mongoose';
 import {
-  INVITATION_STATUSES,
+  invitationAdminViewSchema,
+  memberViewSchema,
+  membershipSchema,
+  receivedInvitationViewSchema,
+  type InvitationAdminView,
+  type MemberView,
+  type Membership,
+  type ReceivedInvitationView,
+} from '@pichu/contracts';
+import {
   MEMBERSHIP_ROLES,
   type InvitationStatus,
   type MembershipRole,
+  type MembershipStatus,
 } from '../models/vehicle-constants.js';
 
 const objectIdSchema = z.string().regex(/^[a-f0-9]{24}$/);
@@ -99,52 +109,88 @@ export function vehicleArchivePublicData(vehicle: {
   });
 }
 
-export const invitationPublicSchema = z.strictObject({
-  id: objectIdSchema,
-  vehicleId: objectIdSchema,
-  inviteeUserId: objectIdSchema,
-  permissions: z.array(z.string()),
-  status: z.enum(INVITATION_STATUSES),
-  expiresAt: z.string().datetime(),
-});
-export type InvitationPublic = z.infer<typeof invitationPublicSchema>;
-
-export function invitationPublicData(invitation: {
+interface InvitationProjectionSource {
   _id: Types.ObjectId;
   vehicleId: Types.ObjectId;
+  inviterUserId: Types.ObjectId;
   inviteeUserId: Types.ObjectId;
   permissions: string[];
-  status: InvitationStatus | string;
   expiresAt: Date;
-}): InvitationPublic {
-  return invitationPublicSchema.parse({
-    id: String(invitation._id),
+  createdAt: Date;
+  acceptedAt?: Date | null;
+  revokedAt?: Date | null;
+  revokeReason?: string | null;
+}
+
+/** Issuer/owner view; `status` must be the effective status computed by the domain. */
+export function invitationAdminViewData(
+  invitation: InvitationProjectionSource,
+  status: InvitationStatus,
+): InvitationAdminView {
+  return invitationAdminViewSchema.parse({
+    invitationId: String(invitation._id),
     vehicleId: String(invitation.vehicleId),
+    inviterUserId: String(invitation.inviterUserId),
     inviteeUserId: String(invitation.inviteeUserId),
     permissions: invitation.permissions,
-    status: invitation.status,
+    status,
     expiresAt: invitation.expiresAt.toISOString(),
+    createdAt: invitation.createdAt.toISOString(),
+    acceptedAt: invitation.acceptedAt?.toISOString() ?? null,
+    revokedAt: invitation.revokedAt?.toISOString() ?? null,
+    revokeReason: invitation.revokeReason ?? null,
   });
 }
 
-export const membershipPublicSchema = z.strictObject({
-  vehicleId: objectIdSchema,
-  userId: objectIdSchema,
-  role: z.enum(MEMBERSHIP_ROLES),
-  permissions: z.array(z.string()),
-});
-export type MembershipPublic = z.infer<typeof membershipPublicSchema>;
+/** Invitee view: never exposes the issuer, the issuing membership, or audit fields. */
+export function receivedInvitationViewData(
+  invitation: InvitationProjectionSource,
+  status: InvitationStatus,
+  vehicleName: string | null,
+): ReceivedInvitationView {
+  return receivedInvitationViewSchema.parse({
+    invitationId: String(invitation._id),
+    vehicleId: String(invitation.vehicleId),
+    vehicleName,
+    permissions: invitation.permissions,
+    status,
+    expiresAt: invitation.expiresAt.toISOString(),
+    createdAt: invitation.createdAt.toISOString(),
+  });
+}
 
-export function membershipPublicData(membership: {
+interface MembershipProjectionSource {
+  _id: Types.ObjectId;
   vehicleId: Types.ObjectId;
   userId: Types.ObjectId;
   role: MembershipRole | string;
   permissions: string[];
-}): MembershipPublic {
-  return membershipPublicSchema.parse({
+  status: MembershipStatus | string;
+}
+
+export function membershipPublicData(membership: MembershipProjectionSource): Membership {
+  return membershipSchema.parse({
+    membershipId: String(membership._id),
     vehicleId: String(membership.vehicleId),
     userId: String(membership.userId),
     role: membership.role,
     permissions: membership.permissions,
+    status: membership.status,
+  });
+}
+
+/** Owner-only administrative view; audit actors and reasons stay internal. */
+export function memberViewData(
+  membership: MembershipProjectionSource & {
+    createdAt: Date;
+    suspendedAt?: Date | null;
+    revokedAt?: Date | null;
+  },
+): MemberView {
+  return memberViewSchema.parse({
+    ...membershipPublicData(membership),
+    createdAt: membership.createdAt.toISOString(),
+    suspendedAt: membership.suspendedAt?.toISOString() ?? null,
+    revokedAt: membership.revokedAt?.toISOString() ?? null,
   });
 }

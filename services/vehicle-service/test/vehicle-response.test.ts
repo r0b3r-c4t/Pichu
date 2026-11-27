@@ -5,8 +5,10 @@ import { VehicleModel } from '../src/models/vehicle.model.js';
 import { MembershipModel } from '../src/models/membership.model.js';
 import { createVehicleTestApp, v2Headers } from './v2-fixture.js';
 import {
-  invitationPublicData,
+  invitationAdminViewData,
+  memberViewData,
   membershipPublicData,
+  receivedInvitationViewData,
   vehicleAccessPublicData,
   vehicleArchivePublicData,
   vehicleOwnerPublicData,
@@ -81,31 +83,85 @@ test('invitation and membership DTOs expose only persisted public state', () => 
   const id = new Types.ObjectId();
   const vehicleId = new Types.ObjectId();
   const userId = new Types.ObjectId();
-  const invitation = invitationPublicData({
+  const inviterUserId = new Types.ObjectId();
+  const source = {
     _id: id,
     vehicleId,
+    inviterUserId,
     inviteeUserId: userId,
+    issuerMembershipId: new Types.ObjectId(),
     permissions: ['vehicle:read'],
     status: 'PENDING',
     expiresAt: new Date('2026-11-10T12:00:00.000Z'),
+    createdAt: new Date('2026-11-03T12:00:00.000Z'),
+    acceptedAt: null,
+    revokedAt: null,
+    revokedByUserId: null,
+    revokeReason: null,
+    updatedByUserId: inviterUserId,
+  };
+  const invitation = invitationAdminViewData(source, 'EXPIRED');
+  assert.deepEqual(Object.keys(invitation).sort(), [
+    'acceptedAt',
+    'createdAt',
+    'expiresAt',
+    'invitationId',
+    'inviteeUserId',
+    'inviterUserId',
+    'permissions',
+    'revokeReason',
+    'revokedAt',
+    'status',
+    'vehicleId',
+  ]);
+  assert.equal(invitation.invitationId, String(id));
+  assert.equal(invitation.status, 'EXPIRED');
+  const received = receivedInvitationViewData(source, 'PENDING', 'Mazda');
+  assert.deepEqual(Object.keys(received).sort(), [
+    'createdAt',
+    'expiresAt',
+    'invitationId',
+    'permissions',
+    'status',
+    'vehicleId',
+    'vehicleName',
+  ]);
+  assert.equal(receivedInvitationViewData(source, 'PENDING', null).vehicleName, null);
+
+  const membershipId = new Types.ObjectId();
+  const membership = {
+    _id: membershipId,
+    vehicleId,
+    userId,
+    role: 'MEMBER',
+    permissions: ['vehicle:read'],
+    status: 'SUSPENDED',
+    createdAt: new Date('2026-11-03T12:00:00.000Z'),
+    suspendedAt: new Date('2026-11-04T12:00:00.000Z'),
+    suspendedByUserId: inviterUserId,
+    suspensionReason: 'internal note',
+    revokedAt: null,
+  };
+  assert.deepEqual(membershipPublicData(membership), {
+    membershipId: String(membershipId),
+    vehicleId: String(vehicleId),
+    userId: String(userId),
+    role: 'MEMBER',
+    permissions: ['vehicle:read'],
+    status: 'SUSPENDED',
   });
-  assert.equal(invitation.id, String(id));
-  assert.equal(invitation.vehicleId, String(vehicleId));
-  assert.equal(invitation.status, 'PENDING');
-  assert.deepEqual(
-    membershipPublicData({
-      vehicleId,
-      userId,
-      role: 'MEMBER',
-      permissions: ['vehicle:read'],
-    }),
-    {
-      vehicleId: String(vehicleId),
-      userId: String(userId),
-      role: 'MEMBER',
-      permissions: ['vehicle:read'],
-    },
-  );
+  assert.deepEqual(memberViewData(membership), {
+    membershipId: String(membershipId),
+    vehicleId: String(vehicleId),
+    userId: String(userId),
+    role: 'MEMBER',
+    permissions: ['vehicle:read'],
+    status: 'SUSPENDED',
+    createdAt: '2026-11-03T12:00:00.000Z',
+    suspendedAt: '2026-11-04T12:00:00.000Z',
+    revokedAt: null,
+  });
+  assert.throws(() => membershipPublicData({ ...membership, status: 'DELETED' }));
 });
 
 test('Vehicle Swagger exposes the public result schemas and examples', async (context) => {
@@ -153,6 +209,36 @@ test('Vehicle Swagger exposes the public result schemas and examples', async (co
   }
   const updateData = item?.patch.responses['200'].content?.['application/json'];
   assert.ok(updateData?.schema.properties?.data);
+
+  const documented: Array<[string, string, string[]]> = [
+    ['/vehicles/{vehicleId}/invitations', 'post', ['201', '400', '403', '404', '409']],
+    ['/vehicles/{vehicleId}/invitations', 'get', ['200', '400', '403', '404']],
+    ['/invitations', 'get', ['200', '400']],
+    ['/invitations/{invitationId}/accept', 'post', ['200', '400', '404', '409']],
+    ['/vehicles/{vehicleId}/invitations/{invitationId}', 'delete', ['200', '403', '404', '409']],
+    ['/vehicles/{vehicleId}/members', 'get', ['200', '400', '403', '404']],
+    ['/vehicles/{vehicleId}/members/{membershipId}', 'patch', ['200', '400', '403', '404', '409']],
+    ['/vehicles/{vehicleId}/members/{membershipId}', 'delete', ['200', '403', '404', '409']],
+    ['/vehicles/{vehicleId}/members/{membershipId}/suspend', 'post', ['200', '403', '404', '409']],
+    [
+      '/vehicles/{vehicleId}/members/{membershipId}/reactivate',
+      'post',
+      ['200', '403', '404', '409'],
+    ],
+    ['/vehicles/{vehicleId}/members/leave', 'post', ['200', '400', '404', '409']],
+  ];
+  for (const [path, method, statuses] of documented) {
+    const operation = document.paths[path]?.[method];
+    assert.ok(operation, `${method.toUpperCase()} ${path} documented`);
+    for (const status of statuses) {
+      assert.ok(operation.responses[status], `${method.toUpperCase()} ${path} ${status}`);
+    }
+  }
+  const memberData =
+    document.paths['/vehicles/{vehicleId}/members'].get.responses['200'].content?.[
+      'application/json'
+    ];
+  assert.ok(memberData?.schema.properties?.members);
 });
 
 function verifiedIdentityFetch(calls: { count: number }) {
@@ -499,4 +585,81 @@ test('invitation endpoint rejects self-invitations and unknown/wildcard permissi
     });
     assert.equal(badRes.statusCode, 400, `Expected 400 for invalid permission ${invalidPerm}`);
   }
+});
+
+test('membership and invitation administration routes reject forged or reserved fields before Identity', async (context) => {
+  let outboundCalls = 0;
+  context.mock.method(globalThis, 'fetch', async () => {
+    outboundCalls += 1;
+    return new Response(JSON.stringify({ verified: true, exists: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  });
+  const app = createVehicleTestApp();
+  context.after(async () => app.close());
+  const vehicleId = String(new Types.ObjectId());
+  const membershipId = String(new Types.ObjectId());
+  const invitationId = String(new Types.ObjectId());
+  const userId = String(new Types.ObjectId());
+  const attempts: Array<{
+    method: 'POST' | 'PATCH' | 'DELETE' | 'GET';
+    url: string;
+    body?: unknown;
+  }> = [
+    {
+      method: 'PATCH',
+      url: `/vehicles/${vehicleId}/members/${membershipId}`,
+      body: { userId, permissions: ['vehicle:read'], role: 'OWNER' },
+    },
+    {
+      method: 'PATCH',
+      url: `/vehicles/${vehicleId}/members/${membershipId}`,
+      body: { userId, permissions: ['vehicle:read'], status: 'ACTIVE' },
+    },
+    {
+      method: 'POST',
+      url: `/vehicles/${vehicleId}/members/${membershipId}/suspend`,
+      body: { userId, suspendedByUserId: userId },
+    },
+    {
+      method: 'POST',
+      url: `/vehicles/${vehicleId}/members/${membershipId}/reactivate`,
+      body: { userId, reason: 'not accepted' },
+    },
+    {
+      method: 'DELETE',
+      url: `/vehicles/${vehicleId}/members/${membershipId}`,
+      body: { userId, revokedByUserId: userId },
+    },
+    {
+      method: 'POST',
+      url: `/vehicles/${vehicleId}/members/leave`,
+      body: { userId, targetUserId: String(new Types.ObjectId()) },
+    },
+    { method: 'POST', url: `/vehicles/${vehicleId}/members/leave`, body: { userId } },
+    {
+      method: 'DELETE',
+      url: `/vehicles/${vehicleId}/invitations/${invitationId}`,
+      body: { userId, status: 'REVOKED' },
+    },
+    { method: 'POST', url: `/vehicles/${vehicleId}/members/not-an-id/suspend`, body: { userId } },
+    { method: 'GET', url: `/vehicles/${vehicleId}/members?userId=${userId}&limit=101` },
+    { method: 'GET', url: `/vehicles/${vehicleId}/invitations?userId=${userId}&status=OPEN` },
+    { method: 'GET', url: `/invitations?userId=${userId}&cursor=${'a'.repeat(257)}` },
+    { method: 'GET', url: '/invitations' },
+  ];
+  for (const attempt of attempts) {
+    const payload =
+      attempt.body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(attempt.body));
+    const response = await app.inject({
+      method: attempt.method,
+      url: attempt.url,
+      ...(attempt.body === undefined ? {} : { payload }),
+      headers: v2Headers(payload, attempt.method, attempt.url),
+    });
+    assert.equal(response.statusCode, 400, `${attempt.method} ${attempt.url}`);
+    assert.equal(response.json().error, 'VALIDATION_ERROR');
+  }
+  assert.equal(outboundCalls, 0);
 });

@@ -4,13 +4,24 @@ import swaggerUi from '@fastify/swagger-ui';
 import type { OpenAPIV3 } from 'openapi-types';
 import { z } from 'zod';
 import {
+  internalInvitationCreateRequestSchema,
+  internalInvitationRevokeRequestSchema,
+  internalMemberLeaveRequestSchema,
+  internalMemberPermissionsUpdateRequestSchema,
+  internalMemberReactivateRequestSchema,
+  internalMemberTransitionRequestSchema,
   internalVehicleArchiveRequestSchema,
   internalVehicleCreateRequestSchema,
   internalVehicleUpdateRequestSchema,
+  invitationAcceptRequestSchema,
+  invitationAdminViewSchema,
+  invitationStatusSchema,
+  memberViewSchema,
+  membershipSchema,
+  membershipStatusSchema,
+  receivedInvitationViewSchema,
 } from '@pichu/contracts';
 import {
-  invitationPublicSchema,
-  membershipPublicSchema,
   vehicleAccessPublicSchema,
   vehicleArchivePublicSchema,
   vehicleOwnerPublicSchema,
@@ -31,8 +42,31 @@ const document = {
       patch: { summary: 'Actualizar parcialmente un vehículo (solo propietario canónico)' },
       delete: { summary: 'Archivar lógicamente un vehículo (solo propietario canónico)' },
     },
-    '/vehicles/{vehicleId}/invitations': { post: { summary: 'Crear invitación' } },
+    '/vehicles/{vehicleId}/invitations': {
+      post: { summary: 'Crear invitación (propietario o delegado autorizado)' },
+      get: { summary: 'Listar invitaciones emitidas del vehículo (paginación keyset)' },
+    },
+    '/vehicles/{vehicleId}/invitations/{invitationId}': {
+      delete: { summary: 'Revocar invitación pendiente' },
+    },
+    '/invitations': { get: { summary: 'Listar invitaciones recibidas por el usuario' } },
     '/invitations/{invitationId}/accept': { post: { summary: 'Aceptar invitación' } },
+    '/vehicles/{vehicleId}/members': {
+      get: { summary: 'Listar miembros del vehículo (solo propietario canónico)' },
+    },
+    '/vehicles/{vehicleId}/members/leave': {
+      post: { summary: 'Abandonar voluntariamente el vehículo (membresía MEMBER propia)' },
+    },
+    '/vehicles/{vehicleId}/members/{membershipId}': {
+      patch: { summary: 'Reemplazar permisos base de un miembro (solo propietario canónico)' },
+      delete: { summary: 'Revocar membresía (solo propietario canónico, idempotente)' },
+    },
+    '/vehicles/{vehicleId}/members/{membershipId}/suspend': {
+      post: { summary: 'Suspender membresía (solo propietario canónico)' },
+    },
+    '/vehicles/{vehicleId}/members/{membershipId}/reactivate': {
+      post: { summary: 'Reactivar membresía suspendida (solo propietario canónico)' },
+    },
     '/vehicles/{vehicleId}/devices/link': { post: { summary: 'Registrar dispositivo vinculado' } },
   },
 };
@@ -68,7 +102,8 @@ const paths = document.paths as unknown as Record<string, Record<string, Record<
 const vehicleTags = [
   { name: 'Health', description: 'Estado y disponibilidad del servicio' },
   { name: 'Vehicles', description: 'Vehículos y acceso aislado por recurso' },
-  { name: 'Invitations', description: 'Invitaciones y membresías' },
+  { name: 'Invitations', description: 'Invitaciones' },
+  { name: 'Members', description: 'Administración de membresías' },
   { name: 'Devices', description: 'Vinculación autorizada de dispositivos' },
 ];
 (document as unknown as { tags: typeof vehicleTags }).tags = vehicleTags;
@@ -77,9 +112,11 @@ for (const [path, operations] of Object.entries(paths)) {
     ? 'Health'
     : path.includes('invitations')
       ? 'Invitations'
-      : path.includes('/devices/')
-        ? 'Devices'
-        : 'Vehicles';
+      : path.includes('/members')
+        ? 'Members'
+        : path.includes('/devices/')
+          ? 'Devices'
+          : 'Vehicles';
   for (const operation of Object.values(operations)) operation.tags = [tag];
 }
 for (const operations of Object.values(paths))
@@ -321,65 +358,367 @@ paths['/vehicles/{vehicleId}'].delete.responses = {
   409: domainError('Vehicle changed concurrently', 'CONFLICT', 'Concurrent state change'),
   500: error,
 };
+const actorUserIdExample = '507f1f77bcf86cd799439011';
+const invitationExample = {
+  invitationId: '507f1f77bcf86cd799439013',
+  vehicleId: vehicleExample.id,
+  inviterUserId: actorUserIdExample,
+  inviteeUserId: '507f1f77bcf86cd799439014',
+  permissions: ['vehicle:read'],
+  status: 'PENDING',
+  expiresAt: '2026-12-03T12:00:00.000Z',
+  createdAt: '2026-11-26T12:00:00.000Z',
+  acceptedAt: null,
+  revokedAt: null,
+  revokeReason: null,
+};
+const membershipExample = {
+  membershipId: '507f1f77bcf86cd799439016',
+  vehicleId: vehicleExample.id,
+  userId: '507f1f77bcf86cd799439014',
+  role: 'MEMBER',
+  permissions: ['vehicle:read'],
+  status: 'ACTIVE',
+};
+const memberExample = {
+  ...membershipExample,
+  createdAt: '2026-11-26T12:00:00.000Z',
+  suspendedAt: null,
+  revokedAt: null,
+};
+const pageSchema = z.strictObject({ nextCursor: z.string().nullable() });
+const invitationNotFound = domainError(
+  'Inexistent, foreign, or invisible invitation (uniform)',
+  'NOT_FOUND',
+  'Invitation not found',
+);
+const membershipNotFound = domainError(
+  'Vehicle or membership not visible, inexistent, or from another vehicle (uniform)',
+  'NOT_FOUND',
+  'Membership not found',
+);
+const insufficientPermissions = domainError(
+  'Caller can read the vehicle but lacks the required authority',
+  'FORBIDDEN',
+  'Insufficient permissions to invite members',
+);
+function stateConflict(description: string, text: string) {
+  return domainError(description, 'CONFLICT', text);
+}
+const membershipConflict = stateConflict(
+  'OWNER membership, incompatible membership state, archived vehicle, or concurrent change',
+  'Cannot suspend membership in status REVOKED',
+);
+
+const userIdQuery = {
+  name: 'userId',
+  in: 'query',
+  required: true,
+  description: 'Identidad derivada del JWT verificado por el Gateway y firmada con HMAC v2',
+  schema: { type: 'string', pattern: '^[a-f0-9]{24}$' },
+};
+const pageQuery = [
+  {
+    name: 'limit',
+    in: 'query',
+    required: false,
+    schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+  },
+  {
+    name: 'cursor',
+    in: 'query',
+    required: false,
+    description:
+      'Cursor keyset opaco (base64url) ligado a actor, recurso, tipo de listado y filtros. ' +
+      'No está cifrado ni firmado y nunca concede acceso.',
+    schema: { type: 'string', maxLength: 256, pattern: '^[A-Za-z0-9_-]+$' },
+  },
+];
+function statusQuery(values: readonly string[], description: string) {
+  return {
+    name: 'status',
+    in: 'query',
+    required: false,
+    description,
+    schema: { type: 'string', enum: [...values] },
+  };
+}
+
+paths['/vehicles/{vehicleId}/invitations'].post.requestBody = jsonRequestBody(
+  internalInvitationCreateRequestSchema,
+  requestExamples['/vehicles/{vehicleId}/invitations'],
+);
+paths['/vehicles/{vehicleId}/invitations'].post.description =
+  'Orden: autenticación, autorización sobre el vehículo, validación de permisos delegados, ' +
+  'consulta de existencia en Identity y revalidación transaccional. Un MEMBER con ' +
+  'vehicle:manage o invitation:create sólo delega vehicle:read, device:read o module:read que ' +
+  'posea directamente. Una invitación pendiente vigente duplicada es 409 y nunca se sobrescribe.';
 paths['/vehicles/{vehicleId}/invitations'].post.responses = {
   201: result(
     'Invitation created',
     z.strictObject({
       invitationId: z.string(),
-      status: z.string(),
+      status: invitationStatusSchema,
       message,
-      data: invitationPublicSchema,
+      data: invitationAdminViewSchema,
       requestId,
     }),
     {
-      invitationId: '507f1f77bcf86cd799439013',
+      invitationId: invitationExample.invitationId,
       status: 'PENDING',
       message: 'Invitation created',
-      data: {
-        id: '507f1f77bcf86cd799439013',
-        vehicleId: vehicleExample.id,
-        inviteeUserId: '507f1f77bcf86cd799439014',
-        permissions: ['vehicle:read'],
-        status: 'PENDING',
-        expiresAt: '2026-11-10T12:00:00.000Z',
-      },
+      data: invitationExample,
       requestId: 'request-1',
     },
   ),
-  400: error,
+  400: vehicleValidationError,
   401: error,
-  404: error,
-  409: error,
+  403: insufficientPermissions,
+  404: domainError('Vehicle not visible, or invitee not found', 'NOT_FOUND', 'Vehicle not found'),
+  409: stateConflict(
+    'Owner invitee, active/suspended membership, or pending invitation already exists',
+    'A pending invitation already exists for this user',
+  ),
   503: error,
+  504: error,
 };
+paths['/vehicles/{vehicleId}/invitations'].get.parameters = [
+  ...(paths['/vehicles/{vehicleId}/invitations'].get.parameters as unknown[]),
+  userIdQuery,
+  ...pageQuery,
+  statusQuery(invitationStatusSchema.options, 'Estado efectivo; sin filtro se listan todos'),
+];
+paths['/vehicles/{vehicleId}/invitations'].get.responses = {
+  200: result(
+    'Issued invitations (owner: all; delegate: own current membership), createdAt ASC, _id ASC',
+    z.strictObject({
+      invitations: z.array(invitationAdminViewSchema),
+      page: pageSchema,
+      requestId,
+    }),
+    { invitations: [invitationExample], page: { nextCursor: null }, requestId: 'request-1' },
+  ),
+  400: vehicleValidationError,
+  401: error,
+  403: domainError(
+    'Caller can read the vehicle but lacks invitation authority',
+    'FORBIDDEN',
+    'Insufficient permissions to list invitations',
+  ),
+  404: vehicleNotFound,
+};
+paths['/invitations'].get.parameters = [
+  userIdQuery,
+  ...pageQuery,
+  statusQuery(invitationStatusSchema.options, 'Estado efectivo; por defecto PENDING vigentes'),
+];
+paths['/invitations'].get.responses = {
+  200: result(
+    "Caller's received invitations, createdAt ASC, _id ASC",
+    z.strictObject({
+      invitations: z.array(receivedInvitationViewSchema),
+      page: pageSchema,
+      requestId,
+    }),
+    {
+      invitations: [
+        {
+          invitationId: invitationExample.invitationId,
+          vehicleId: vehicleExample.id,
+          vehicleName: vehicleExample.name,
+          permissions: ['vehicle:read'],
+          status: 'PENDING',
+          expiresAt: invitationExample.expiresAt,
+          createdAt: invitationExample.createdAt,
+        },
+      ],
+      page: { nextCursor: null },
+      requestId: 'request-1',
+    },
+  ),
+  400: vehicleValidationError,
+  401: error,
+};
+paths['/invitations/{invitationId}/accept'].post.requestBody = jsonRequestBody(
+  invitationAcceptRequestSchema,
+  requestExamples['/invitations/{invitationId}/accept'],
+);
 paths['/invitations/{invitationId}/accept'].post.responses = {
   200: result(
-    'Invitation accepted',
+    'Invitation accepted; a new MEMBER membership without inherited grants is created',
     z.strictObject({
       accepted: z.literal(true),
       vehicleId: z.string(),
       message,
-      data: membershipPublicSchema,
+      data: membershipSchema,
       requestId,
     }),
     {
       accepted: true,
       vehicleId: vehicleExample.id,
       message: 'Invitation accepted',
+      data: membershipExample,
+      requestId: 'request-1',
+    },
+  ),
+  400: vehicleValidationError,
+  401: error,
+  404: invitationNotFound,
+  409: stateConflict(
+    'Own invitation not pending, expired (persisted EXPIRED), issuer authority lost ' +
+      '(persisted REVOKED issuer_authority_lost), or incompatible membership',
+    'Invitation is no longer pending',
+  ),
+  500: error,
+};
+paths['/vehicles/{vehicleId}/invitations/{invitationId}'].delete.requestBody = jsonRequestBody(
+  internalInvitationRevokeRequestSchema,
+  { userId: actorUserIdExample, reason: 'Wrong recipient' },
+);
+paths['/vehicles/{vehicleId}/invitations/{invitationId}'].delete.responses = {
+  200: result(
+    'Invitation revoked, or already revoked (original record, unchanged)',
+    z.strictObject({
+      invitationId: z.string(),
+      status: z.literal('REVOKED'),
+      message,
+      data: invitationAdminViewSchema,
+      requestId,
+    }),
+    {
+      invitationId: invitationExample.invitationId,
+      status: 'REVOKED',
+      message: 'Invitation revoked',
       data: {
-        vehicleId: vehicleExample.id,
-        userId: '507f1f77bcf86cd799439014',
-        role: 'MEMBER',
-        permissions: ['vehicle:read'],
+        ...invitationExample,
+        status: 'REVOKED',
+        revokedAt: '2026-11-26T13:00:00.000Z',
+        revokeReason: 'Wrong recipient',
       },
       requestId: 'request-1',
     },
   ),
-  400: error,
+  400: vehicleValidationError,
   401: error,
-  404: error,
-  409: error,
-  500: error,
+  403: insufficientPermissions,
+  404: invitationNotFound,
+  409: stateConflict('Invitation accepted or expired', 'Invitation already expired'),
+};
+paths['/vehicles/{vehicleId}/members'].get.parameters = [
+  ...(paths['/vehicles/{vehicleId}/members'].get.parameters as unknown[]),
+  userIdQuery,
+  ...pageQuery,
+  statusQuery(
+    membershipStatusSchema.options,
+    'Por defecto ACTIVE y SUSPENDED; REVOKED requiere filtro explícito',
+  ),
+];
+paths['/vehicles/{vehicleId}/members'].get.responses = {
+  200: result(
+    'Vehicle members, createdAt ASC, _id ASC',
+    z.strictObject({ members: z.array(memberViewSchema), page: pageSchema, requestId }),
+    { members: [memberExample], page: { nextCursor: null }, requestId: 'request-1' },
+  ),
+  400: vehicleValidationError,
+  401: error,
+  403: vehicleOwnerOnly,
+  404: vehicleNotFound,
+};
+const memberMutationSchema = z.strictObject({
+  membershipId: z.string(),
+  status: membershipStatusSchema,
+  message,
+  data: memberViewSchema,
+  requestId,
+});
+function memberMutationResponses(description: string, text: string, data: unknown) {
+  return {
+    200: result(description, memberMutationSchema, {
+      membershipId: memberExample.membershipId,
+      status: (data as { status: string }).status,
+      message: text,
+      data,
+      requestId: 'request-1',
+    }),
+    400: vehicleValidationError,
+    401: error,
+    403: vehicleOwnerOnly,
+    404: membershipNotFound,
+    409: membershipConflict,
+  };
+}
+const memberPath = '/vehicles/{vehicleId}/members/{membershipId}';
+paths[memberPath].patch.requestBody = jsonRequestBody(
+  internalMemberPermissionsUpdateRequestSchema,
+  { userId: actorUserIdExample, permissions: ['vehicle:read', 'device:read'] },
+);
+paths[memberPath].patch.description =
+  'Reemplaza el conjunto completo de permisos base (vacío permitido) de una membresía MEMBER ' +
+  'ACTIVE o SUSPENDED. No modifica rol, identidad, estado ni auditoría. Las AccessGrants son ' +
+  'independientes y no se revocan implícitamente; las invitaciones pendientes emitidas por el ' +
+  'miembro que el nuevo conjunto ya no autoriza se revocan en la misma transacción.';
+paths[memberPath].patch.responses = memberMutationResponses(
+  'Permissions replaced (or unchanged)',
+  'Member permissions updated',
+  { ...memberExample, permissions: ['vehicle:read', 'device:read'] },
+);
+paths[memberPath].delete.requestBody = jsonRequestBody(internalMemberTransitionRequestSchema, {
+  userId: actorUserIdExample,
+  reason: 'No longer drives the car',
+});
+paths[memberPath].delete.responses = memberMutationResponses(
+  'Membership revoked with its grants and pending issued invitations; repeating returns the ' +
+    'original revocation unchanged',
+  'Member revoked',
+  { ...memberExample, status: 'REVOKED', revokedAt: '2026-11-26T13:00:00.000Z' },
+);
+paths[`${memberPath}/suspend`].post.requestBody = jsonRequestBody(
+  internalMemberTransitionRequestSchema,
+  { userId: actorUserIdExample, reason: 'Temporary' },
+);
+paths[`${memberPath}/suspend`].post.responses = memberMutationResponses(
+  'Membership suspended; its active AccessGrants and pending issued invitations are revoked',
+  'Member suspended',
+  { ...memberExample, status: 'SUSPENDED', suspendedAt: '2026-11-26T13:00:00.000Z' },
+);
+paths[`${memberPath}/reactivate`].post.requestBody = jsonRequestBody(
+  internalMemberReactivateRequestSchema,
+  { userId: actorUserIdExample },
+);
+paths[`${memberPath}/reactivate`].post.responses = memberMutationResponses(
+  'Membership reactivated with its current base permissions only (no grants or invitations)',
+  'Member reactivated',
+  memberExample,
+);
+paths['/vehicles/{vehicleId}/members/leave'].post.requestBody = jsonRequestBody(
+  internalMemberLeaveRequestSchema,
+  { userId: '507f1f77bcf86cd799439014', membershipId: memberExample.membershipId },
+);
+paths['/vehicles/{vehicleId}/members/leave'].post.responses = {
+  200: result(
+    'Own MEMBER membership revoked (member_left), or the targeted one was already revoked',
+    z.strictObject({
+      membershipId: z.string(),
+      status: z.literal('REVOKED'),
+      message,
+      data: membershipSchema,
+      requestId,
+    }),
+    {
+      membershipId: memberExample.membershipId,
+      status: 'REVOKED',
+      message: 'Left vehicle',
+      data: { ...membershipExample, status: 'REVOKED' },
+      requestId: 'request-1',
+    },
+  ),
+  400: vehicleValidationError,
+  401: error,
+  404: membershipNotFound,
+  409: stateConflict(
+    'The canonical owner cannot leave',
+    'The vehicle owner cannot leave the vehicle',
+  ),
 };
 paths['/vehicles/{vehicleId}/devices/link'].post.responses = {
   201: result(

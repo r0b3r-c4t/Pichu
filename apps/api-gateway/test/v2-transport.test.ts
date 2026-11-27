@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHmac } from 'node:crypto';
 import { createApp } from '../src/app.js';
+import { gatewayEnvSchema, type GatewayEnv } from '../src/config/env.js';
 import { testInternalAuthEnv } from './test-env.js';
 
 function token(secret: string): string {
@@ -19,11 +20,11 @@ function token(secret: string): string {
   return `${header}.${payload}.${createHmac('sha256', secret).update(`${header}.${payload}`).digest('base64url')}`;
 }
 
-function env(secret: string) {
-  return {
+function env(secret: string): GatewayEnv {
+  return gatewayEnvSchema.parse({
     HOST: '127.0.0.1',
     PORT: 3000,
-    NODE_ENV: 'test' as const,
+    NODE_ENV: 'test',
     ...testInternalAuthEnv,
     JWT_SECRET: secret,
     JWT_ISSUER: 'issuer',
@@ -32,7 +33,7 @@ function env(secret: string) {
     DEVICE_SERVICE_URL: 'http://device.test',
     IDENTITY_SERVICE_URL: 'http://identity.test',
     PROXY_TIMEOUT_MS: 100,
-  };
+  });
 }
 
 function identityProfile() {
@@ -125,12 +126,17 @@ test('Gateway derives inviterUserId from authenticated JWT when proxying invitat
           status: 'PENDING',
           message: 'Invitation created',
           data: {
-            id: invitationId,
+            invitationId,
             vehicleId,
+            inviterUserId: '507f1f77bcf86cd799439011',
             inviteeUserId,
             permissions: ['vehicle:read'],
             status: 'PENDING',
             expiresAt: '2026-12-01T00:00:00.000Z',
+            createdAt: '2026-11-24T00:00:00.000Z',
+            acceptedAt: null,
+            revokedAt: null,
+            revokeReason: null,
           },
           requestId: 'gateway-inv-1',
         }),
