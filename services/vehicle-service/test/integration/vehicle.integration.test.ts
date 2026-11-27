@@ -59,6 +59,11 @@ import {
   VehicleServiceError,
   type VehicleAuditEvent,
 } from '../../src/services/vehicle.service.js';
+import {
+  resourceAuthorization,
+  type AuthorizationContext,
+  type VehicleAccessCandidate,
+} from '../../src/services/resource-authorization.service.js';
 import { setupVehicleTestAuth } from '../v2-fixture.js';
 
 const execFileAsync = promisify(execFile);
@@ -125,6 +130,20 @@ async function resetVehicleCollections(): Promise<void> {
     InvitationModel.deleteMany({}),
     AccessGrantModel.deleteMany({}),
   ]);
+}
+
+/** Explicit test fixture of verified ownership evidence (no authoritative source exists yet). */
+function testOwnershipEvidence(
+  scopeType: 'DEVICE' | 'MODULE',
+  resourceId: Types.ObjectId,
+  vehicleId: Types.ObjectId,
+) {
+  return createVerifiedExternalResourceBinding({
+    scopeType,
+    resourceId,
+    vehicleId,
+    isActive: true,
+  });
 }
 
 test('1. Multi-brand vehicles and incomplete technical metadata persist without Mazda assumptions', async () => {
@@ -590,6 +609,7 @@ test('8. AccessGrant rules: multiple grants, cascade revocation, non-inheritance
         actorUserId: memberA,
         scopeType: 'DEVICE',
         scopeResourceId: device1,
+        verifiedResourceBinding: testOwnershipEvidence('DEVICE', device1, vehicle1._id),
         channel: 'ONLINE',
         permissions: ['device:read'],
         now,
@@ -635,6 +655,7 @@ test('8. AccessGrant rules: multiple grants, cascade revocation, non-inheritance
     actorUserId: ownerId,
     scopeType: 'DEVICE',
     scopeResourceId: device1,
+    verifiedResourceBinding: testOwnershipEvidence('DEVICE', device1, vehicle1._id),
     channel: 'ONLINE',
     permissions: ['device:read', 'device:command'],
     startsAt: now,
@@ -649,6 +670,7 @@ test('8. AccessGrant rules: multiple grants, cascade revocation, non-inheritance
     actorUserId: ownerId,
     scopeType: 'DEVICE',
     scopeResourceId: device1,
+    verifiedResourceBinding: testOwnershipEvidence('DEVICE', device1, vehicle1._id),
     channel: 'BLE_OFFLINE',
     permissions: ['device:connect', 'device:command'],
     startsAt: now,
@@ -663,6 +685,7 @@ test('8. AccessGrant rules: multiple grants, cascade revocation, non-inheritance
     actorUserId: ownerId,
     scopeType: 'DEVICE',
     scopeResourceId: device2,
+    verifiedResourceBinding: testOwnershipEvidence('DEVICE', device2, vehicle1._id),
     channel: 'ONLINE',
     permissions: ['device:read'],
     startsAt: now,
@@ -677,6 +700,7 @@ test('8. AccessGrant rules: multiple grants, cascade revocation, non-inheritance
     actorUserId: ownerId,
     scopeType: 'MODULE',
     scopeResourceId: moduleSunroof,
+    verifiedResourceBinding: testOwnershipEvidence('MODULE', moduleSunroof, vehicle1._id),
     channel: 'ONLINE',
     permissions: ['module:actuate'],
     startsAt: inOneHour,
@@ -1244,6 +1268,7 @@ test('10b. Cross-document concurrent integrity: AccessGrant vs revokeMembership,
         actorUserId: ownerId,
         scopeType: 'DEVICE',
         scopeResourceId: deviceId,
+        verifiedResourceBinding: testOwnershipEvidence('DEVICE', deviceId, vehicle._id),
         channel: 'ONLINE',
         permissions: ['device:read', 'device:command'],
       }),
@@ -1289,6 +1314,7 @@ test('10b. Cross-document concurrent integrity: AccessGrant vs revokeMembership,
         actorUserId: ownerId,
         scopeType: 'DEVICE',
         scopeResourceId: deviceId,
+        verifiedResourceBinding: testOwnershipEvidence('DEVICE', deviceId, vehicle._id),
         channel: 'ONLINE',
         permissions: ['device:read'],
       }),
@@ -1709,6 +1735,7 @@ test('14. TKT-011 read access: only current VEHICLE ONLINE/ANY grants with vehic
 
   assert.equal(await isVisible(), false);
   const deviceId = new Types.ObjectId();
+  const moduleId = new Types.ObjectId();
   await createAccessGrant({
     vehicleId: vehicle._id,
     membershipId: member.membershipId,
@@ -1716,6 +1743,7 @@ test('14. TKT-011 read access: only current VEHICLE ONLINE/ANY grants with vehic
     actorUserId: ownerId,
     scopeType: 'DEVICE',
     scopeResourceId: deviceId,
+    verifiedResourceBinding: testOwnershipEvidence('DEVICE', deviceId, vehicle._id),
     channel: 'ONLINE',
     permissions: ['device:read'],
   });
@@ -1725,7 +1753,8 @@ test('14. TKT-011 read access: only current VEHICLE ONLINE/ANY grants with vehic
     subjectUserId: member.memberId,
     actorUserId: ownerId,
     scopeType: 'MODULE',
-    scopeResourceId: new Types.ObjectId(),
+    scopeResourceId: moduleId,
+    verifiedResourceBinding: testOwnershipEvidence('MODULE', moduleId, vehicle._id),
     channel: 'ONLINE',
     permissions: ['module:read'],
   });
@@ -2973,6 +3002,23 @@ test('11. End-to-end Gateway -> Vehicle -> Identity/Device over real HTTPS, HMAC
       });
       assert.equal(linkRes.status, 201);
     }
+
+    // TKT-013: the canonical OWNER links through OWNER_ROLE; without authorization the
+    // response is a uniform 404 and Device is never reached.
+    const linkAs = (jwt: string, targetVehicleId: string) =>
+      fetch(`${gatewayUrl}/api/vehicles/${targetVehicleId}/devices/link`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${jwt}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          deviceIdentifier: `esp32-tkt013-${randomUUID().slice(0, 8)}`,
+          publicKey: generateKeyPairSync('ed25519')
+            .publicKey.export({ type: 'spki', format: 'pem' })
+            .toString(),
+        }),
+      });
+    assert.equal((await linkAs(ownerJwt, vehicleId)).status, 201);
+    const deniedLink = await linkAs(inviteeJwt, String(new Types.ObjectId()));
+    assert.equal(deniedLink.status, 404);
 
     // HMAC v2 replay rejection directly against Vehicle HTTPS endpoint
     const gwVehKey = keys.find(
@@ -5120,7 +5166,7 @@ test('28. TKT-012 permission updates audit actor and date without touching ident
     channel: 'ONLINE' as const,
   };
   await createAccessGrant({ ...grantFrame, permissions: ['vehicle:read'] });
-  const revokedGrant = await createAccessGrant({ ...grantFrame, permissions: ['device:read'] });
+  const revokedGrant = await createAccessGrant({ ...grantFrame, permissions: ['device:link'] });
   await revokeAccessGrant({
     vehicleId: vehicle._id,
     grantId: revokedGrant._id,
@@ -5227,4 +5273,797 @@ test('28. TKT-012 permission updates audit actor and date without touching ident
       }),
     'CONFLICT',
   );
+});
+
+function vehicleContext(
+  vehicleId: Types.ObjectId,
+  actorUserId: Types.ObjectId,
+  permission: AuthorizationContext['permission'],
+  channel: AuthorizationContext['channel'] = 'ONLINE',
+): AuthorizationContext {
+  return { actorUserId, vehicleId, resource: { type: 'VEHICLE' }, channel, permission };
+}
+
+function externalContext(
+  vehicleId: Types.ObjectId,
+  actorUserId: Types.ObjectId,
+  resource: AuthorizationContext['resource'],
+  permission: AuthorizationContext['permission'],
+  channel: AuthorizationContext['channel'] = 'ONLINE',
+): AuthorizationContext {
+  return { actorUserId, vehicleId, resource, channel, permission };
+}
+
+const atTime = (instant: Date) => ({ clock: () => instant });
+
+test('29. TKT-013 user and vehicle isolation: per-vehicle authority, exact roles, and read semantics', async () => {
+  await resetVehicleCollections();
+  const ownerA = new Types.ObjectId();
+  const ownerB = new Types.ObjectId();
+  const vehicleA = await createVehicle(ownerA, { name: 'Isolation A' });
+  const vehicleB = await createVehicle(ownerB, { name: 'Isolation B' });
+  const evaluate = (context: AuthorizationContext) => resourceAuthorization.evaluate(context);
+
+  // The owner of A has no authority on B, even for reserved permissions.
+  const ownerOnA = await evaluate(vehicleContext(vehicleA._id, ownerA, 'vehicle:archive'));
+  assert.equal(ownerOnA.allowed, true);
+  assert.equal(ownerOnA.allowed && ownerOnA.source, 'OWNER_ROLE');
+  const ownerOnB = await evaluate(vehicleContext(vehicleB._id, ownerA, 'vehicle:read'));
+  assert.equal(ownerOnB.allowed, false);
+  assert.equal(ownerOnB.reason, 'MEMBERSHIP_INACTIVE_OR_MISSING');
+  assert.equal(await resourceAuthorization.isOwner(vehicleB._id, ownerA), false);
+  assert.equal(await resourceAuthorization.isMember(vehicleB._id, ownerA), false);
+  assert.equal(await resourceAuthorization.isMember(vehicleA._id, ownerA), true);
+  assert.equal(await resourceAuthorization.hasRole(vehicleA._id, ownerA, 'MEMBER'), false);
+  await rejectsWithCode(
+    () =>
+      resourceAuthorization.assertPermission(vehicleContext(vehicleB._id, ownerA, 'vehicle:read')),
+    'NOT_FOUND',
+  );
+
+  // The same user holds different permissions on two vehicles; nothing leaks across them.
+  const sharedUser = new Types.ObjectId();
+  const invitationA = await inviteMember(vehicleA._id, ownerA, sharedUser, [
+    'vehicle:read',
+    'device:link',
+  ]);
+  const invitationB = await inviteMember(vehicleB._id, ownerB, sharedUser, [
+    'vehicle:read',
+    'vehicle:update',
+  ]);
+  assert.ok(invitationA && invitationB);
+  assert.ok(await acceptInvitation(invitationA._id, sharedUser));
+  assert.ok(await acceptInvitation(invitationB._id, sharedUser));
+  assert.equal(
+    (await evaluate(vehicleContext(vehicleA._id, sharedUser, 'device:link'))).allowed,
+    true,
+  );
+  assert.equal(
+    (await evaluate(vehicleContext(vehicleB._id, sharedUser, 'device:link'))).allowed,
+    false,
+  );
+  assert.equal(
+    (await evaluate(vehicleContext(vehicleA._id, sharedUser, 'vehicle:update'))).allowed,
+    false,
+  );
+  const updateOnB = await evaluate(vehicleContext(vehicleB._id, sharedUser, 'vehicle:update'));
+  assert.equal(updateOnB.allowed && updateOnB.source, 'MEMBERSHIP_PERMISSION');
+  assert.equal(await canLinkDeviceToVehicle(vehicleA._id, sharedUser), true);
+  assert.equal(await canLinkDeviceToVehicle(vehicleB._id, sharedUser), false);
+  assert.equal(await resourceAuthorization.hasRole(vehicleB._id, sharedUser, 'MEMBER'), true);
+  assert.equal(await resourceAuthorization.isOwner(vehicleB._id, sharedUser), false);
+  // A generic ALLOW never replaces the operation policy: vehicle updates stay OWNER-only.
+  await rejectsWithCode(
+    () =>
+      updateVehicle({ vehicleId: vehicleB._id, actorUserId: sharedUser, changes: { trim: 'X' } }),
+    'FORBIDDEN',
+  );
+  // Reserved permissions stay OWNER-only for members.
+  const reserved = await evaluate(vehicleContext(vehicleB._id, sharedUser, 'vehicle:archive'));
+  assert.equal(reserved.reason, 'OWNER_PERMISSION_FORBIDDEN');
+
+  // A member without vehicle:read is a member but cannot read the vehicle.
+  const blind = await addAcceptedMember(vehicleA._id, ownerA, ['device:read']);
+  assert.equal(await resourceAuthorization.isMember(vehicleA._id, blind.memberId), true);
+  assert.equal(
+    await resourceAuthorization.hasVehicleReadAccess(vehicleA._id, blind.memberId),
+    false,
+  );
+  assert.equal(await canAccessVehicle(vehicleA._id, blind.memberId), false);
+  assert.equal(await canAccessVehicle(vehicleA._id, blind.memberId, 'device:read'), false);
+  await rejectsWithCode(() => getAccessibleVehicle(vehicleA._id, blind.memberId), 'NOT_FOUND');
+  await rejectsWithCode(
+    () =>
+      resourceAuthorization.assertPermission(
+        vehicleContext(vehicleA._id, blind.memberId, 'vehicle:update'),
+      ),
+    'NOT_FOUND',
+  );
+  // vehicle:manage keeps implying read without an explicit vehicle:read.
+  const manager = await addAcceptedMember(vehicleA._id, ownerA, ['vehicle:manage']);
+  assert.equal(await canAccessVehicle(vehicleA._id, manager.memberId), true);
+  await rejectsWithCode(
+    () =>
+      resourceAuthorization.assertPermission(
+        vehicleContext(vehicleA._id, manager.memberId, 'vehicle:update'),
+      ),
+    'FORBIDDEN',
+  );
+});
+
+test('30. TKT-013 DEVICE/MODULE isolation with verified test evidence and hardened grant issuance', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Resource Hatch' });
+  const otherVehicle = await createVehicle(new Types.ObjectId(), { name: 'Foreign Hatch' });
+  const member = await addAcceptedMember(vehicle._id, ownerId, ['device:read', 'module:read']);
+  const bare = await addAcceptedMember(vehicle._id, ownerId, []);
+  const device1 = new Types.ObjectId();
+  const device2 = new Types.ObjectId();
+  const module1 = new Types.ObjectId();
+  const device = (resourceId: Types.ObjectId, evidenceVehicle = vehicle._id) => ({
+    type: 'DEVICE' as const,
+    resourceId,
+    binding: testOwnershipEvidence('DEVICE', resourceId, evidenceVehicle),
+  });
+  const moduleResource = (resourceId: Types.ObjectId) => ({
+    type: 'MODULE' as const,
+    resourceId,
+    binding: testOwnershipEvidence('MODULE', resourceId, vehicle._id),
+  });
+  const evaluate = (context: AuthorizationContext) => resourceAuthorization.evaluate(context);
+
+  // Base permissions apply ONLINE to compatible resources with verified evidence only.
+  const baseDevice = await evaluate(
+    externalContext(vehicle._id, member.memberId, device(device1), 'device:read'),
+  );
+  assert.equal(baseDevice.allowed && baseDevice.source, 'MEMBERSHIP_PERMISSION');
+  const baseModule = await evaluate(
+    externalContext(vehicle._id, member.memberId, moduleResource(module1), 'module:read'),
+  );
+  assert.equal(baseModule.allowed && baseModule.source, 'MEMBERSHIP_PERMISSION');
+  const offline = await evaluate(
+    externalContext(vehicle._id, member.memberId, device(device1), 'device:read', 'BLE_OFFLINE'),
+  );
+  assert.equal(offline.allowed, false);
+  assert.equal(offline.reason, 'PERMISSION_NOT_GRANTED');
+  // Base device:read no longer authorizes the VEHICLE resource (documented incompatibility).
+  const onVehicle = await evaluate(vehicleContext(vehicle._id, member.memberId, 'device:read'));
+  assert.equal(onVehicle.reason, 'PERMISSION_RESOURCE_MISMATCH');
+
+  // Missing, wrong-type, wrong-resource, and foreign-vehicle evidence all fail closed.
+  const unverified = [
+    { type: 'DEVICE' as const, resourceId: device1 },
+    { type: 'DEVICE' as const, resourceId: device1, binding: moduleResource(device1).binding },
+    { type: 'DEVICE' as const, resourceId: device2, binding: device(device1).binding },
+    device(device1, otherVehicle._id),
+  ];
+  for (const resource of unverified) {
+    const decision = await evaluate(
+      externalContext(vehicle._id, member.memberId, resource, 'device:read'),
+    );
+    assert.equal(decision.allowed, false);
+    assert.equal(decision.reason, 'UNVERIFIED_EXTERNAL_RESOURCE');
+  }
+  const crossType = await evaluate(
+    externalContext(vehicle._id, member.memberId, moduleResource(module1), 'device:read'),
+  );
+  assert.equal(crossType.reason, 'PERMISSION_RESOURCE_MISMATCH');
+
+  // A DEVICE grant authorizes that device only, never a sibling device or a module.
+  const grantFrame = {
+    vehicleId: vehicle._id,
+    membershipId: bare.membershipId,
+    subjectUserId: bare.memberId,
+    actorUserId: ownerId,
+    channel: 'ONLINE' as const,
+  };
+  const deviceGrant = await createAccessGrant({
+    ...grantFrame,
+    scopeType: 'DEVICE',
+    scopeResourceId: device1,
+    verifiedResourceBinding: testOwnershipEvidence('DEVICE', device1, vehicle._id),
+    permissions: ['device:read', 'device:command'],
+  });
+  const granted = await evaluate(
+    externalContext(vehicle._id, bare.memberId, device(device1), 'device:command'),
+  );
+  assert.equal(granted.allowed && granted.source, 'ACCESS_GRANT');
+  assert.equal(granted.allowed && granted.grantId?.equals(deviceGrant._id), true);
+  const sibling = await evaluate(
+    externalContext(vehicle._id, bare.memberId, device(device2), 'device:command'),
+  );
+  assert.equal(sibling.reason, 'PERMISSION_NOT_GRANTED');
+  const moduleDenied = await evaluate(
+    externalContext(vehicle._id, bare.memberId, moduleResource(module1), 'module:read'),
+  );
+  assert.equal(moduleDenied.reason, 'PERMISSION_NOT_GRANTED');
+  // A DEVICE grant does not let the member read the vehicle.
+  assert.equal(await canAccessVehicle(vehicle._id, bare.memberId), false);
+
+  // Issuing DEVICE/MODULE grants without verified evidence persists nothing.
+  const before = await vehiclePersistenceSnapshot(vehicle._id);
+  const forged = JSON.parse(
+    JSON.stringify(testOwnershipEvidence('DEVICE', device2, vehicle._id)),
+  ) as ReturnType<typeof testOwnershipEvidence>;
+  const rejectedEvidence = [
+    { scopeType: 'DEVICE' as const, scopeResourceId: device2, verifiedResourceBinding: undefined },
+    { scopeType: 'DEVICE' as const, scopeResourceId: device2, verifiedResourceBinding: forged },
+    {
+      scopeType: 'DEVICE' as const,
+      scopeResourceId: device2,
+      verifiedResourceBinding: testOwnershipEvidence('DEVICE', device2, otherVehicle._id),
+    },
+    {
+      scopeType: 'DEVICE' as const,
+      scopeResourceId: device2,
+      verifiedResourceBinding: testOwnershipEvidence('DEVICE', device1, vehicle._id),
+    },
+    {
+      scopeType: 'MODULE' as const,
+      scopeResourceId: module1,
+      verifiedResourceBinding: testOwnershipEvidence('DEVICE', module1, vehicle._id),
+    },
+  ];
+  for (const evidence of rejectedEvidence) {
+    await rejectsWithCode(
+      () =>
+        createAccessGrant({
+          ...grantFrame,
+          ...evidence,
+          permissions: evidence.scopeType === 'DEVICE' ? ['device:read'] : ['module:read'],
+        }),
+      'VALIDATION_ERROR',
+    );
+  }
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), before);
+});
+
+test('31. TKT-013 AccessGrant matching: subject, membership, inclusive start, exclusive expiry, status, and channel', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Grant Window Wagon' });
+  const member = await addAcceptedMember(vehicle._id, ownerId, []);
+  const bystander = await addAcceptedMember(vehicle._id, ownerId, []);
+  const evaluate = (context: AuthorizationContext, instant?: Date) =>
+    resourceAuthorization.evaluate(context, instant ? atTime(instant) : {});
+  const readCtx = vehicleContext(vehicle._id, member.memberId, 'vehicle:read');
+  const grantFrame = {
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE' as const,
+  };
+
+  // Window boundaries: startsAt == now allows, expiresAt == now denies, future/past deny.
+  const start = new Date(Date.now() + 60_000);
+  const end = new Date(start.getTime() + 60_000);
+  const windowed = await createAccessGrant({
+    ...grantFrame,
+    channel: 'ONLINE',
+    permissions: ['vehicle:read'],
+    startsAt: start,
+    expiresAt: end,
+  });
+  assert.equal((await evaluate(readCtx, new Date(start.getTime() - 1))).allowed, false);
+  const atStart = await evaluate(readCtx, start);
+  assert.equal(atStart.allowed && atStart.grantId?.equals(windowed._id), true);
+  assert.equal((await evaluate(readCtx, new Date(end.getTime() - 1))).allowed, true);
+  assert.equal((await evaluate(readCtx, end)).allowed, false);
+  assert.equal((await evaluate(readCtx, new Date(end.getTime() + 1))).allowed, false);
+  assert.equal((await evaluate(readCtx)).allowed, false, 'future grant is not yet effective');
+
+  // The grant belongs to its subject only.
+  assert.equal(
+    (await evaluate(vehicleContext(vehicle._id, bystander.memberId, 'vehicle:read'), start))
+      .allowed,
+    false,
+  );
+  // A grant whose subject does not match the membership never applies to either party.
+  await insertRawActiveGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: bystander.memberId,
+    grantedByUserId: ownerId,
+    permissions: ['vehicle:update'],
+    expiresAt: null,
+  });
+  assert.equal(
+    (await evaluate(vehicleContext(vehicle._id, member.memberId, 'vehicle:update'))).allowed,
+    false,
+  );
+  assert.equal(
+    (await evaluate(vehicleContext(vehicle._id, bystander.memberId, 'vehicle:update'))).allowed,
+    false,
+  );
+
+  // Revoked and expired grants never apply.
+  const revoked = await createAccessGrant({
+    ...grantFrame,
+    channel: 'ONLINE',
+    permissions: ['vehicle:update'],
+  });
+  assert.equal(
+    (await evaluate(vehicleContext(vehicle._id, member.memberId, 'vehicle:update'))).allowed,
+    true,
+  );
+  await revokeAccessGrant({ vehicleId: vehicle._id, grantId: revoked._id, actorUserId: ownerId });
+  assert.equal(
+    (await evaluate(vehicleContext(vehicle._id, member.memberId, 'vehicle:update'))).allowed,
+    false,
+  );
+  await expireElapsedAccessGrants(vehicle._id, new Date(end.getTime() + 1));
+  assert.equal((await AccessGrantModel.findById(windowed._id).lean())?.status, 'EXPIRED');
+  assert.equal((await evaluate(readCtx, start)).allowed, false);
+
+  // Channel semantics: ONLINE without expiry allowed; BLE_OFFLINE/ANY without expiry never count.
+  const online = await createAccessGrant({
+    ...grantFrame,
+    channel: 'ONLINE',
+    permissions: ['device:link'],
+  });
+  assert.equal(online.expiresAt, null);
+  const linkCtx = vehicleContext(vehicle._id, member.memberId, 'device:link');
+  assert.equal((await evaluate(linkCtx)).allowed, true);
+  assert.equal((await evaluate({ ...linkCtx, channel: 'BLE_OFFLINE' })).allowed, false);
+  await rejectsWithCode(
+    () =>
+      createAccessGrant({ ...grantFrame, channel: 'BLE_OFFLINE', permissions: ['vehicle:read'] }),
+    'VALIDATION_ERROR',
+  );
+  await rejectsWithCode(
+    () => createAccessGrant({ ...grantFrame, channel: 'ANY', permissions: ['vehicle:read'] }),
+    'VALIDATION_ERROR',
+  );
+  await insertRawActiveGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    grantedByUserId: ownerId,
+    permissions: ['vehicle:read'],
+    expiresAt: null,
+    channel: 'ANY',
+  });
+  const anyCtx = vehicleContext(vehicle._id, member.memberId, 'vehicle:read');
+  assert.equal((await evaluate(anyCtx)).allowed, false);
+  assert.equal((await evaluate({ ...anyCtx, channel: 'BLE_OFFLINE' })).allowed, false);
+  // ANY with expiry covers both channels; a grant gives no invitation issuance authority.
+  await createAccessGrant({
+    ...grantFrame,
+    channel: 'ANY',
+    permissions: ['vehicle:read'],
+    expiresAt: new Date(Date.now() + 3_600_000),
+  });
+  assert.equal((await evaluate(anyCtx)).allowed, true);
+  const offlineGrant = await evaluate({ ...anyCtx, channel: 'BLE_OFFLINE' });
+  assert.equal(offlineGrant.allowed && offlineGrant.source, 'ACCESS_GRANT');
+  await rejectsWithCode(
+    () =>
+      createAccessGrant({ ...grantFrame, channel: 'ONLINE', permissions: ['invitation:create'] }),
+    'VALIDATION_ERROR',
+  );
+  await rejectsWithCode(
+    () => inviteMember(vehicle._id, member.memberId, new Types.ObjectId(), ['vehicle:read']),
+    'FORBIDDEN',
+  );
+
+  // Grants of a previous membership never apply to a later membership of the same user.
+  const formerGrant = await createAccessGrant({
+    ...grantFrame,
+    channel: 'ONLINE',
+    permissions: ['vehicle:update'],
+  });
+  await revokeMembership({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    actorUserId: ownerId,
+  });
+  await AccessGrantModel.collection.updateOne(
+    { _id: formerGrant._id },
+    { $set: { status: 'ACTIVE', revokedAt: null, revokedByUserId: null, revokeReason: null } },
+  );
+  const reinvited = await inviteMember(vehicle._id, ownerId, member.memberId, []);
+  assert.ok(reinvited);
+  assert.ok(await acceptInvitation(reinvited._id, member.memberId));
+  const stale = await evaluate(vehicleContext(vehicle._id, member.memberId, 'vehicle:update'));
+  assert.equal(stale.allowed, false);
+  assert.equal(stale.reason, 'PERMISSION_NOT_GRANTED');
+});
+
+test('32. TKT-013 evaluation with a session sees the transaction snapshot but is not a write barrier', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Snapshot Sedan' });
+  const member = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const readCtx = vehicleContext(vehicle._id, member.memberId, 'vehicle:read');
+  const updateCtx = vehicleContext(vehicle._id, member.memberId, 'vehicle:update');
+
+  // Uncommitted changes are visible only to evaluations bound to the same session.
+  const session = await mongoose.startSession();
+  try {
+    session.startTransaction({
+      readConcern: { level: 'snapshot' },
+      writeConcern: { w: 'majority' },
+    });
+    await MembershipModel.updateOne(
+      { _id: member.membershipId },
+      { $set: { permissions: [] } },
+      { session },
+    );
+    await AccessGrantModel.create(
+      [
+        {
+          vehicleId: vehicle._id,
+          membershipId: member.membershipId,
+          subjectUserId: member.memberId,
+          scopeType: 'VEHICLE',
+          scopeResourceId: null,
+          channel: 'ONLINE',
+          permissions: ['vehicle:update'],
+          status: 'ACTIVE',
+          startsAt: new Date(Date.now() - 1_000),
+          expiresAt: null,
+          grantedByUserId: ownerId,
+        },
+      ],
+      { session },
+    );
+    const inTxRead = await resourceAuthorization.evaluate(readCtx, { session });
+    assert.equal(inTxRead.reason, 'PERMISSION_NOT_GRANTED');
+    const inTxUpdate = await resourceAuthorization.evaluate(updateCtx, { session });
+    assert.equal(inTxUpdate.allowed && inTxUpdate.source, 'ACCESS_GRANT');
+    assert.equal((await resourceAuthorization.evaluate(readCtx)).allowed, true);
+    assert.equal((await resourceAuthorization.evaluate(updateCtx)).allowed, false);
+    await VehicleModel.updateOne(
+      { _id: vehicle._id },
+      { $set: { status: 'ARCHIVED', archivedAt: new Date(), archivedByUserId: ownerId } },
+      { session },
+    );
+    const archivedInTx = await resourceAuthorization.evaluate(updateCtx, { session });
+    assert.equal(archivedInTx.reason, 'VEHICLE_UNAVAILABLE_OR_INCONSISTENT');
+    await session.abortTransaction();
+  } finally {
+    await session.endSession();
+  }
+  assert.equal((await resourceAuthorization.evaluate(readCtx)).allowed, true);
+  assert.equal(await AccessGrantModel.countDocuments({ vehicleId: vehicle._id }), 0);
+
+  // A snapshot read keeps answering ALLOW after a concurrent suspension commits: only the
+  // conditional write on the authority document detects the conflict.
+  const stale = await mongoose.startSession();
+  try {
+    stale.startTransaction({ readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } });
+    assert.equal((await resourceAuthorization.evaluate(readCtx, { session: stale })).allowed, true);
+    await suspendMembership({
+      vehicleId: vehicle._id,
+      membershipId: member.membershipId,
+      actorUserId: ownerId,
+    });
+    assert.equal((await resourceAuthorization.evaluate(readCtx)).allowed, false);
+    assert.equal((await resourceAuthorization.evaluate(readCtx, { session: stale })).allowed, true);
+    await assert.rejects(
+      MembershipModel.updateOne(
+        { _id: member.membershipId, status: 'ACTIVE' },
+        { $set: { updatedAt: new Date() } },
+        { session: stale },
+      ),
+      (error: unknown) =>
+        error instanceof mongoose.mongo.MongoServerError &&
+        error.hasErrorLabel('TransientTransactionError'),
+    );
+    await stale.abortTransaction().catch(() => undefined);
+  } finally {
+    await stale.endSession();
+  }
+  const persisted = await MembershipModel.findById(member.membershipId).lean();
+  assert.equal(persisted?.status, 'SUSPENDED');
+});
+
+test('33. TKT-013 authorized mutations re-validate authority inside the transaction against concurrent changes', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Concurrency Coupe' });
+  const pendingFrom = (membershipId: Types.ObjectId) =>
+    InvitationModel.countDocuments({ issuerMembershipId: membershipId, status: 'PENDING' });
+
+  // Deterministic: the pre-check passes against committed state, the held permission change
+  // commits, and the in-transaction re-check denies without persisting anything.
+  const changes: Array<{ label: string; update: Record<string, unknown> }> = [
+    { label: 'permission change', update: { permissions: ['vehicle:read'] } },
+    {
+      label: 'suspension',
+      update: { status: 'SUSPENDED', suspendedAt: new Date(), suspendedByUserId: ownerId },
+    },
+    {
+      label: 'revocation',
+      update: { status: 'REVOKED', revokedAt: new Date(), revokedByUserId: ownerId },
+    },
+  ];
+  for (const { label, update } of changes) {
+    const delegate = await addAcceptedMember(vehicle._id, ownerId, [
+      'vehicle:read',
+      'invitation:create',
+    ]);
+    assert.equal(
+      (
+        await resourceAuthorization.evaluate(
+          vehicleContext(vehicle._id, delegate.memberId, 'invitation:create'),
+        )
+      ).allowed,
+      true,
+    );
+    const held = await holdMembershipChange(vehicle._id, delegate.membershipId, update);
+    const blocked = inviteMember(vehicle._id, delegate.memberId, new Types.ObjectId(), [
+      'vehicle:read',
+    ]);
+    blocked.catch(() => undefined);
+    assert.equal(await stillPendingAfter(blocked, 300), true, `${label}: invite must wait`);
+    await held.commit();
+    await assert.rejects(
+      blocked,
+      (error: unknown) =>
+        error instanceof VehicleServiceError && ['FORBIDDEN', 'NOT_FOUND'].includes(error.code),
+      label,
+    );
+    assert.equal(await pendingFrom(delegate.membershipId), 0, label);
+  }
+
+  // Racing: whichever order commits, no PENDING invitation survives the loss of authority.
+  for (let round = 0; round < 5; round += 1) {
+    const delegate = await addAcceptedMember(vehicle._id, ownerId, [
+      'vehicle:read',
+      'invitation:create',
+    ]);
+    const [, demoted] = await Promise.allSettled([
+      inviteMember(vehicle._id, delegate.memberId, new Types.ObjectId(), ['vehicle:read']),
+      round % 2 === 0
+        ? updateMembershipPermissions({
+            vehicleId: vehicle._id,
+            membershipId: delegate.membershipId,
+            actorUserId: ownerId,
+            permissions: ['vehicle:read'],
+          })
+        : suspendMembership({
+            vehicleId: vehicle._id,
+            membershipId: delegate.membershipId,
+            actorUserId: ownerId,
+          }),
+    ]);
+    assert.equal(demoted.status, 'fulfilled', `round ${round}`);
+    assert.equal(await pendingFrom(delegate.membershipId), 0, `round ${round}`);
+    assert.equal(
+      (
+        await resourceAuthorization.evaluate(
+          vehicleContext(vehicle._id, delegate.memberId, 'invitation:create'),
+        )
+      ).allowed,
+      false,
+    );
+  }
+});
+
+test('34. TKT-013 incompatible and inconsistent AccessGrants: creation rejected without writes, stored records never grant and stay manageable', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Historical Grant Hatch' });
+  const member = await addAcceptedMember(vehicle._id, ownerId, []);
+  const deviceId = new Types.ObjectId();
+  const grantFrame = {
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE' as const,
+    channel: 'ONLINE' as const,
+  };
+
+  // Creation: VEHICLE-scoped device:read is grantable in storage but never issuable.
+  const before = await vehiclePersistenceSnapshot(vehicle._id);
+  for (const permissions of [['device:read'], ['vehicle:read', 'device:read']]) {
+    await rejectsWithCode(
+      () => createAccessGrant({ ...grantFrame, permissions }),
+      'VALIDATION_ERROR',
+    );
+  }
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), before);
+
+  const rawGrant = async (fields: Record<string, unknown>): Promise<Types.ObjectId> => {
+    const _id = new Types.ObjectId();
+    const created = new Date(Date.now() - 120_000);
+    await AccessGrantModel.collection.insertOne({
+      _id,
+      vehicleId: vehicle._id,
+      membershipId: member.membershipId,
+      subjectUserId: member.memberId,
+      scopeType: 'VEHICLE',
+      scopeResourceId: null,
+      channel: 'ONLINE',
+      permissions: ['device:read'],
+      status: 'ACTIVE',
+      startsAt: created,
+      expiresAt: null,
+      grantedByUserId: ownerId,
+      updatedByUserId: null,
+      revokedAt: null,
+      revokedByUserId: null,
+      revokeReason: null,
+      expiredAt: null,
+      createdAt: created,
+      updatedAt: created,
+      ...fields,
+    });
+    return _id;
+  };
+
+  // A historical incompatible record stays valid for the model but never grants anything.
+  const historicalId = await rawGrant({});
+  const historical = await AccessGrantModel.findById(historicalId);
+  assert.ok(historical);
+  await assert.doesNotReject(() => historical.validate());
+  const onVehicle = await resourceAuthorization.evaluate(
+    vehicleContext(vehicle._id, member.memberId, 'device:read'),
+  );
+  assert.equal(onVehicle.reason, 'PERMISSION_RESOURCE_MISMATCH');
+  const onDevice = await resourceAuthorization.evaluate(
+    externalContext(
+      vehicle._id,
+      member.memberId,
+      {
+        type: 'DEVICE',
+        resourceId: deviceId,
+        binding: testOwnershipEvidence('DEVICE', deviceId, vehicle._id),
+      },
+      'device:read',
+    ),
+  );
+  assert.equal(onDevice.reason, 'PERMISSION_NOT_GRANTED');
+  assert.equal(await canAccessVehicle(vehicle._id, member.memberId), false);
+  assert.equal(await canAccessVehicle(vehicle._id, member.memberId, 'device:read'), false);
+
+  // Revocation of the historical record keeps working and is audited on the record.
+  const revoked = await revokeAccessGrant({
+    vehicleId: vehicle._id,
+    grantId: historicalId,
+    actorUserId: ownerId,
+    reason: 'Historical incompatible grant',
+  });
+  assert.equal(revoked?.status, 'REVOKED');
+  assert.equal(revoked?.revokeReason, 'Historical incompatible grant');
+  assert.deepEqual(revoked?.permissions, ['device:read']);
+
+  // BLE_OFFLINE / ANY records without a valid expiry never grant, whatever their inconsistency.
+  const inconsistent = [
+    { channel: 'BLE_OFFLINE', expiresAt: null },
+    { channel: 'ANY', expiresAt: null },
+    { channel: 'BLE_OFFLINE', expiresAt: undefined },
+    { channel: 'ANY', expiresAt: undefined },
+    { channel: 'ANY', expiresAt: new Date(Date.now() + 3_600_000).toISOString() },
+  ];
+  const inconsistentIds: Types.ObjectId[] = [];
+  for (const { channel, expiresAt } of inconsistent) {
+    const fields: Record<string, unknown> = { channel, permissions: ['vehicle:read'] };
+    if (expiresAt !== undefined) {
+      fields.expiresAt = expiresAt;
+    }
+    const id = await rawGrant(fields);
+    if (expiresAt === undefined) {
+      await AccessGrantModel.collection.updateOne({ _id: id }, { $unset: { expiresAt: '' } });
+    }
+    inconsistentIds.push(id);
+  }
+  const readCtx = vehicleContext(vehicle._id, member.memberId, 'vehicle:read');
+  assert.equal((await resourceAuthorization.evaluate(readCtx)).allowed, false);
+  assert.equal(
+    (await resourceAuthorization.evaluate({ ...readCtx, channel: 'BLE_OFFLINE' })).allowed,
+    false,
+  );
+  assert.equal(await canAccessVehicle(vehicle._id, member.memberId), false);
+  const [vehicleRecord] = await VehicleModel.find({ _id: vehicle._id }).lean();
+  const membershipRecord = await MembershipModel.findById(member.membershipId).lean();
+  assert.ok(vehicleRecord && membershipRecord);
+  assert.deepEqual(
+    await resourceAuthorization.filterReadableCandidates(
+      member.memberId,
+      [{ vehicle: vehicleRecord, membership: membershipRecord }],
+      { now: new Date() },
+    ),
+    [],
+  );
+
+  // Cascades still manage stored incompatible and inconsistent records.
+  const historicalActive = await rawGrant({});
+  await suspendMembership({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    actorUserId: ownerId,
+  });
+  for (const id of [historicalActive, ...inconsistentIds]) {
+    const stored = await AccessGrantModel.findById(id).lean();
+    assert.notEqual(stored?.status, 'ACTIVE', String(id));
+  }
+});
+
+test('35. TKT-013 single and batch read authorization agree for every actor kind without N+1', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicles = await Promise.all(
+    ['Batch One', 'Batch Two', 'Batch Three'].map((name) => createVehicle(ownerId, { name })),
+  );
+  const actorId = new Types.ObjectId();
+  const actorKinds: Array<{ vehicle: (typeof vehicles)[number]; permissions: string[] }> = [
+    { vehicle: vehicles[0]!, permissions: ['vehicle:read'] },
+    { vehicle: vehicles[1]!, permissions: ['vehicle:manage'] },
+    { vehicle: vehicles[2]!, permissions: ['device:read'] },
+  ];
+  const memberships: Types.ObjectId[] = [];
+  for (const { vehicle, permissions } of actorKinds) {
+    const invitation = await inviteMember(vehicle._id, ownerId, actorId, permissions);
+    assert.ok(invitation);
+    const membership = await acceptInvitation(invitation._id, actorId);
+    assert.ok(membership);
+    memberships.push(membership._id);
+  }
+  // A current VEHICLE vehicle:read grant makes the third vehicle readable as well.
+  await createAccessGrant({
+    vehicleId: vehicles[2]!._id,
+    membershipId: memberships[2]!,
+    subjectUserId: actorId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:read'],
+    expiresAt: new Date(Date.now() + 60_000),
+  });
+
+  const loadCandidates = async () => {
+    const records = await MembershipModel.find({ userId: actorId, status: 'ACTIVE' }).lean();
+    const vehicleRecords = await VehicleModel.find({
+      _id: { $in: records.map((record) => record.vehicleId) },
+    }).lean();
+    return records.map((membership) => ({
+      membership,
+      vehicle: vehicleRecords.find((record) => record._id.equals(membership.vehicleId))!,
+    }));
+  };
+  const compare = async (label: string) => {
+    const candidates = await loadCandidates();
+    const originalFind = AccessGrantModel.find.bind(AccessGrantModel);
+    let grantQueries = 0;
+    AccessGrantModel.find = ((...args: Parameters<typeof AccessGrantModel.find>) => {
+      grantQueries += 1;
+      return originalFind(...args);
+    }) as typeof AccessGrantModel.find;
+    let batch: VehicleAccessCandidate[];
+    try {
+      batch = await resourceAuthorization.filterReadableCandidates(actorId, candidates, {
+        now: new Date(),
+      });
+    } finally {
+      AccessGrantModel.find = originalFind;
+    }
+    assert.ok(grantQueries <= 1, `${label}: ${grantQueries} grant queries`);
+    for (const vehicle of vehicles) {
+      const single = await resourceAuthorization.hasVehicleReadAccess(vehicle._id, actorId);
+      const inBatch = batch.some((candidate) => candidate.vehicle._id.equals(vehicle._id));
+      assert.equal(inBatch, single, `${label}: ${vehicle.name}`);
+      assert.equal(await canAccessVehicle(vehicle._id, actorId), single, label);
+    }
+    return batch.length;
+  };
+
+  assert.equal(await compare('initial'), 3);
+  await suspendMembership({
+    vehicleId: vehicles[1]!._id,
+    membershipId: memberships[1]!,
+    actorUserId: ownerId,
+  });
+  assert.equal(await compare('after suspension'), 2);
+  await updateMembershipPermissions({
+    vehicleId: vehicles[0]!._id,
+    membershipId: memberships[0]!,
+    actorUserId: ownerId,
+    permissions: ['device:read'],
+  });
+  assert.equal(await compare('after permission change'), 1);
 });

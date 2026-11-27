@@ -21,10 +21,9 @@ import {
   DEFAULT_INVITATION_TTL_MS,
   INVITATION_AUTHORITY_PERMISSIONS,
   INVITATION_STATUSES,
-  isAccessGrantPermissionForScope,
   isDelegableMembershipPermission,
+  isIssuableAccessGrantPermission,
   isKnownPermission,
-  isOwnerReservedPermission,
   MEMBER_DELEGABLE_INVITATION_PERMISSIONS,
   MEMBERSHIP_STATUSES,
   normalizeOptionalText,
@@ -37,33 +36,44 @@ import {
   type MembershipStatus,
 } from '../models/vehicle-constants.js';
 import { VehicleModel, type Vehicle } from '../models/vehicle.model.js';
+import {
+  ACTIVE_MEMBERSHIP_CRITERIA,
+  activeAccessGrantCriteria,
+  auditOwnershipInconsistency,
+  databaseUnavailableError,
+  isCanonicalOwnershipConsistent,
+  isDatabaseUnavailableError,
+  resourceAuthorization,
+  VEHICLE_READ_PERMISSIONS,
+  verifyExternalResourceBinding,
+  type AuthorizationDecision,
+  type AuthorizationResource,
+  type MembershipRecord,
+  type PermissionDecisionReason,
+  type VehicleAccessCandidate,
+  type VehicleRecord,
+  type VerifiedExternalResourceBinding,
+  type VerifiedVehicleLoadOptions,
+} from './resource-authorization.service.js';
+import {
+  defaultAuditLogger,
+  VehicleServiceError,
+  type VehicleAuditEvent,
+  type VehicleAuditLogger,
+  type VehicleDomainErrorCode,
+} from './vehicle-errors.js';
 
-export type VehicleDomainErrorCode =
-  'VALIDATION_ERROR' | 'FORBIDDEN' | 'NOT_FOUND' | 'CONFLICT' | 'DATABASE_UNAVAILABLE';
-
-export class VehicleServiceError extends Error {
-  constructor(
-    public readonly code: VehicleDomainErrorCode,
-    message: string,
-    options?: { cause?: unknown },
-  ) {
-    super(message, options);
-    this.name = 'VehicleServiceError';
-  }
-}
-
-export interface VehicleAuditEvent {
-  action: string;
-  actorUserId: string;
-  vehicleId?: string;
-  targetId?: string;
-  outcome: 'success' | 'denied' | 'conflict' | 'error';
-  reason?: string;
-}
-
-export type VehicleAuditLogger = (event: VehicleAuditEvent) => void;
-
-const defaultAuditLogger: VehicleAuditLogger = () => undefined;
+export {
+  VehicleServiceError,
+  type VehicleAuditEvent,
+  type VehicleAuditLogger,
+  type VehicleDomainErrorCode,
+} from './vehicle-errors.js';
+export {
+  createVerifiedExternalResourceBinding,
+  type PermissionDecisionReason,
+  type VerifiedExternalResourceBinding,
+} from './resource-authorization.service.js';
 
 export interface CreateVehicleInput {
   name: string;
@@ -85,49 +95,7 @@ type VehicleFieldChanges = Partial<
   { name: string; year: number | null } & Record<VehicleOptionalTextField, string | null>
 >;
 
-type VehicleRecord = Vehicle & { _id: Types.ObjectId };
-type MembershipRecord = Membership & { _id: Types.ObjectId };
 type InvitationRecord = Invitation & { _id: Types.ObjectId };
-
-const VERIFIED_RESOURCE_BINDING_BRAND: unique symbol = Symbol('VerifiedExternalResourceBinding');
-
-export interface VerifiedExternalResourceBinding {
-  readonly [VERIFIED_RESOURCE_BINDING_BRAND]: true;
-  readonly scopeType: 'DEVICE' | 'MODULE';
-  readonly resourceId: Types.ObjectId;
-  readonly vehicleId: Types.ObjectId;
-  readonly isActive: boolean;
-}
-
-/**
- * Trusted internal factory for owner-service resource bindings (Device / Automation).
- * Plain JSON objects (e.g., deserialized from untrusted HTTP input) cannot carry the
- * module-private brand symbol and are always rejected fail-closed.
- */
-export function createVerifiedExternalResourceBinding(input: {
-  scopeType: 'DEVICE' | 'MODULE';
-  resourceId: Types.ObjectId;
-  vehicleId: Types.ObjectId;
-  isActive: boolean;
-}): VerifiedExternalResourceBinding {
-  return Object.freeze({
-    [VERIFIED_RESOURCE_BINDING_BRAND]: true as const,
-    scopeType: input.scopeType,
-    resourceId: input.resourceId,
-    vehicleId: input.vehicleId,
-    isActive: input.isActive,
-  });
-}
-
-function isTrustedVerifiedResourceBinding(
-  value: unknown,
-): value is VerifiedExternalResourceBinding {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    (value as Record<symbol, unknown>)[VERIFIED_RESOURCE_BINDING_BRAND] === true
-  );
-}
 
 export interface EvaluateVehiclePermissionInput {
   vehicleId: Types.ObjectId;
@@ -139,18 +107,6 @@ export interface EvaluateVehiclePermissionInput {
   verifiedResourceBinding?: VerifiedExternalResourceBinding;
   now?: Date;
 }
-
-export type PermissionDecisionReason =
-  | 'ALLOWED'
-  | 'UNKNOWN_OR_INVALID_PERMISSION'
-  | 'INVALID_SCOPE'
-  | 'UNVERIFIED_EXTERNAL_RESOURCE'
-  | 'VEHICLE_UNAVAILABLE_OR_INCONSISTENT'
-  | 'MEMBERSHIP_INACTIVE_OR_MISSING'
-  | 'OWNERSHIP_MISMATCH'
-  | 'OWNER_PERMISSION_FORBIDDEN'
-  | 'BLE_OWNER_GRANT_REQUIRED'
-  | 'PERMISSION_NOT_GRANTED';
 
 export interface PermissionEvaluationResult {
   allowed: boolean;
@@ -167,6 +123,8 @@ export interface CreateAccessGrantInput {
   actorUserId: Types.ObjectId;
   scopeType: AccessGrantScopeType;
   scopeResourceId?: Types.ObjectId | null;
+  /** Required for DEVICE / MODULE grants: ownership evidence from the resource's authority. */
+  verifiedResourceBinding?: VerifiedExternalResourceBinding;
   channel?: AccessGrantChannel;
   permissions: string[];
   startsAt?: Date;
@@ -208,17 +166,29 @@ function isDetachedUnitTestModelStub(): boolean {
   );
 }
 
+/**
+ * Connectivity failures are classified only once they escape `withTransaction`, after the driver
+ * has exhausted its own retries (TransientTransactionError / UnknownTransactionCommitResult).
+ * Domain, validation, write-conflict, and programming errors propagate unchanged.
+ */
 async function runInVehicleTransaction<T>(
   work: (session: ClientSession | undefined) => Promise<T>,
 ): Promise<T> {
   if (mongoose.connection.readyState === 1) {
-    const session = await mongoose.connection.startSession();
+    let session: ClientSession;
+    try {
+      session = await mongoose.connection.startSession();
+    } catch (error) {
+      throw isDatabaseUnavailableError(error) ? databaseUnavailableError(error) : error;
+    }
     try {
       let outcome!: T;
       await session.withTransaction(async () => {
         outcome = await work(session);
       }, TRANSACTION_OPTIONS);
       return outcome;
+    } catch (error) {
+      throw isDatabaseUnavailableError(error) ? databaseUnavailableError(error) : error;
     } finally {
       await session.endSession();
     }
@@ -359,68 +329,11 @@ function validateOptionalAuditReason(reason: string | null | undefined): string 
   return normalized;
 }
 
-const ACTIVE_MEMBERSHIP_CRITERIA = {
-  status: 'ACTIVE',
-  suspendedAt: null,
-  revokedAt: null,
-} as const;
-
-/**
- * Canonical ownership invariant: Vehicle.ownerUserId MUST match exactly one ACTIVE,
- * unrevoked, unsuspended OWNER Membership. `ownerMemberships` must contain every unrevoked
- * OWNER membership of the vehicle.
- */
-function isCanonicalOwnershipConsistent(
-  vehicle: VehicleRecord,
-  ownerMemberships: readonly MembershipRecord[],
-): boolean {
-  const ownerRecord = ownerMemberships[0];
-  return (
-    ownerMemberships.length === 1 &&
-    ownerRecord !== undefined &&
-    ownerRecord.status === 'ACTIVE' &&
-    ownerRecord.suspendedAt === null &&
-    ownerRecord.revokedAt === null &&
-    ownerRecord.userId.equals(vehicle.ownerUserId)
-  );
-}
-
-function auditOwnershipInconsistency(
-  audit: VehicleAuditLogger,
-  vehicleId: Types.ObjectId,
-  actorUserId: Types.ObjectId | undefined,
-): void {
-  audit({
-    action: 'vehicle.ownership_inconsistency',
-    actorUserId: actorUserId ? String(actorUserId) : 'system',
-    vehicleId: String(vehicleId),
-    outcome: 'denied',
-    reason: 'canonical_owner_mismatch',
-  });
-}
-
 async function loadOwnerMembershipsByVehicle(
   vehicleIds: readonly Types.ObjectId[],
   session?: ClientSession,
 ): Promise<Map<string, MembershipRecord[]>> {
-  const ownersByVehicle = new Map<string, MembershipRecord[]>();
-  if (vehicleIds.length === 0) {
-    return ownersByVehicle;
-  }
-  const owners = (await MembershipModel.find({
-    vehicleId: { $in: vehicleIds },
-    role: 'OWNER',
-    revokedAt: null,
-  })
-    .session(session ?? null)
-    .lean()) as MembershipRecord[];
-  for (const owner of owners) {
-    const key = String(owner.vehicleId);
-    const group = ownersByVehicle.get(key) ?? [];
-    group.push(owner);
-    ownersByVehicle.set(key, group);
-  }
-  return ownersByVehicle;
+  return resourceAuthorization.loadOwnerMembershipsByVehicle(vehicleIds, session);
 }
 
 /**
@@ -429,31 +342,9 @@ async function loadOwnerMembershipsByVehicle(
  */
 async function loadVerifiedVehicle(
   vehicleId: Types.ObjectId,
-  options: {
-    status?: Vehicle['status'];
-    session?: ClientSession;
-    audit?: VehicleAuditLogger;
-    actorUserId?: Types.ObjectId;
-  } = {},
+  options: VerifiedVehicleLoadOptions = {},
 ): Promise<VehicleRecord | null> {
-  const audit = options.audit ?? defaultAuditLogger;
-  const vehicle = (await VehicleModel.findOne({
-    _id: vehicleId,
-    ...(options.status ? { status: options.status } : {}),
-  })
-    .session(options.session ?? null)
-    .lean()) as VehicleRecord | null;
-  if (!vehicle) {
-    return null;
-  }
-
-  const ownersByVehicle = await loadOwnerMembershipsByVehicle([vehicleId], options.session);
-  if (!isCanonicalOwnershipConsistent(vehicle, ownersByVehicle.get(String(vehicleId)) ?? [])) {
-    auditOwnershipInconsistency(audit, vehicleId, options.actorUserId);
-    return null;
-  }
-
-  return vehicle;
+  return resourceAuthorization.loadVerifiedVehicle(vehicleId, options);
 }
 
 /**
@@ -463,11 +354,7 @@ async function loadVerifiedVehicle(
  */
 export async function loadVerifiedActiveVehicle(
   vehicleId: Types.ObjectId,
-  options: {
-    session?: ClientSession;
-    audit?: VehicleAuditLogger;
-    actorUserId?: Types.ObjectId;
-  } = {},
+  options: Omit<VerifiedVehicleLoadOptions, 'status'> = {},
 ): Promise<VehicleRecord | null> {
   return loadVerifiedVehicle(vehicleId, { ...options, status: 'ACTIVE' });
 }
@@ -620,283 +507,87 @@ export async function createVehicle(
   return createdVehicle;
 }
 
-export async function evaluateVehiclePermission(
-  input: EvaluateVehiclePermissionInput,
-): Promise<PermissionEvaluationResult> {
-  const scopeType = input.scopeType ?? 'VEHICLE';
-  const scopeResourceId = input.scopeResourceId ?? null;
-  const channel = input.channel ?? 'ONLINE';
-  const now = input.now ?? new Date();
-
-  if (!isKnownPermission(input.permission)) {
-    return { allowed: false, reason: 'UNKNOWN_OR_INVALID_PERMISSION' };
+/** Legacy result shape: denials carry only `allowed` and `reason`. */
+function toPermissionEvaluationResult(decision: AuthorizationDecision): PermissionEvaluationResult {
+  if (!decision.allowed) {
+    return { allowed: false, reason: decision.reason };
   }
-
-  if (scopeType === 'VEHICLE' && scopeResourceId !== null) {
-    return { allowed: false, reason: 'INVALID_SCOPE' };
-  }
-
-  if ((scopeType === 'DEVICE' || scopeType === 'MODULE') && scopeResourceId === null) {
-    return { allowed: false, reason: 'INVALID_SCOPE' };
-  }
-
-  if (scopeType === 'DEVICE' || scopeType === 'MODULE') {
-    const binding = input.verifiedResourceBinding;
-    if (
-      !isTrustedVerifiedResourceBinding(binding) ||
-      !binding.isActive ||
-      binding.scopeType !== scopeType ||
-      !binding.resourceId.equals(scopeResourceId!) ||
-      !binding.vehicleId.equals(input.vehicleId)
-    ) {
-      return { allowed: false, reason: 'UNVERIFIED_EXTERNAL_RESOURCE' };
-    }
-  }
-
-  const vehicle = await loadVerifiedActiveVehicle(input.vehicleId, { actorUserId: input.userId });
-  if (!vehicle) {
-    return { allowed: false, reason: 'VEHICLE_UNAVAILABLE_OR_INCONSISTENT' };
-  }
-
-  const membership = (await MembershipModel.findOne({
-    vehicleId: input.vehicleId,
-    userId: input.userId,
-    ...ACTIVE_MEMBERSHIP_CRITERIA,
-  }).lean()) as MembershipRecord | null;
-
-  const request: PermissionRequest = {
-    permission: input.permission,
-    scopeType,
-    scopeResourceId,
-    channel,
-  };
-  const decision = decideMembershipPermission(vehicle, membership, input.userId, request);
-  if (decision.kind === 'DECIDED') {
-    return decision.result;
-  }
-
-  const grant = (await AccessGrantModel.findOne({
-    vehicleId: input.vehicleId,
-    membershipId: decision.membershipId,
-    ...activeAccessGrantCriteria(input.userId, request, now),
-  }).lean()) as (AccessGrant & { _id: Types.ObjectId }) | null;
-
-  if (!grant) {
-    return { allowed: false, reason: 'PERMISSION_NOT_GRANTED' };
-  }
-
   return {
     allowed: true,
     reason: 'ALLOWED',
-    source: 'ACCESS_GRANT',
+    source: decision.source,
     membershipId: decision.membershipId,
-    grantId: grant._id,
+    ...(decision.grantId ? { grantId: decision.grantId } : {}),
   };
 }
 
-interface PermissionRequest {
-  permission: string;
-  scopeType: AccessGrantScopeType;
-  scopeResourceId: Types.ObjectId | null;
-  channel: 'ONLINE' | 'BLE_OFFLINE';
+function toAuthorizationResource(
+  scopeType: AccessGrantScopeType,
+  scopeResourceId: Types.ObjectId | null,
+  binding: VerifiedExternalResourceBinding | undefined,
+): AuthorizationResource | null {
+  if (scopeType === 'VEHICLE') {
+    return scopeResourceId === null ? { type: 'VEHICLE' } : null;
+  }
+  if (scopeResourceId === null) {
+    return null;
+  }
+  return scopeType === 'DEVICE'
+    ? { type: 'DEVICE', resourceId: scopeResourceId, binding }
+    : { type: 'MODULE', resourceId: scopeResourceId, binding };
 }
 
-type MembershipPermissionDecision =
-  | { kind: 'DECIDED'; result: PermissionEvaluationResult }
-  | { kind: 'ACCESS_GRANT_REQUIRED'; membershipId: Types.ObjectId };
-
-/**
- * Single source of truth for membership-level authorization over an already verified,
- * ownership-consistent ACTIVE vehicle. When only an AccessGrant can still authorize the
- * request, the caller must look it up with `activeAccessGrantCriteria`.
- */
-function decideMembershipPermission(
-  vehicle: VehicleRecord,
-  membership: MembershipRecord | null,
-  userId: Types.ObjectId,
-  request: PermissionRequest,
-): MembershipPermissionDecision {
-  const decided = (result: PermissionEvaluationResult): MembershipPermissionDecision => ({
-    kind: 'DECIDED',
-    result,
-  });
-
-  if (!membership) {
-    return decided({ allowed: false, reason: 'MEMBERSHIP_INACTIVE_OR_MISSING' });
+/** Compatibility adapter over `resourceAuthorization.evaluate`. */
+export async function evaluateVehiclePermission(
+  input: EvaluateVehiclePermissionInput,
+): Promise<PermissionEvaluationResult> {
+  if (!isKnownPermission(input.permission)) {
+    return { allowed: false, reason: 'UNKNOWN_OR_INVALID_PERMISSION' };
   }
-
-  if (membership.role === 'OWNER') {
-    if (!vehicle.ownerUserId.equals(userId)) {
-      return decided({ allowed: false, reason: 'OWNERSHIP_MISMATCH' });
-    }
-    if (request.channel === 'BLE_OFFLINE') {
-      return decided({ allowed: false, reason: 'BLE_OWNER_GRANT_REQUIRED' });
-    }
-    return decided({
-      allowed: true,
-      reason: 'ALLOWED',
-      source: 'OWNER_ROLE',
-      membershipId: membership._id,
-    });
+  const resource = toAuthorizationResource(
+    input.scopeType ?? 'VEHICLE',
+    input.scopeResourceId ?? null,
+    input.verifiedResourceBinding,
+  );
+  if (!resource) {
+    return { allowed: false, reason: 'INVALID_SCOPE' };
   }
-
-  if (vehicle.ownerUserId.equals(userId)) {
-    // Owner without OWNER role indicates corrupted state; fail closed.
-    return decided({ allowed: false, reason: 'OWNERSHIP_MISMATCH' });
-  }
-
-  if (isOwnerReservedPermission(request.permission)) {
-    return decided({ allowed: false, reason: 'OWNER_PERMISSION_FORBIDDEN' });
-  }
-
-  if (
-    request.scopeType === 'VEHICLE' &&
-    request.channel === 'ONLINE' &&
-    membership.permissions.includes(request.permission)
-  ) {
-    return decided({
-      allowed: true,
-      reason: 'ALLOWED',
-      source: 'MEMBERSHIP_PERMISSION',
-      membershipId: membership._id,
-    });
-  }
-
-  if (!isAccessGrantPermissionForScope(request.scopeType, request.permission)) {
-    return decided({ allowed: false, reason: 'PERMISSION_NOT_GRANTED' });
-  }
-
-  return { kind: 'ACCESS_GRANT_REQUIRED', membershipId: membership._id };
+  const now = input.now;
+  const decision = await resourceAuthorization.evaluate(
+    {
+      actorUserId: input.userId,
+      vehicleId: input.vehicleId,
+      resource,
+      permission: input.permission,
+      channel: input.channel ?? 'ONLINE',
+    },
+    now ? { clock: () => now } : {},
+  );
+  return toPermissionEvaluationResult(decision);
 }
 
-/** AccessGrant filter shared by single and batched evaluation (vehicle/membership excluded). */
-function activeAccessGrantCriteria(userId: Types.ObjectId, request: PermissionRequest, now: Date) {
-  const allowedChannels: AccessGrantChannel[] =
-    request.channel === 'BLE_OFFLINE' ? ['BLE_OFFLINE', 'ANY'] : ['ONLINE', 'ANY'];
-  return {
-    subjectUserId: userId,
-    scopeType: request.scopeType,
-    scopeResourceId: request.scopeType === 'VEHICLE' ? null : request.scopeResourceId,
-    channel: { $in: allowedChannels },
-    status: 'ACTIVE' as const,
-    revokedAt: null,
-    expiredAt: null,
-    startsAt: { $lte: now },
-    $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
-    permissions: request.permission,
-  };
-}
-
-/**
- * Effective online read access to a vehicle: canonical OWNER, or MEMBER holding
- * `vehicle:read` / `vehicle:manage` directly, or a current VEHICLE-scoped ONLINE/ANY
- * AccessGrant with `vehicle:read` bound to the current membership. DEVICE, MODULE, and
- * BLE_OFFLINE grants never confer vehicle read access.
- */
-const VEHICLE_READ_PERMISSIONS = ['vehicle:read', 'vehicle:manage'] as const;
-
-interface VehicleAccessCandidate {
-  vehicle: VehicleRecord;
-  membership: MembershipRecord;
-}
-
-/**
- * Batched read authorization over ownership-consistent ACTIVE vehicles. Applies the same
- * `decideMembershipPermission` / `activeAccessGrantCriteria` rules as
- * `evaluateVehiclePermission`, with at most one AccessGrant query per read permission.
- * Input order is preserved.
- */
+/** Batched read authorization; see `ResourceAuthorizationService.filterReadableCandidates`. */
 async function filterReadableVehicleCandidates(
   userId: Types.ObjectId,
   candidates: readonly VehicleAccessCandidate[],
   now: Date,
   session?: ClientSession,
 ): Promise<VehicleAccessCandidate[]> {
-  const readable = new Set<VehicleAccessCandidate>();
-  const pendingByPermission = new Map<string, VehicleAccessCandidate[]>();
-
-  for (const candidate of candidates) {
-    for (const permission of VEHICLE_READ_PERMISSIONS) {
-      const decision = decideMembershipPermission(candidate.vehicle, candidate.membership, userId, {
-        permission,
-        scopeType: 'VEHICLE',
-        scopeResourceId: null,
-        channel: 'ONLINE',
-      });
-      if (decision.kind === 'DECIDED') {
-        if (decision.result.allowed) {
-          readable.add(candidate);
-          break;
-        }
-        continue;
-      }
-      const pending = pendingByPermission.get(permission) ?? [];
-      pending.push(candidate);
-      pendingByPermission.set(permission, pending);
-    }
-  }
-
-  for (const [permission, pending] of pendingByPermission) {
-    const unresolved = pending.filter((candidate) => !readable.has(candidate));
-    if (unresolved.length === 0) {
-      continue;
-    }
-    const grants = (await AccessGrantModel.find(
-      {
-        vehicleId: { $in: unresolved.map((candidate) => candidate.vehicle._id) },
-        membershipId: { $in: unresolved.map((candidate) => candidate.membership._id) },
-        ...activeAccessGrantCriteria(
-          userId,
-          { permission, scopeType: 'VEHICLE', scopeResourceId: null, channel: 'ONLINE' },
-          now,
-        ),
-      },
-      { vehicleId: 1, membershipId: 1 },
-    )
-      .session(session ?? null)
-      .lean()) as Array<Pick<AccessGrant, 'vehicleId' | 'membershipId'>>;
-    const grantKeys = new Set(
-      grants.map((grant) => `${String(grant.vehicleId)}:${String(grant.membershipId)}`),
-    );
-    for (const candidate of unresolved) {
-      if (grantKeys.has(`${String(candidate.vehicle._id)}:${String(candidate.membership._id)}`)) {
-        readable.add(candidate);
-      }
-    }
-  }
-
-  return candidates.filter((candidate) => readable.has(candidate));
+  return resourceAuthorization.filterReadableCandidates(userId, candidates, { now, session });
 }
 
+/**
+ * Without `permission`: effective vehicle read access (TKT-011 semantics), not mere membership.
+ * With `permission`: ONLINE evaluation on the VEHICLE resource.
+ */
 export async function canAccessVehicle(
   vehicleId: Types.ObjectId,
   userId: Types.ObjectId,
   permission?: string,
 ): Promise<boolean> {
-  if (!permission) {
-    const vehicle = await loadVerifiedActiveVehicle(vehicleId, { actorUserId: userId });
-    if (!vehicle) {
-      return false;
-    }
-    const membership = await MembershipModel.findOne({
-      vehicleId,
-      userId,
-      status: 'ACTIVE',
-      suspendedAt: null,
-      revokedAt: null,
-    }).lean();
-    if (!membership) {
-      return false;
-    }
-    if (membership.role === 'OWNER' && !vehicle.ownerUserId.equals(userId)) {
-      return false;
-    }
-    if (membership.role !== 'OWNER' && vehicle.ownerUserId.equals(userId)) {
-      return false;
-    }
-    return true;
+  if (permission === undefined) {
+    return resourceAuthorization.hasVehicleReadAccess(vehicleId, userId);
   }
-
   const evaluation = await evaluateVehiclePermission({
     vehicleId,
     userId,
@@ -907,29 +598,19 @@ export async function canAccessVehicle(
   return evaluation.allowed;
 }
 
+/**
+ * `vehicle:manage` or `device:link` on the VEHICLE resource, ONLINE. A point-in-time answer: it
+ * does not cover the later completion of the Device challenge.
+ */
 export async function canLinkDeviceToVehicle(
   vehicleId: Types.ObjectId,
   userId: Types.ObjectId,
 ): Promise<boolean> {
-  const byManage = await evaluateVehiclePermission({
-    vehicleId,
-    userId,
-    permission: 'vehicle:manage',
-    scopeType: 'VEHICLE',
-    channel: 'ONLINE',
-  });
-  if (byManage.allowed) {
-    return true;
-  }
-
-  const byDeviceLink = await evaluateVehiclePermission({
-    vehicleId,
-    userId,
-    permission: 'device:link',
-    scopeType: 'VEHICLE',
-    channel: 'ONLINE',
-  });
-  return byDeviceLink.allowed;
+  const decision = await resourceAuthorization.evaluateAnyOf(
+    { actorUserId: userId, vehicleId, resource: { type: 'VEHICLE' }, channel: 'ONLINE' },
+    ['vehicle:manage', 'device:link'],
+  );
+  return decision.allowed;
 }
 
 export async function listOwnedVehicles(
@@ -1146,16 +827,15 @@ function accessibleVehicleBatchPipeline(
         foreignField: 'membershipId',
         pipeline: [
           {
-            $match: {
-              status: 'ACTIVE',
-              scopeType: 'VEHICLE',
-              channel: { $in: ['ONLINE', 'ANY'] },
-              permissions: { $in: [...VEHICLE_READ_PERMISSIONS] },
-              revokedAt: null,
-              expiredAt: null,
-              startsAt: { $lte: now },
-              $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
-            },
+            $match: activeAccessGrantCriteria(
+              {
+                subjectUserId: userId,
+                resource: { type: 'VEHICLE' },
+                channel: 'ONLINE',
+                permissions: VEHICLE_READ_PERMISSIONS,
+              },
+              now,
+            ),
           },
           { $limit: 1 },
           { $project: { _id: 1 } },
@@ -1280,11 +960,7 @@ async function resolveVehicleRelation(
     return { kind: 'NONE' };
   }
 
-  const membership = (await MembershipModel.findOne({
-    vehicleId,
-    userId,
-    ...ACTIVE_MEMBERSHIP_CRITERIA,
-  }).lean()) as MembershipRecord | null;
+  const membership = await resourceAuthorization.findActiveMembership(vehicleId, userId);
   if (!membership) {
     return { kind: 'NONE' };
   }
@@ -1412,27 +1088,15 @@ async function resolveInvitationIssuer(
   actorUserId: Types.ObjectId,
   options: { now: Date; audit: VehicleAuditLogger },
 ): Promise<InvitationIssuerResolution> {
-  const vehicle = await loadVerifiedActiveVehicle(vehicleId, {
+  const resolution = await resourceAuthorization.resolveSubject(vehicleId, actorUserId, {
     audit: options.audit,
-    actorUserId,
   });
-  if (!vehicle) {
+  if (!resolution.resolved) {
     return { kind: 'NONE' };
   }
-  const membership = (await MembershipModel.findOne({
-    vehicleId,
-    userId: actorUserId,
-    ...ACTIVE_MEMBERSHIP_CRITERIA,
-  }).lean()) as MembershipRecord | null;
-  if (!membership) {
-    return { kind: 'NONE' };
-  }
-  const isOwner = vehicle.ownerUserId.equals(actorUserId);
-  if (membership.role === 'OWNER') {
-    return isOwner ? { kind: 'OWNER', vehicle, membership } : { kind: 'NONE' };
-  }
-  if (isOwner) {
-    return { kind: 'NONE' };
+  const { vehicle, membership } = resolution.subject;
+  if (resolution.subject.role === 'OWNER') {
+    return { kind: 'OWNER', vehicle, membership };
   }
   if (holdsInvitationAuthority(membership.permissions)) {
     return { kind: 'DELEGATE', vehicle, membership };
@@ -3115,6 +2779,20 @@ export async function createAccessGrant(
     );
   }
 
+  const resource = toAuthorizationResource(
+    input.scopeType,
+    scopeResourceId,
+    input.verifiedResourceBinding,
+  );
+  if (resource && resource.type !== 'VEHICLE') {
+    if (!verifyExternalResourceBinding(input.vehicleId, resource)) {
+      throw new VehicleServiceError(
+        'VALIDATION_ERROR',
+        `${resource.type} scope grants require verified ownership evidence for the resource`,
+      );
+    }
+  }
+
   if ((channel === 'BLE_OFFLINE' || channel === 'ANY') && !(expiresAt instanceof Date)) {
     throw new VehicleServiceError(
       'VALIDATION_ERROR',
@@ -3135,7 +2813,7 @@ export async function createAccessGrant(
     !validatePermissionSet(input.permissions, {
       minItems: 1,
       maxItems: 50,
-      allowPermission: (permission) => isAccessGrantPermissionForScope(input.scopeType, permission),
+      allowPermission: (permission) => isIssuableAccessGrantPermission(input.scopeType, permission),
     })
   ) {
     throw new VehicleServiceError(
