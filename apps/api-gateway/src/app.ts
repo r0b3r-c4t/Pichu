@@ -17,7 +17,17 @@ import {
   invitationAcceptBodySchema,
   invitationCreateBodySchema,
   invitationIdParamsInputSchema,
+  invitationRevokeBodySchema,
+  invitationRevokeParamsInputSchema,
   loginBodySchema,
+  memberLeaveBodySchema,
+  memberListQueryInputSchema,
+  memberParamsInputSchema,
+  memberPermissionsUpdateBodySchema,
+  memberReactivateBodySchema,
+  memberTransitionBodySchema,
+  receivedInvitationListQueryInputSchema,
+  vehicleInvitationListQueryInputSchema,
   passwordResetConfirmBodySchema,
   passwordResetRequestBodySchema,
   registerBodySchema,
@@ -42,6 +52,12 @@ import { GatewayJwtError, verifyGatewayAccessToken } from './security/jwt.js';
 import {
   invitationAcceptResponseSchema,
   invitationCreateResponseSchema,
+  invitationRevokeResponseSchema,
+  memberLeaveResponseSchema,
+  memberListResponseSchema,
+  memberMutationResponseSchema,
+  receivedInvitationListResponseSchema,
+  vehicleInvitationListResponseSchema,
   vehicleArchiveResponseSchema,
   vehicleCreateResponseSchema,
   vehicleDetailResponseSchema,
@@ -1102,32 +1118,132 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
       },
     );
 
+    // Instance-local issuance limit on top of the global one: per authenticated user (JWT
+    // subject, verified locally without I/O) and, complementarily, per client IP.
+    const invitationIssuanceRateLimit = async (request: FastifyRequest, reply: FastifyReply) => {
+      const windowMs = env.INVITATION_RATE_LIMIT_WINDOW_SECONDS * 1000;
+      const byIp = rateLimiter.consume(
+        `${request.ip}:invitation-issue`,
+        env.INVITATION_IP_RATE_LIMIT_MAX,
+        windowMs,
+      );
+      const userId =
+        byIp === undefined
+          ? extractUserId(request.headers.authorization, env.JWT_SECRET, env)
+          : undefined;
+      const retryAfter =
+        byIp ??
+        (userId
+          ? rateLimiter.consume(
+              `user:${userId}:invitation-issue`,
+              env.INVITATION_RATE_LIMIT_MAX,
+              windowMs,
+            )
+          : undefined);
+      if (retryAfter === undefined) return;
+      reply.header('retry-after', retryAfter);
+      await reply
+        .code(429)
+        .send(
+          normalizeErrorResponse(
+            429,
+            { error: 'RATE_LIMITED', message: 'Too many invitation requests' },
+            getRequestId(request),
+          ),
+        );
+    };
+
+    const invitationExample = {
+      invitationId: '507f1f77bcf86cd799439013',
+      vehicleId: vehicleResponseExample.id,
+      inviterUserId: vehicleResponseExample.ownerUserId,
+      inviteeUserId: '507f1f77bcf86cd799439014',
+      permissions: ['vehicle:read'],
+      status: 'PENDING',
+      expiresAt: '2026-12-03T12:00:00.000Z',
+      createdAt: '2026-11-26T12:00:00.000Z',
+      acceptedAt: null,
+      revokedAt: null,
+      revokeReason: null,
+    };
+    const membershipExample = {
+      membershipId: '507f1f77bcf86cd799439016',
+      vehicleId: vehicleResponseExample.id,
+      userId: '507f1f77bcf86cd799439014',
+      role: 'MEMBER',
+      permissions: ['vehicle:read'],
+      status: 'ACTIVE',
+    };
+    const memberExample = {
+      ...membershipExample,
+      createdAt: '2026-11-26T12:00:00.000Z',
+      suspendedAt: null,
+      revokedAt: null,
+    };
+    const invitationNotFoundErrorResponse = vehicleErrorResponseWithExample(
+      'NOT_FOUND',
+      'Invitation not found',
+    );
+    const membershipNotFoundErrorResponse = vehicleErrorResponseWithExample(
+      'NOT_FOUND',
+      'Membership not found',
+    );
+    const invitationAuthorityErrorResponse = {
+      ...vehicleErrorResponseWithExample('FORBIDDEN', 'Insufficient permissions to invite members'),
+      description:
+        'Email not verified (EMAIL_NOT_VERIFIED), or caller can read the vehicle but lacks ' +
+        'invitation authority or tries to delegate a permission they may not delegate (FORBIDDEN)',
+    };
+    const invitationConflictErrorResponse = vehicleErrorResponseWithExample(
+      'CONFLICT',
+      'A pending invitation already exists for this user',
+    );
+    const membershipConflictErrorResponse = {
+      ...vehicleErrorResponseWithExample('CONFLICT', 'Cannot suspend membership in status REVOKED'),
+      description:
+        'OWNER membership, incompatible membership state, archived vehicle, or concurrent change',
+    };
+    /** Upstream list query; the actor is always derived from the verified JWT. */
+    const actorListQuery = (
+      request: FastifyRequest,
+      query: { limit?: number; cursor?: string; status?: string },
+    ): string => {
+      const userId = extractUserId(request.headers.authorization, env.JWT_SECRET, env);
+      const params = new URLSearchParams({ userId: userId ?? '' });
+      if (query.limit !== undefined) params.set('limit', String(query.limit));
+      if (query.cursor !== undefined) params.set('cursor', query.cursor);
+      if (query.status !== undefined) params.set('status', query.status);
+      return params.toString();
+    };
+
     app.post<{ Params: { vehicleId: string } }>(
       '/api/vehicles/:vehicleId/invitations',
       {
+        onRequest: invitationIssuanceRateLimit,
         schema: {
           tags: ['Invitations'],
-          summary: 'Create invitation (verified email required)',
+          summary: 'Create invitation (owner or authorized delegate, verified email required)',
+          description:
+            'The issuer is derived from the JWT. The canonical owner may delegate any delegable ' +
+            'permission; a MEMBER holding vehicle:manage or invitation:create directly may only ' +
+            'delegate vehicle:read, device:read or module:read that they hold directly. A ' +
+            'duplicate valid pending invitation is 409 and is never overwritten: revoke it and ' +
+            'issue a new one. Rate limited per authenticated user and per IP (429 + Retry-After).',
           security: [{ bearerAuth: [] }],
           params: jsonSchema(vehicleIdParamsInputSchema),
           body: jsonSchema(invitationCreateBodySchema),
           response: {
             ...vehicleCommonErrors,
+            403: invitationAuthorityErrorResponse,
             404: vehicleNotFoundErrorResponse,
+            409: invitationConflictErrorResponse,
             201: {
               ...jsonSchema(invitationCreateResponseSchema),
               example: {
-                invitationId: '507f1f77bcf86cd799439013',
+                invitationId: invitationExample.invitationId,
                 status: 'PENDING',
                 message: 'Invitation created',
-                data: {
-                  id: '507f1f77bcf86cd799439013',
-                  vehicleId: vehicleResponseExample.id,
-                  inviteeUserId: '507f1f77bcf86cd799439014',
-                  permissions: ['vehicle:read'],
-                  status: 'PENDING',
-                  expiresAt: '2026-11-10T12:00:00.000Z',
-                },
+                data: invitationExample,
                 requestId: 'request-1',
               },
             },
@@ -1137,7 +1253,7 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
       async (request, reply) => {
         const params = vehicleIdParamsInputSchema.safeParse(request.params);
         const body = invitationCreateBodySchema.safeParse(request.body);
-        if (!params.success || !body.success)
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
           return sendProxyResult(reply, getRequestId(request), 400, {
             message: 'Invalid invitation data',
           });
@@ -1153,30 +1269,124 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
       },
     );
 
+    app.get<{ Params: { vehicleId: string } }>(
+      '/api/vehicles/:vehicleId/invitations',
+      {
+        schema: {
+          tags: ['Invitations'],
+          summary: 'List invitations issued for a vehicle (verified email required)',
+          description:
+            'The canonical owner sees every invitation of the vehicle; an authorized delegate ' +
+            'only those issued through their current membership. Keyset pagination ' +
+            '(createdAt ASC, _id ASC); status is the effective state.',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(vehicleIdParamsInputSchema),
+          querystring: jsonSchema(vehicleInvitationListQueryInputSchema),
+          response: {
+            ...vehicleCommonErrors,
+            403: invitationAuthorityErrorResponse,
+            404: vehicleNotFoundErrorResponse,
+            200: {
+              ...jsonSchema(vehicleInvitationListResponseSchema),
+              example: {
+                invitations: [invitationExample],
+                page: { nextCursor: null },
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = vehicleIdParamsInputSchema.safeParse(request.params);
+        const query = vehicleInvitationListQueryInputSchema.safeParse(request.query);
+        if (!params.success || !query.success)
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid invitation query',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'GET',
+          `/vehicles/${params.data.vehicleId}/invitations?${actorListQuery(request, query.data)}`,
+        );
+      },
+    );
+
+    app.get(
+      '/api/invitations',
+      {
+        schema: {
+          tags: ['Invitations'],
+          summary: 'List invitations received by the caller (verified email required)',
+          description:
+            "Only the caller's own invitations; no prior membership is required. Without status " +
+            'only effective PENDING invitations are listed.',
+          security: [{ bearerAuth: [] }],
+          querystring: jsonSchema(receivedInvitationListQueryInputSchema),
+          response: {
+            ...vehicleCommonErrors,
+            200: {
+              ...jsonSchema(receivedInvitationListResponseSchema),
+              example: {
+                invitations: [
+                  {
+                    invitationId: invitationExample.invitationId,
+                    vehicleId: vehicleResponseExample.id,
+                    vehicleName: vehicleResponseExample.name,
+                    permissions: ['vehicle:read'],
+                    status: 'PENDING',
+                    expiresAt: invitationExample.expiresAt,
+                    createdAt: invitationExample.createdAt,
+                  },
+                ],
+                page: { nextCursor: null },
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const query = receivedInvitationListQueryInputSchema.safeParse(request.query);
+        if (!query.success)
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid invitation query',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'GET',
+          `/invitations?${actorListQuery(request, query.data)}`,
+        );
+      },
+    );
+
     app.post<{ Params: { invitationId: string } }>(
       '/api/invitations/:invitationId/accept',
       {
         schema: {
           tags: ['Invitations'],
           summary: 'Accept invitation (verified email required)',
+          description:
+            'Only the invitee may accept. Inexistent or foreign invitations are 404; own ' +
+            'non-pending or expired invitations are 409. If the issuer no longer holds the ' +
+            'delegated authority the invitation is durably revoked (issuer_authority_lost) and ' +
+            'the acceptance is rejected with 409.',
           security: [{ bearerAuth: [] }],
           params: jsonSchema(invitationIdParamsInputSchema),
           body: jsonSchema(invitationAcceptBodySchema),
           response: {
             ...vehicleCommonErrors,
-            404: vehicleNotFoundErrorResponse,
+            404: invitationNotFoundErrorResponse,
+            409: vehicleErrorResponseWithExample('CONFLICT', 'Invitation is no longer pending'),
             200: {
               ...jsonSchema(invitationAcceptResponseSchema),
               example: {
                 accepted: true,
                 vehicleId: vehicleResponseExample.id,
                 message: 'Invitation accepted',
-                data: {
-                  vehicleId: vehicleResponseExample.id,
-                  userId: '507f1f77bcf86cd799439014',
-                  role: 'MEMBER',
-                  permissions: ['vehicle:read'],
-                },
+                data: membershipExample,
                 requestId: 'request-1',
               },
             },
@@ -1186,7 +1396,7 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
       async (request, reply) => {
         const params = invitationIdParamsInputSchema.safeParse(request.params);
         const body = invitationAcceptBodySchema.safeParse(request.body);
-        if (!params.success || !body.success)
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
           return sendProxyResult(reply, getRequestId(request), 400, {
             message: 'Invalid invitation data',
           });
@@ -1195,6 +1405,306 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
           reply,
           'POST',
           `/invitations/${params.data.invitationId}/accept`,
+          body.data,
+        );
+      },
+    );
+
+    app.delete<{ Params: { vehicleId: string; invitationId: string } }>(
+      '/api/vehicles/:vehicleId/invitations/:invitationId',
+      {
+        schema: {
+          tags: ['Invitations'],
+          summary: 'Revoke a pending invitation (verified email required)',
+          description:
+            'The canonical owner may revoke any pending invitation of the vehicle; an ' +
+            'authorized delegate only those issued through their current membership. The body ' +
+            'is optional; `{ "reason": "..." }` may be sent. Repeating returns the original ' +
+            'revocation unchanged.',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(invitationRevokeParamsInputSchema),
+          response: {
+            ...vehicleCommonErrors,
+            403: invitationAuthorityErrorResponse,
+            404: invitationNotFoundErrorResponse,
+            409: vehicleErrorResponseWithExample('CONFLICT', 'Invitation already expired'),
+            200: {
+              ...jsonSchema(invitationRevokeResponseSchema),
+              example: {
+                invitationId: invitationExample.invitationId,
+                status: 'REVOKED',
+                message: 'Invitation revoked',
+                data: {
+                  ...invitationExample,
+                  status: 'REVOKED',
+                  revokedAt: '2026-11-26T13:00:00.000Z',
+                  revokeReason: 'Wrong recipient',
+                },
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = invitationRevokeParamsInputSchema.safeParse(request.params);
+        const body = invitationRevokeBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid invitation revocation request',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'DELETE',
+          `/vehicles/${params.data.vehicleId}/invitations/${params.data.invitationId}`,
+          body.data ?? {},
+        );
+      },
+    );
+
+    app.get<{ Params: { vehicleId: string } }>(
+      '/api/vehicles/:vehicleId/members',
+      {
+        schema: {
+          tags: ['Members'],
+          summary: 'List vehicle members (canonical owner only, verified email required)',
+          description:
+            'Defaults to ACTIVE and SUSPENDED members; REVOKED history requires status=REVOKED. ' +
+            'Keyset pagination (createdAt ASC, _id ASC).',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(vehicleIdParamsInputSchema),
+          querystring: jsonSchema(memberListQueryInputSchema),
+          response: {
+            ...vehicleCommonErrors,
+            403: vehicleOwnerOnlyErrorResponse,
+            404: vehicleNotFoundErrorResponse,
+            200: {
+              ...jsonSchema(memberListResponseSchema),
+              example: {
+                members: [memberExample],
+                page: { nextCursor: null },
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = vehicleIdParamsInputSchema.safeParse(request.params);
+        const query = memberListQueryInputSchema.safeParse(request.query);
+        if (!params.success || !query.success)
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid member query',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'GET',
+          `/vehicles/${params.data.vehicleId}/members?${actorListQuery(request, query.data)}`,
+        );
+      },
+    );
+
+    const memberMutationSchema = (
+      summary: string,
+      description: string,
+      example: { status: string } & Record<string, unknown>,
+      message: string,
+      body?: Record<string, unknown>,
+    ) => ({
+      tags: ['Members'],
+      summary,
+      description,
+      security: [{ bearerAuth: [] }],
+      params: jsonSchema(memberParamsInputSchema),
+      ...(body ? { body } : {}),
+      response: {
+        ...vehicleCommonErrors,
+        403: vehicleOwnerOnlyErrorResponse,
+        404: membershipNotFoundErrorResponse,
+        409: membershipConflictErrorResponse,
+        200: {
+          ...jsonSchema(memberMutationResponseSchema),
+          example: {
+            membershipId: memberExample.membershipId,
+            status: example.status,
+            message,
+            data: example,
+            requestId: 'request-1',
+          },
+        },
+      },
+    });
+    type MemberRoute = { Params: { vehicleId: string; membershipId: string } };
+
+    app.patch<MemberRoute>(
+      '/api/vehicles/:vehicleId/members/:membershipId',
+      {
+        schema: memberMutationSchema(
+          'Replace member base permissions (canonical owner only, verified email required)',
+          'Replaces the complete permission set (empty allowed) of an ACTIVE or SUSPENDED MEMBER. ' +
+            'Role, identity, status and audit fields cannot be changed and the OWNER membership ' +
+            'is never a valid target. AccessGrants are independent and are not revoked; pending ' +
+            'invitations issued by the member that the new set no longer authorizes are revoked.',
+          { ...memberExample, permissions: ['vehicle:read', 'device:read'] },
+          'Member permissions updated',
+          jsonSchema(memberPermissionsUpdateBodySchema),
+        ),
+      },
+      async (request, reply) => {
+        const params = memberParamsInputSchema.safeParse(request.params);
+        const body = memberPermissionsUpdateBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid member permissions',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'PATCH',
+          `/vehicles/${params.data.vehicleId}/members/${params.data.membershipId}`,
+          body.data,
+        );
+      },
+    );
+
+    app.post<MemberRoute>(
+      '/api/vehicles/:vehicleId/members/:membershipId/suspend',
+      {
+        schema: memberMutationSchema(
+          'Suspend member (canonical owner only, verified email required)',
+          "ACTIVE → SUSPENDED. Access is blocked, the membership's active AccessGrants and " +
+            'pending issued invitations are revoked in the same transaction, and base ' +
+            'permissions are kept. Optional body `{ "reason": "..." }`. Credentials already ' +
+            'stored on physical devices are not invalidated by this operation.',
+          { ...memberExample, status: 'SUSPENDED', suspendedAt: '2026-11-26T13:00:00.000Z' },
+          'Member suspended',
+        ),
+      },
+      async (request, reply) => {
+        const params = memberParamsInputSchema.safeParse(request.params);
+        const body = memberTransitionBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid member suspension request',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'POST',
+          `/vehicles/${params.data.vehicleId}/members/${params.data.membershipId}/suspend`,
+          body.data ?? {},
+        );
+      },
+    );
+
+    app.post<MemberRoute>(
+      '/api/vehicles/:vehicleId/members/:membershipId/reactivate',
+      {
+        schema: memberMutationSchema(
+          'Reactivate suspended member (canonical owner only, verified email required)',
+          'SUSPENDED → ACTIVE with the current base permissions only; revoked AccessGrants and ' +
+            'invitations are not restored. REVOKED memberships cannot be reactivated. The body ' +
+            'is optional and must be `{}` when sent.',
+          memberExample,
+          'Member reactivated',
+        ),
+      },
+      async (request, reply) => {
+        const params = memberParamsInputSchema.safeParse(request.params);
+        const body = memberReactivateBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid member reactivation request',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'POST',
+          `/vehicles/${params.data.vehicleId}/members/${params.data.membershipId}/reactivate`,
+          body.data ?? {},
+        );
+      },
+    );
+
+    app.delete<MemberRoute>(
+      '/api/vehicles/:vehicleId/members/:membershipId',
+      {
+        schema: memberMutationSchema(
+          'Revoke member (canonical owner only, verified email required)',
+          'Terminal revocation of an ACTIVE or SUSPENDED MEMBER, revoking its AccessGrants and ' +
+            'pending issued invitations in the same transaction. Optional body ' +
+            '`{ "reason": "..." }`. Repeating returns the original revocation unchanged. ' +
+            'Credentials already stored on physical devices are not invalidated immediately.',
+          { ...memberExample, status: 'REVOKED', revokedAt: '2026-11-26T13:00:00.000Z' },
+          'Member revoked',
+        ),
+      },
+      async (request, reply) => {
+        const params = memberParamsInputSchema.safeParse(request.params);
+        const body = memberTransitionBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid member revocation request',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'DELETE',
+          `/vehicles/${params.data.vehicleId}/members/${params.data.membershipId}`,
+          body.data ?? {},
+        );
+      },
+    );
+
+    app.post<{ Params: { vehicleId: string } }>(
+      '/api/vehicles/:vehicleId/members/leave',
+      {
+        schema: {
+          tags: ['Members'],
+          summary: 'Leave a vehicle voluntarily (own MEMBER membership, verified email required)',
+          description:
+            "Revokes the caller's own ACTIVE or SUSPENDED MEMBER membership identified by the " +
+            'required `membershipId` (reason member_left), with its AccessGrants and pending ' +
+            'issued invitations. The membership must belong to the caller and to the vehicle. ' +
+            'Repeating returns it unchanged and never affects a later membership. The canonical ' +
+            'owner cannot leave (409).',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(vehicleIdParamsInputSchema),
+          body: jsonSchema(memberLeaveBodySchema),
+          response: {
+            ...vehicleCommonErrors,
+            404: membershipNotFoundErrorResponse,
+            409: vehicleErrorResponseWithExample(
+              'CONFLICT',
+              'The vehicle owner cannot leave the vehicle',
+            ),
+            200: {
+              ...jsonSchema(memberLeaveResponseSchema),
+              example: {
+                membershipId: membershipExample.membershipId,
+                status: 'REVOKED',
+                message: 'Left vehicle',
+                data: { ...membershipExample, status: 'REVOKED' },
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = vehicleIdParamsInputSchema.safeParse(request.params);
+        const body = memberLeaveBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid leave request',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'POST',
+          `/vehicles/${params.data.vehicleId}/members/leave`,
           body.data,
         );
       },

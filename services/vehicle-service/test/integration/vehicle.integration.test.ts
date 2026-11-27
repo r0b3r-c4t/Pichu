@@ -40,16 +40,24 @@ import {
   expireElapsedAccessGrants,
   getAccessibleVehicle,
   getVehicleForUser,
+  INVITATION_ISSUER_AUTHORITY_LOST_REASON,
   inviteMember,
+  leaveVehicle,
   listAccessibleVehicles,
   listOwnedVehicles,
+  listReceivedInvitations,
+  listVehicleInvitations,
+  listVehicleMembers,
+  MEMBER_LEFT_REASON,
   reactivateMembership,
   revokeAccessGrant,
   revokeInvitation,
   revokeMembership,
   suspendMembership,
+  updateMembershipPermissions,
   updateVehicle,
   VehicleServiceError,
+  type VehicleAuditEvent,
 } from '../../src/services/vehicle.service.js';
 import { setupVehicleTestAuth } from '../v2-fixture.js';
 
@@ -395,9 +403,11 @@ test('6. Expired invitations persist EXPIRED outside rollback, allow re-issuance
   });
   assert.ok(expiredInvite);
 
-  // Attempting to accept after expiry returns null AND durably persists EXPIRED (not rolled back!)
-  const acceptResult = await acceptInvitation(expiredInvite._id, inviteeA);
-  assert.equal(acceptResult, null);
+  // Accepting an own invitation after expiry is a CONFLICT AND durably persists EXPIRED
+  await assert.rejects(
+    () => acceptInvitation(expiredInvite._id, inviteeA),
+    (err: unknown) => err instanceof VehicleServiceError && err.code === 'CONFLICT',
+  );
 
   const persistedExpired = await InvitationModel.findById(expiredInvite._id).lean();
   assert.equal(persistedExpired?.status, 'EXPIRED');
@@ -424,17 +434,22 @@ test('6. Expired invitations persist EXPIRED outside rollback, allow re-issuance
     actorUserId: ownerId,
     reason: 'Changed permissions',
   });
-  assert.equal(revoked?.status, 'REVOKED');
+  assert.equal(revoked.invitation.status, 'REVOKED');
+  assert.equal(revoked.alreadyRevoked, false);
 
   // Cannot reopen terminal REVOKED or EXPIRED invitations
-  assert.equal(await acceptInvitation(reissued._id, inviteeB), null);
-  assert.equal(
-    await revokeInvitation({
-      vehicleId: vehicle._id,
-      invitationId: expiredInvite._id,
-      actorUserId: ownerId,
-    }),
-    null,
+  await assert.rejects(
+    () => acceptInvitation(reissued._id, inviteeB),
+    (err: unknown) => err instanceof VehicleServiceError && err.code === 'CONFLICT',
+  );
+  await assert.rejects(
+    () =>
+      revokeInvitation({
+        vehicleId: vehicle._id,
+        invitationId: expiredInvite._id,
+        actorUserId: ownerId,
+      }),
+    (err: unknown) => err instanceof VehicleServiceError && err.code === 'CONFLICT',
   );
 
   const third = await inviteMember(vehicle._id, ownerId, inviteeB, ['vehicle:read']);
@@ -828,14 +843,24 @@ test('8. AccessGrant rules: multiple grants, cascade revocation, non-inheritance
   assert.equal((await AccessGrantModel.findById(grantDev2Online._id))?.status, 'ACTIVE');
   assert.equal((await AccessGrantModel.findById(grantModuleFuture._id))?.status, 'ACTIVE');
 
-  // 8f. Suspending Membership blocks active AccessGrants without revoking them; reactivation restores them
-  await suspendMembership({
+  // 8f. TKT-012: suspending a Membership revokes its active AccessGrants (current and future
+  // windows) in the same transaction; reactivation restores base permissions only.
+  const suspendOutcome = await suspendMembership({
     vehicleId: vehicle1._id,
     membershipId: memA._id,
     actorUserId: ownerId,
     reason: 'Temporary travel pause',
     now,
   });
+  assert.equal(suspendOutcome.membership.status, 'SUSPENDED');
+  assert.equal(suspendOutcome.revokedGrantsCount, 2); // grantDev2Online + grantModuleFuture
+  for (const grantId of [grantDev2Online._id, grantModuleFuture._id]) {
+    const grant = await AccessGrantModel.findById(grantId).lean();
+    assert.equal(grant?.status, 'REVOKED');
+    assert.equal(grant?.revokeReason, 'Temporary travel pause');
+    assert.equal(grant?.revokedByUserId?.equals(ownerId), true);
+  }
+  assert.equal((await AccessGrantModel.findById(grantDev1Ble._id).lean())?.status, 'EXPIRED');
   const whileSuspended = await evaluateVehiclePermission({
     vehicleId: vehicle1._id,
     userId: memberA,
@@ -874,9 +899,28 @@ test('8. AccessGrant rules: multiple grants, cascade revocation, non-inheritance
     }),
     now,
   });
-  assert.equal(afterReactivate.allowed, true);
+  assert.equal(afterReactivate.allowed, false);
+  assert.equal((await AccessGrantModel.findById(grantDev2Online._id).lean())?.status, 'REVOKED');
+  const baseAfterReactivate = await evaluateVehiclePermission({
+    vehicleId: vehicle1._id,
+    userId: memberA,
+    permission: 'vehicle:read',
+    now,
+  });
+  assert.equal(baseAfterReactivate.allowed, true);
 
-  // 8g. Revoking Membership cascades to all remaining ACTIVE grants AND new Membership does NOT inherit old grants
+  // 8g. Revoking Membership cascades to remaining ACTIVE grants (none left after suspension) AND
+  // a new Membership does NOT inherit old grants
+  const lateGrant = await createAccessGrant({
+    vehicleId: vehicle1._id,
+    membershipId: memA._id,
+    subjectUserId: memberA,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:read'],
+    now,
+  });
   const revokeOutcome = await revokeMembership({
     vehicleId: vehicle1._id,
     membershipId: memA._id,
@@ -884,7 +928,9 @@ test('8. AccessGrant rules: multiple grants, cascade revocation, non-inheritance
     reason: 'End membership',
     now,
   });
-  assert.equal(revokeOutcome?.revokedGrantsCount, 2); // grantDev2Online + grantModuleFuture
+  assert.equal(revokeOutcome.revokedGrantsCount, 1);
+  assert.equal(revokeOutcome.alreadyRevoked, false);
+  assert.equal((await AccessGrantModel.findById(lateGrant._id).lean())?.status, 'REVOKED');
 
   // Terminal REVOKED membership cannot be reactivated
   await assert.rejects(
@@ -990,7 +1036,10 @@ test('9. Archived vehicles revoke pending invitations and active grants and deny
     await inviteMember(vehicle._id, ownerId, new Types.ObjectId(), ['vehicle:read']),
     null,
   );
-  assert.equal(await acceptInvitation(invPending._id, pendingInviteeId), null);
+  await assert.rejects(
+    () => acceptInvitation(invPending._id, pendingInviteeId),
+    (err: unknown) => err instanceof VehicleServiceError && err.code === 'CONFLICT',
+  );
 
   await assert.rejects(
     () =>
@@ -2287,7 +2336,10 @@ test('18. TKT-011 inviteMember authorizes before persisting expirations: unautho
   const ownerId = new Types.ObjectId();
   const vehicle = await createVehicle(ownerId, { name: 'Invitation Guard Van' });
   const reader = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
-  const delegate = await addAcceptedMember(vehicle._id, ownerId, ['invitation:create']);
+  const delegate = await addAcceptedMember(vehicle._id, ownerId, [
+    'invitation:create',
+    'vehicle:read',
+  ]);
   const outsider = new Types.ObjectId();
   const elapsedInvitee = new Types.ObjectId();
   const elapsedInvitationId = new Types.ObjectId();
@@ -2313,12 +2365,12 @@ test('18. TKT-011 inviteMember authorizes before persisting expirations: unautho
   });
 
   const snapshot = await vehiclePersistenceSnapshot(vehicle._id);
-  for (const unauthorized of [outsider, reader.memberId]) {
-    assert.equal(
-      await inviteMember(vehicle._id, unauthorized, elapsedInvitee, ['vehicle:read']),
-      null,
-    );
-  }
+  assert.equal(await inviteMember(vehicle._id, outsider, elapsedInvitee, ['vehicle:read']), null);
+  // TKT-012: a member who can see the vehicle but lacks invite authority gets FORBIDDEN.
+  await rejectsWithCode(
+    () => inviteMember(vehicle._id, reader.memberId, elapsedInvitee, ['vehicle:read']),
+    'FORBIDDEN',
+  );
   assert.equal(
     await inviteMember(new Types.ObjectId(), ownerId, elapsedInvitee, ['vehicle:read']),
     null,
@@ -2564,6 +2616,8 @@ test('11. End-to-end Gateway -> Vehicle -> Identity/Device over real HTTPS, HMAC
     const inviteeSessionId = String(new Types.ObjectId());
     const unverifiedId = String(new Types.ObjectId());
     const unverifiedSessionId = String(new Types.ObjectId());
+    const delegateId = String(new Types.ObjectId());
+    const delegateSessionId = String(new Types.ObjectId());
     const jwtSecret = 'k'.repeat(32);
 
     const identityDb = rootClient.db('identity_db');
@@ -2613,6 +2667,20 @@ test('11. End-to-end Gateway -> Vehicle -> Identity/Device over real HTTPS, HMAC
         createdAt: new Date(),
         updatedAt: new Date(),
       },
+      {
+        _id: new Types.ObjectId(delegateId),
+        name: 'Delegate Verified',
+        username: 'delegate_verified',
+        normalizedUsername: 'delegate_verified',
+        email: 'delegate@example.com',
+        normalizedEmail: 'delegate@example.com',
+        passwordHash: 'unused',
+        emailVerifiedAt: new Date(),
+        passwordRecoverySequence: 0,
+        passwordRecoveryGeneration: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
     ]);
 
     await identityDb.collection('sessions').insertMany([
@@ -2648,6 +2716,17 @@ test('11. End-to-end Gateway -> Vehicle -> Identity/Device over real HTTPS, HMAC
         revokedAt: null,
         revokeReason: null,
         userAgent: 'tkt010-e2e',
+      },
+      {
+        _id: new Types.ObjectId(delegateSessionId),
+        userId: new Types.ObjectId(delegateId),
+        familyId: randomUUID(),
+        createdAt: new Date(),
+        lastActivityAt: new Date(),
+        expiresAt: new Date(Date.now() + 600_000),
+        revokedAt: null,
+        revokeReason: null,
+        userAgent: 'tkt012-e2e',
       },
     ]);
 
@@ -2815,6 +2894,7 @@ test('11. End-to-end Gateway -> Vehicle -> Identity/Device over real HTTPS, HMAC
     const ownerJwt = signUserJwt(ownerId, ownerSessionId, jwtSecret);
     const inviteeJwt = signUserJwt(inviteeId, inviteeSessionId, jwtSecret);
     const unverifiedJwt = signUserJwt(unverifiedId, unverifiedSessionId, jwtSecret);
+    const delegateJwt = signUserJwt(delegateId, delegateSessionId, jwtSecret);
 
     // Unverified user blocked with 403 EMAIL_NOT_VERIFIED
     const unverifiedCreate = await fetch(`${gatewayUrl}/api/vehicles`, {
@@ -3161,6 +3241,419 @@ test('11. End-to-end Gateway -> Vehicle -> Identity/Device over real HTTPS, HMAC
     assert.equal(directPaddedTooLong.status, 400);
     assert.equal((await VehicleModel.findById(vehicleId).lean())?.bodyStyle, 'b'.repeat(60));
 
+    // TKT-012: the eleven membership/invitation endpoints over Gateway -> HTTPS + HMAC v2.
+    const auditFields = [
+      'issuerMembershipId',
+      'revokedByUserId',
+      'suspendedByUserId',
+      'userIdHash',
+    ];
+    const assertNoAuditFields = (body: unknown) => {
+      const text = JSON.stringify(body);
+      for (const field of auditFields) assert.equal(text.includes(`"${field}"`), false, field);
+    };
+
+    const delegateInvite = await gw('POST', `/api/vehicles/${vehicleId}/invitations`, ownerJwt, {
+      inviteeUserId: delegateId,
+      permissions: ['vehicle:read', 'invitation:create'],
+    });
+    assert.equal(delegateInvite.status, 201);
+    assertNoAuditFields(delegateInvite.body);
+    const delegateInvitation = delegateInvite.body.data as Record<string, unknown>;
+    assert.equal(delegateInvitation.inviterUserId, ownerId);
+    assert.equal(delegateInvitation.status, 'PENDING');
+    assert.equal(delegateInvite.body.invitationId, delegateInvitation.invitationId);
+
+    const received = await gw('GET', '/api/invitations', delegateJwt);
+    assert.equal(received.status, 200);
+    assert.deepEqual(
+      (received.body.invitations as Array<Record<string, unknown>>).map((item) => [
+        item.invitationId,
+        item.vehicleName,
+        item.status,
+      ]),
+      [[delegateInvitation.invitationId, 'Gateway Hyundai Ioniq 5', 'PENDING']],
+    );
+    assert.equal(JSON.stringify(received.body).includes('inviterUserId'), false);
+    assert.deepEqual((await gw('GET', '/api/invitations', unverifiedJwt)).status, 403);
+
+    const delegateAccept = await gw(
+      'POST',
+      `/api/invitations/${String(delegateInvitation.invitationId)}/accept`,
+      delegateJwt,
+      {},
+    );
+    assert.equal(delegateAccept.status, 200);
+    const delegateMembership = delegateAccept.body.data as Record<string, unknown>;
+    assert.equal(delegateMembership.status, 'ACTIVE');
+    assert.equal(delegateMembership.role, 'MEMBER');
+    const delegateMembershipId = String(delegateMembership.membershipId);
+    const acceptAgain = await gw(
+      'POST',
+      `/api/invitations/${String(delegateInvitation.invitationId)}/accept`,
+      delegateJwt,
+      {},
+    );
+    assert.equal(acceptAgain.status, 409);
+    const foreignAccept = await gw(
+      'POST',
+      `/api/invitations/${String(delegateInvitation.invitationId)}/accept`,
+      inviteeJwt,
+      {},
+    );
+    assert.equal(foreignAccept.status, 404);
+
+    // Delegate issues a read-only invitation; duplicates and physical permissions are rejected.
+    const delegatedInvite = await gw(
+      'POST',
+      `/api/vehicles/${vehicleId}/invitations`,
+      delegateJwt,
+      {
+        inviteeUserId: unverifiedId,
+        permissions: ['vehicle:read'],
+      },
+    );
+    assert.equal(delegatedInvite.status, 201);
+    const delegatedInvitationId = String(delegatedInvite.body.invitationId);
+    const duplicateInvite = await gw(
+      'POST',
+      `/api/vehicles/${vehicleId}/invitations`,
+      delegateJwt,
+      {
+        inviteeUserId: unverifiedId,
+        permissions: ['vehicle:read'],
+      },
+    );
+    assert.equal(duplicateInvite.status, 409);
+    const physicalDelegation = await gw(
+      'POST',
+      `/api/vehicles/${vehicleId}/invitations`,
+      delegateJwt,
+      { inviteeUserId: String(new Types.ObjectId()), permissions: ['device:link'] },
+    );
+    assert.equal(physicalDelegation.status, 403);
+    const readerInvite = await gw('POST', `/api/vehicles/${vehicleId}/invitations`, inviteeJwt, {
+      inviteeUserId: String(new Types.ObjectId()),
+      permissions: ['vehicle:read'],
+    });
+    assert.equal(readerInvite.status, 403);
+    const unknownInvitee = await gw('POST', `/api/vehicles/${vehicleId}/invitations`, ownerJwt, {
+      inviteeUserId: String(new Types.ObjectId()),
+      permissions: ['vehicle:read'],
+    });
+    assert.equal(unknownInvitee.status, 404);
+
+    // Unverified invitees cannot accept until their email is verified.
+    const unverifiedAccept = await gw(
+      'POST',
+      `/api/invitations/${delegatedInvitationId}/accept`,
+      unverifiedJwt,
+      {},
+    );
+    assert.equal(unverifiedAccept.status, 403);
+    assert.equal(unverifiedAccept.body.error, 'EMAIL_NOT_VERIFIED');
+
+    // Issued invitations: the owner pages through all, the delegate sees only their own.
+    const ownerInvitationIds: string[] = [];
+    let invitationCursor: string | null = null;
+    do {
+      const page = await gw(
+        'GET',
+        `/api/vehicles/${vehicleId}/invitations?limit=1${
+          invitationCursor ? `&cursor=${encodeURIComponent(invitationCursor)}` : ''
+        }`,
+        ownerJwt,
+      );
+      assert.equal(page.status, 200);
+      assertNoAuditFields(page.body);
+      for (const item of page.body.invitations as Array<Record<string, unknown>>)
+        ownerInvitationIds.push(String(item.invitationId));
+      invitationCursor = (page.body.page as { nextCursor: string | null }).nextCursor;
+      if (invitationCursor && ownerInvitationIds.length === 1) {
+        const stolen = await gw(
+          'GET',
+          `/api/vehicles/${vehicleId}/invitations?limit=1&cursor=${encodeURIComponent(invitationCursor)}`,
+          delegateJwt,
+        );
+        assert.equal(stolen.status, 400);
+        const mismatched = await gw(
+          'GET',
+          `/api/vehicles/${vehicleId}/invitations?limit=1&status=PENDING&cursor=${encodeURIComponent(invitationCursor)}`,
+          ownerJwt,
+        );
+        assert.equal(mismatched.status, 400);
+      }
+    } while (invitationCursor);
+    assert.equal(ownerInvitationIds.length, 3);
+    assert.equal(new Set(ownerInvitationIds).size, 3);
+    assert.ok(ownerInvitationIds.includes(delegatedInvitationId));
+    const delegateIssued = await gw('GET', `/api/vehicles/${vehicleId}/invitations`, delegateJwt);
+    assert.equal(delegateIssued.status, 200);
+    assert.deepEqual(
+      (delegateIssued.body.invitations as Array<Record<string, unknown>>).map(
+        (item) => item.invitationId,
+      ),
+      [delegatedInvitationId],
+    );
+    assert.equal(
+      (await gw('GET', `/api/vehicles/${vehicleId}/invitations`, inviteeJwt)).status,
+      403,
+    );
+    assert.equal(
+      (await gw('GET', `/api/vehicles/${probeVehicleId}/invitations`, inviteeJwt)).status,
+      404,
+    );
+
+    // Members: owner-only listing with ACTIVE+SUSPENDED by default.
+    const members = await gw('GET', `/api/vehicles/${vehicleId}/members`, ownerJwt);
+    assert.equal(members.status, 200);
+    assertNoAuditFields(members.body);
+    const memberRows = members.body.members as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      memberRows.map((row) => [row.userId, row.role, row.status]),
+      [
+        [ownerId, 'OWNER', 'ACTIVE'],
+        [inviteeId, 'MEMBER', 'ACTIVE'],
+        [delegateId, 'MEMBER', 'ACTIVE'],
+      ],
+    );
+    const ownerMembershipId = String(memberRows[0]?.membershipId);
+    const inviteeMembershipId = String(memberRows[1]?.membershipId);
+    assert.equal(memberRows[2]?.membershipId, delegateMembershipId);
+    assert.equal((await gw('GET', `/api/vehicles/${vehicleId}/members`, delegateJwt)).status, 403);
+    assert.deepEqual(
+      (await gw('GET', `/api/vehicles/${vehicleId}/members?status=REVOKED`, ownerJwt)).body.members,
+      [],
+    );
+
+    // PATCH replaces base permissions; the OWNER membership and reserved fields are protected.
+    const memberBase = `/api/vehicles/${vehicleId}/members`;
+    const narrowed = await gw('PATCH', `${memberBase}/${inviteeMembershipId}`, ownerJwt, {
+      permissions: ['vehicle:read'],
+    });
+    assert.equal(narrowed.status, 200);
+    assert.deepEqual((narrowed.body.data as Record<string, unknown>).permissions, ['vehicle:read']);
+    assertNoAuditFields(narrowed.body);
+    assert.equal(
+      (await gw('PATCH', `${memberBase}/${ownerMembershipId}`, ownerJwt, { permissions: [] }))
+        .status,
+      409,
+    );
+    assert.equal(
+      (
+        await gw('PATCH', `${memberBase}/${inviteeMembershipId}`, ownerJwt, {
+          permissions: ['vehicle:read'],
+          role: 'OWNER',
+        })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (
+        await gw('PATCH', `${memberBase}/${inviteeMembershipId}`, delegateJwt, {
+          permissions: ['vehicle:read', 'device:link'],
+        })
+      ).status,
+      403,
+    );
+
+    // Suspend blocks access, reactivate restores base permissions only.
+    const suspended = await gw('POST', `${memberBase}/${inviteeMembershipId}/suspend`, ownerJwt, {
+      reason: 'Temporary pause',
+    });
+    assert.equal(suspended.status, 200);
+    assert.equal(suspended.body.status, 'SUSPENDED');
+    assert.ok((suspended.body.data as Record<string, unknown>).suspendedAt);
+    assert.equal((await gw('GET', `/api/vehicles/${vehicleId}`, inviteeJwt)).status, 404);
+    assert.equal(
+      (await gw('POST', `${memberBase}/${inviteeMembershipId}/suspend`, ownerJwt)).status,
+      409,
+    );
+    assert.equal(
+      (await gw('POST', `${memberBase}/${ownerMembershipId}/suspend`, ownerJwt)).status,
+      409,
+    );
+    const reactivated = await gw(
+      'POST',
+      `${memberBase}/${inviteeMembershipId}/reactivate`,
+      ownerJwt,
+    );
+    assert.equal(reactivated.status, 200);
+    assert.equal(reactivated.body.status, 'ACTIVE');
+    assert.equal((await gw('GET', `/api/vehicles/${vehicleId}`, inviteeJwt)).status, 200);
+
+    // Removing invitation:create from the delegate revokes their pending issued invitation.
+    const demoted = await gw('PATCH', `${memberBase}/${delegateMembershipId}`, ownerJwt, {
+      permissions: ['vehicle:read'],
+    });
+    assert.equal(demoted.status, 200);
+    const cascaded = await InvitationModel.findById(delegatedInvitationId).lean();
+    assert.equal(cascaded?.status, 'REVOKED');
+    assert.equal(cascaded?.revokeReason, 'issuer_authority_lost');
+
+    // DELETE invitation: owner revokes; repeated DELETE returns the original revocation.
+    const ownerReinvite = await gw('POST', `/api/vehicles/${vehicleId}/invitations`, ownerJwt, {
+      inviteeUserId: unverifiedId,
+      permissions: ['vehicle:read', 'device:read'],
+    });
+    assert.equal(ownerReinvite.status, 201);
+    const reinviteId = String(ownerReinvite.body.invitationId);
+    assert.equal(
+      (await gw('DELETE', `/api/vehicles/${vehicleId}/invitations/${reinviteId}`, delegateJwt))
+        .status,
+      403,
+    );
+    const revokedInvitation = await gw(
+      'DELETE',
+      `/api/vehicles/${vehicleId}/invitations/${reinviteId}`,
+      ownerJwt,
+      { reason: 'Wrong recipient' },
+    );
+    assert.equal(revokedInvitation.status, 200);
+    assert.equal(revokedInvitation.body.status, 'REVOKED');
+    const revokedData = revokedInvitation.body.data as Record<string, unknown>;
+    assert.equal(revokedData.revokeReason, 'Wrong recipient');
+    assertNoAuditFields(revokedInvitation.body);
+    const revokedAgain = await gw(
+      'DELETE',
+      `/api/vehicles/${vehicleId}/invitations/${reinviteId}`,
+      ownerJwt,
+      { reason: 'Second reason' },
+    );
+    assert.equal(revokedAgain.status, 200);
+    assert.equal(revokedAgain.body.message, 'Invitation already revoked');
+    assert.equal(
+      (revokedAgain.body.data as Record<string, unknown>).revokedAt,
+      revokedData.revokedAt,
+    );
+    assert.equal(
+      (revokedAgain.body.data as Record<string, unknown>).revokeReason,
+      'Wrong recipient',
+    );
+    assert.equal(
+      (await gw('DELETE', `/api/vehicles/${probeVehicleId}/invitations/${reinviteId}`, ownerJwt))
+        .status,
+      404,
+    );
+
+    // Voluntary leave: explicit membershipId, idempotent, never affects a later membership.
+    assert.equal((await gw('POST', `${memberBase}/leave`, inviteeJwt, {})).status, 400);
+    assert.equal(
+      (
+        await gw('POST', `${memberBase}/leave`, inviteeJwt, {
+          membershipId: delegateMembershipId,
+        })
+      ).status,
+      404,
+    );
+    assert.equal(
+      (
+        await gw('POST', `/api/vehicles/${probeVehicleId}/members/leave`, inviteeJwt, {
+          membershipId: inviteeMembershipId,
+        })
+      ).status,
+      404,
+    );
+    const left = await gw('POST', `${memberBase}/leave`, inviteeJwt, {
+      membershipId: inviteeMembershipId,
+    });
+    assert.equal(left.status, 200);
+    assert.equal(left.body.status, 'REVOKED');
+    assert.equal(left.body.membershipId, inviteeMembershipId);
+    assert.equal(left.body.message, 'Left vehicle');
+    const leftRecord = await MembershipModel.findById(inviteeMembershipId).lean();
+    assert.equal(leftRecord?.revokeReason, 'member_left');
+    assert.equal(String(leftRecord?.revokedByUserId), inviteeId);
+    const leftAgain = await gw('POST', `${memberBase}/leave`, inviteeJwt, {
+      membershipId: inviteeMembershipId,
+    });
+    assert.equal(leftAgain.status, 200);
+    assert.equal(leftAgain.body.message, 'Membership already revoked');
+    assert.equal((await gw('GET', `/api/vehicles/${vehicleId}`, inviteeJwt)).status, 404);
+    assert.equal(
+      (
+        await gw('POST', `${memberBase}/leave`, ownerJwt, {
+          membershipId: ownerMembershipId,
+        })
+      ).status,
+      409,
+    );
+    const rejoinInvite = await gw('POST', `/api/vehicles/${vehicleId}/invitations`, ownerJwt, {
+      inviteeUserId: inviteeId,
+      permissions: ['vehicle:read', 'device:read'],
+    });
+    assert.equal(rejoinInvite.status, 201);
+    const rejoined = await gw(
+      'POST',
+      `/api/invitations/${String(rejoinInvite.body.invitationId)}/accept`,
+      inviteeJwt,
+      {},
+    );
+    assert.equal(rejoined.status, 200);
+    const rejoinedMembershipId = String(
+      (rejoined.body.data as Record<string, unknown>).membershipId,
+    );
+    assert.notEqual(rejoinedMembershipId, inviteeMembershipId);
+    const replayedLeave = await gw('POST', `${memberBase}/leave`, inviteeJwt, {
+      membershipId: inviteeMembershipId,
+    });
+    assert.equal(replayedLeave.status, 200);
+    assert.equal(replayedLeave.body.membershipId, inviteeMembershipId);
+    assert.equal(replayedLeave.body.message, 'Membership already revoked');
+    const rejoinedRecord = await MembershipModel.findById(rejoinedMembershipId).lean();
+    assert.equal(rejoinedRecord?.status, 'ACTIVE');
+    assert.deepEqual(rejoinedRecord?.permissions, ['vehicle:read', 'device:read']);
+    assert.deepEqual(await MembershipModel.findById(inviteeMembershipId).lean(), leftRecord);
+    assert.equal((await gw('GET', `/api/vehicles/${vehicleId}`, inviteeJwt)).status, 200);
+
+    // Owner revokes the delegate; repeated DELETE keeps the original audit and REVOKED is terminal.
+    const revokedMember = await gw('DELETE', `${memberBase}/${delegateMembershipId}`, ownerJwt, {
+      reason: 'No longer drives',
+    });
+    assert.equal(revokedMember.status, 200);
+    assert.equal(revokedMember.body.status, 'REVOKED');
+    const revokedMemberAt = (revokedMember.body.data as Record<string, unknown>).revokedAt;
+    const revokedMemberAgain = await gw(
+      'DELETE',
+      `${memberBase}/${delegateMembershipId}`,
+      ownerJwt,
+      { reason: 'Overwrite attempt' },
+    );
+    assert.equal(revokedMemberAgain.status, 200);
+    assert.equal(revokedMemberAgain.body.message, 'Member already revoked');
+    assert.equal(
+      (revokedMemberAgain.body.data as Record<string, unknown>).revokedAt,
+      revokedMemberAt,
+    );
+    assert.equal(
+      (await MembershipModel.findById(delegateMembershipId).lean())?.revokeReason,
+      'No longer drives',
+    );
+    assert.equal(
+      (await gw('POST', `${memberBase}/${delegateMembershipId}/reactivate`, ownerJwt)).status,
+      409,
+    );
+    assert.equal(
+      (
+        await gw(
+          'DELETE',
+          `/api/vehicles/${probeVehicleId}/members/${delegateMembershipId}`,
+          ownerJwt,
+        )
+      ).status,
+      404,
+    );
+    const revokedMembers = await gw('GET', `${memberBase}?status=REVOKED`, ownerJwt);
+    assert.deepEqual(
+      (revokedMembers.body.members as Array<Record<string, unknown>>)
+        .map((row) => row.membershipId)
+        .sort(),
+      [inviteeMembershipId, delegateMembershipId].sort(),
+    );
+    const inviteeHistory = await gw('GET', '/api/invitations?status=ACCEPTED', inviteeJwt);
+    assert.equal(inviteeHistory.status, 200);
+    assert.equal((inviteeHistory.body.invitations as unknown[]).length, 2);
+
     // DELETE without body, then repeated DELETE with a reason: idempotent and unchanged.
     const archiveNoBody = await gw('DELETE', `/api/vehicles/${probeVehicleId}`, ownerJwt);
     assert.equal(archiveNoBody.status, 200);
@@ -3210,4 +3703,1528 @@ test('11. End-to-end Gateway -> Vehicle -> Identity/Device over real HTTPS, HMAC
     }
     await rm(tlsDir, { recursive: true, force: true }).catch(() => undefined);
   }
+});
+
+async function insertBoundInvitation(input: {
+  vehicleId: Types.ObjectId;
+  inviterUserId: Types.ObjectId;
+  inviteeUserId: Types.ObjectId;
+  issuerMembershipId?: Types.ObjectId;
+  permissions?: string[];
+}): Promise<Types.ObjectId> {
+  const _id = new Types.ObjectId();
+  const now = new Date();
+  await InvitationModel.collection.insertOne({
+    _id,
+    vehicleId: input.vehicleId,
+    inviterUserId: input.inviterUserId,
+    inviteeUserId: input.inviteeUserId,
+    ...(input.issuerMembershipId ? { issuerMembershipId: input.issuerMembershipId } : {}),
+    targetRole: 'MEMBER',
+    permissions: input.permissions ?? ['vehicle:read'],
+    status: 'PENDING',
+    expiresAt: new Date(now.getTime() + 3_600_000),
+    acceptedAt: null,
+    acceptedByUserId: null,
+    revokedAt: null,
+    revokedByUserId: null,
+    revokeReason: null,
+    expiredAt: null,
+    updatedByUserId: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return _id;
+}
+
+/**
+ * Holds an uncommitted transaction that writes the vehicle (the shared barrier) and applies
+ * `update` to a membership, simulating an issuer change in flight.
+ */
+async function holdMembershipChange(
+  vehicleId: Types.ObjectId,
+  membershipId: Types.ObjectId,
+  update: Record<string, unknown>,
+): Promise<{ commit: () => Promise<void> }> {
+  const session = await mongoose.startSession();
+  session.startTransaction({ readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } });
+  await VehicleModel.updateOne(
+    { _id: vehicleId },
+    { $set: { updatedAt: new Date() } },
+    { session },
+  );
+  await MembershipModel.updateOne({ _id: membershipId }, { $set: update }, { session });
+  return {
+    commit: async () => {
+      await session.commitTransaction();
+      await session.endSession();
+    },
+  };
+}
+
+test('20. TKT-012 issuance: delegation limits, no AccessGrant authority, no overwrite, OWNER-only re-invitation, and no oracle', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Delegation Coupe' });
+  const otherVehicle = await createVehicle(new Types.ObjectId(), { name: 'Foreign Coupe' });
+  const ownerMembership = await MembershipModel.findOne({ vehicleId: vehicle._id, role: 'OWNER' });
+  assert.ok(ownerMembership);
+  const delegate = await addAcceptedMember(vehicle._id, ownerId, [
+    'vehicle:read',
+    'device:read',
+    'invitation:create',
+  ]);
+  const manager = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:manage', 'module:read']);
+  const reader = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  await insertRawActiveGrant({
+    vehicleId: vehicle._id,
+    membershipId: reader.membershipId,
+    subjectUserId: reader.memberId,
+    grantedByUserId: ownerId,
+    permissions: ['vehicle:read', 'invitation:create', 'vehicle:manage'],
+    expiresAt: null,
+  });
+
+  let lookups = 0;
+  const confirmInviteeExists = async () => {
+    lookups += 1;
+    return true;
+  };
+  const target = new Types.ObjectId();
+  const snapshot = await vehiclePersistenceSnapshot(vehicle._id);
+  const forbidden: Array<[Types.ObjectId, string[]]> = [
+    [delegate.memberId, ['device:link']],
+    [delegate.memberId, ['module:read']],
+    [delegate.memberId, ['invitation:create']],
+    [delegate.memberId, ['vehicle:manage']],
+    [delegate.memberId, ['vehicle:read', 'device:link']],
+    [manager.memberId, ['vehicle:read']],
+    [reader.memberId, ['vehicle:read']],
+  ];
+  for (const [issuer, permissions] of forbidden) {
+    await rejectsWithCode(
+      () => inviteMember(vehicle._id, issuer, target, permissions, { confirmInviteeExists }),
+      'FORBIDDEN',
+    );
+  }
+  assert.equal(
+    await inviteMember(vehicle._id, new Types.ObjectId(), target, ['vehicle:read'], {
+      confirmInviteeExists,
+    }),
+    null,
+  );
+  assert.equal(
+    await inviteMember(otherVehicle._id, delegate.memberId, target, ['vehicle:read'], {
+      confirmInviteeExists,
+    }),
+    null,
+  );
+  assert.equal(lookups, 0, 'unauthorized issuers never reach Identity');
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), snapshot);
+
+  await rejectsWithCode(
+    () =>
+      inviteMember(vehicle._id, ownerId, target, ['vehicle:read'], {
+        confirmInviteeExists: async () => {
+          lookups += 1;
+          return false;
+        },
+      }),
+    'NOT_FOUND',
+  );
+  assert.equal(lookups, 1);
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), snapshot);
+
+  // Allowed delegations are bound to the issuing membership identity.
+  const delegated = await inviteMember(
+    vehicle._id,
+    delegate.memberId,
+    target,
+    ['vehicle:read', 'device:read'],
+    { confirmInviteeExists },
+  );
+  assert.ok(delegated);
+  assert.equal(lookups, 2);
+  assert.equal(delegated.issuerMembershipId?.equals(delegate.membershipId), true);
+  const managerTarget = new Types.ObjectId();
+  const managed = await inviteMember(vehicle._id, manager.memberId, managerTarget, ['module:read']);
+  assert.equal(managed?.issuerMembershipId?.equals(manager.membershipId), true);
+  const ownerTarget = new Types.ObjectId();
+  const ownerIssued = await inviteMember(vehicle._id, ownerId, ownerTarget, [
+    'vehicle:read',
+    'device:link',
+  ]);
+  assert.ok(ownerIssued && managed);
+  assert.equal(ownerIssued.issuerMembershipId?.equals(ownerMembership._id), true);
+
+  // A valid pending invitation is never overwritten, whoever tries.
+  const beforeDuplicate = await InvitationModel.findById(ownerIssued._id).lean();
+  await rejectsWithCode(
+    () => inviteMember(vehicle._id, ownerId, ownerTarget, ['vehicle:read']),
+    'CONFLICT',
+  );
+  await rejectsWithCode(
+    () => inviteMember(vehicle._id, delegate.memberId, ownerTarget, ['vehicle:read']),
+    'CONFLICT',
+  );
+  assert.deepEqual(await InvitationModel.findById(ownerIssued._id).lean(), beforeDuplicate);
+  assert.equal(
+    await InvitationModel.countDocuments({ vehicleId: vehicle._id, inviteeUserId: ownerTarget }),
+    1,
+  );
+
+  // Invalid recipients.
+  await rejectsWithCode(
+    () => inviteMember(vehicle._id, delegate.memberId, delegate.memberId, ['vehicle:read']),
+    'VALIDATION_ERROR',
+  );
+  await rejectsWithCode(
+    () => inviteMember(vehicle._id, delegate.memberId, ownerId, ['vehicle:read']),
+    'CONFLICT',
+  );
+  await rejectsWithCode(
+    () => inviteMember(vehicle._id, ownerId, reader.memberId, ['vehicle:read']),
+    'CONFLICT',
+  );
+  await suspendMembership({
+    vehicleId: vehicle._id,
+    membershipId: reader.membershipId,
+    actorUserId: ownerId,
+  });
+  await rejectsWithCode(
+    () => inviteMember(vehicle._id, ownerId, reader.memberId, ['vehicle:read']),
+    'CONFLICT',
+  );
+
+  // Terminal invitations cannot be reused.
+  await revokeInvitation({
+    vehicleId: vehicle._id,
+    invitationId: managed._id,
+    actorUserId: ownerId,
+  });
+  await rejectsWithCode(() => acceptInvitation(managed._id, managerTarget), 'CONFLICT');
+
+  // Only the OWNER re-invites a revoked member; the new membership inherits no grants.
+  await revokeMembership({
+    vehicleId: vehicle._id,
+    membershipId: reader.membershipId,
+    actorUserId: ownerId,
+  });
+  await rejectsWithCode(
+    () => inviteMember(vehicle._id, delegate.memberId, reader.memberId, ['vehicle:read']),
+    'FORBIDDEN',
+  );
+  const reinvite = await inviteMember(vehicle._id, ownerId, reader.memberId, ['vehicle:read']);
+  assert.ok(reinvite);
+  const rejoined = await acceptInvitation(reinvite._id, reader.memberId);
+  assert.ok(rejoined);
+  assert.equal(rejoined._id.equals(reader.membershipId), false);
+  assert.equal(await AccessGrantModel.countDocuments({ membershipId: rejoined._id }), 0);
+  assert.equal(
+    await AccessGrantModel.countDocuments({ membershipId: reader.membershipId, status: 'ACTIVE' }),
+    0,
+  );
+
+  // Concurrent duplicate issuance: exactly one invitation, every loser gets CONFLICT.
+  const raceTarget = new Types.ObjectId();
+  const attempts = await Promise.allSettled(
+    Array.from({ length: 6 }, (_, index) =>
+      inviteMember(vehicle._id, index % 2 ? ownerId : delegate.memberId, raceTarget, [
+        'vehicle:read',
+      ]),
+    ),
+  );
+  assert.equal(
+    attempts.filter((attempt) => attempt.status === 'fulfilled' && attempt.value).length,
+    1,
+  );
+  for (const attempt of attempts) {
+    if (attempt.status === 'rejected') {
+      assert.ok(attempt.reason instanceof VehicleServiceError);
+      assert.equal(attempt.reason.code, 'CONFLICT');
+    }
+  }
+  assert.equal(
+    await InvitationModel.countDocuments({ vehicleId: vehicle._id, inviteeUserId: raceTarget }),
+    1,
+  );
+});
+
+test('21. TKT-012 acceptance revalidates the issuing membership and durably revokes invitations whose issuer lost authority', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Authority Sedan' });
+  const delegate = await addAcceptedMember(vehicle._id, ownerId, [
+    'vehicle:read',
+    'device:read',
+    'invitation:create',
+  ]);
+  const issue = async (issuer: Types.ObjectId, permissions: string[]) => {
+    const invitee = new Types.ObjectId();
+    const invitation = await inviteMember(vehicle._id, issuer, invitee, permissions);
+    assert.ok(invitation);
+    return { invitee, invitationId: invitation._id };
+  };
+
+  // Only the invitee can accept; everyone else sees nothing and changes nothing.
+  const readInvite = await issue(delegate.memberId, ['vehicle:read']);
+  const deviceInvite = await issue(delegate.memberId, ['device:read']);
+  assert.equal(await acceptInvitation(readInvite.invitationId, new Types.ObjectId()), null);
+  assert.equal(await acceptInvitation(readInvite.invitationId, ownerId), null);
+  assert.equal(await acceptInvitation(readInvite.invitationId, delegate.memberId), null);
+  assert.equal((await InvitationModel.findById(readInvite.invitationId).lean())?.status, 'PENDING');
+
+  // Partial loss of delegated permissions revokes only the invitations it no longer covers.
+  const partial = await updateMembershipPermissions({
+    vehicleId: vehicle._id,
+    membershipId: delegate.membershipId,
+    actorUserId: ownerId,
+    permissions: ['vehicle:read', 'invitation:create'],
+  });
+  assert.equal(partial.changed, true);
+  assert.equal(partial.revokedInvitationsCount, 1);
+  const deviceAfter = await InvitationModel.findById(deviceInvite.invitationId).lean();
+  assert.equal(deviceAfter?.status, 'REVOKED');
+  assert.equal(deviceAfter?.revokeReason, INVITATION_ISSUER_AUTHORITY_LOST_REASON);
+  assert.equal(deviceAfter?.revokedByUserId?.equals(ownerId), true);
+  assert.equal((await InvitationModel.findById(readInvite.invitationId).lean())?.status, 'PENDING');
+
+  // Authority lost without a cascade (e.g. a pre-TKT-012 writer): acceptance is rejected and the
+  // REVOKED transition survives the rejected acceptance.
+  await MembershipModel.collection.updateOne(
+    { _id: delegate.membershipId },
+    { $set: { permissions: ['vehicle:read'] } },
+  );
+  await rejectsWithCode(
+    () => acceptInvitation(readInvite.invitationId, readInvite.invitee),
+    'CONFLICT',
+  );
+  const lost = await InvitationModel.findById(readInvite.invitationId).lean();
+  assert.equal(lost?.status, 'REVOKED');
+  assert.equal(lost?.revokeReason, INVITATION_ISSUER_AUTHORITY_LOST_REASON);
+  assert.equal(lost?.revokedByUserId?.equals(readInvite.invitee), true);
+  assert.equal(
+    await MembershipModel.countDocuments({ vehicleId: vehicle._id, userId: readInvite.invitee }),
+    0,
+  );
+  await rejectsWithCode(
+    () => acceptInvitation(readInvite.invitationId, readInvite.invitee),
+    'CONFLICT',
+  );
+  await MembershipModel.collection.updateOne(
+    { _id: delegate.membershipId },
+    { $set: { permissions: ['vehicle:read', 'invitation:create'] } },
+  );
+
+  // Revoked and rejoined issuer: the new membership never revalidates invitations of the old one.
+  const cascaded = await issue(delegate.memberId, ['vehicle:read']);
+  const revokedIssuer = await revokeMembership({
+    vehicleId: vehicle._id,
+    membershipId: delegate.membershipId,
+    actorUserId: ownerId,
+  });
+  assert.equal(revokedIssuer.revokedInvitationsCount, 1);
+  assert.equal((await InvitationModel.findById(cascaded.invitationId).lean())?.status, 'REVOKED');
+  const orphanInvitee = new Types.ObjectId();
+  const orphanId = await insertBoundInvitation({
+    vehicleId: vehicle._id,
+    inviterUserId: delegate.memberId,
+    inviteeUserId: orphanInvitee,
+    issuerMembershipId: delegate.membershipId,
+  });
+  const rejoinInvite = await inviteMember(vehicle._id, ownerId, delegate.memberId, [
+    'vehicle:read',
+    'invitation:create',
+  ]);
+  assert.ok(rejoinInvite);
+  const rejoined = await acceptInvitation(rejoinInvite._id, delegate.memberId);
+  assert.ok(rejoined);
+  await rejectsWithCode(() => acceptInvitation(orphanId, orphanInvitee), 'CONFLICT');
+  assert.equal(
+    (await InvitationModel.findById(orphanId).lean())?.revokeReason,
+    INVITATION_ISSUER_AUTHORITY_LOST_REASON,
+  );
+  const fresh = await issue(delegate.memberId, ['vehicle:read']);
+  assert.ok(await acceptInvitation(fresh.invitationId, fresh.invitee));
+
+  // Legacy invitations without issuer binding: delegate ones fail closed, owner ones stay valid.
+  const legacyDelegateInvitee = new Types.ObjectId();
+  const legacyDelegate = await insertBoundInvitation({
+    vehicleId: vehicle._id,
+    inviterUserId: delegate.memberId,
+    inviteeUserId: legacyDelegateInvitee,
+  });
+  await rejectsWithCode(() => acceptInvitation(legacyDelegate, legacyDelegateInvitee), 'CONFLICT');
+  assert.equal((await InvitationModel.findById(legacyDelegate).lean())?.status, 'REVOKED');
+  const legacyOwnerInvitee = new Types.ObjectId();
+  const legacyOwner = await insertBoundInvitation({
+    vehicleId: vehicle._id,
+    inviterUserId: ownerId,
+    inviteeUserId: legacyOwnerInvitee,
+  });
+  assert.ok(await acceptInvitation(legacyOwner, legacyOwnerInvitee));
+
+  // Exact expiry boundary: expiresAt itself is already expired; one millisecond earlier is valid.
+  const issuedAt = new Date();
+  const expiresAt = new Date(issuedAt.getTime() + 1_000);
+  const atBoundary = new Types.ObjectId();
+  const boundaryInvite = await inviteMember(vehicle._id, ownerId, atBoundary, ['vehicle:read'], {
+    now: issuedAt,
+    ttlMs: 1_000,
+  });
+  const beforeBoundary = new Types.ObjectId();
+  const earlyInvite = await inviteMember(vehicle._id, ownerId, beforeBoundary, ['vehicle:read'], {
+    now: issuedAt,
+    ttlMs: 1_000,
+  });
+  assert.ok(boundaryInvite && earlyInvite);
+  await rejectsWithCode(
+    () => acceptInvitation(boundaryInvite._id, atBoundary, { now: expiresAt }),
+    'CONFLICT',
+  );
+  const expired = await InvitationModel.findById(boundaryInvite._id).lean();
+  assert.equal(expired?.status, 'EXPIRED');
+  assert.equal(expired?.expiredAt?.getTime(), expiresAt.getTime());
+  assert.ok(
+    await acceptInvitation(earlyInvite._id, beforeBoundary, {
+      now: new Date(expiresAt.getTime() - 1),
+    }),
+  );
+});
+
+test('22. TKT-012 membership administration: OWNER-only transitions, cascades, idempotency, leave, and protected OWNER', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Lifecycle Wagon' });
+  const otherVehicle = await createVehicle(ownerId, { name: 'Second Wagon' });
+  const ownerMembership = await MembershipModel.findOne({ vehicleId: vehicle._id, role: 'OWNER' });
+  assert.ok(ownerMembership);
+  const member = await addAcceptedMember(vehicle._id, ownerId, [
+    'vehicle:read',
+    'device:read',
+    'invitation:create',
+  ]);
+  const manager = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read', 'vehicle:manage']);
+  const outsider = new Types.ObjectId();
+  const grantId = await insertRawActiveGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    grantedByUserId: ownerId,
+    permissions: ['device:link'],
+    expiresAt: null,
+  });
+  assert.ok(
+    await inviteMember(vehicle._id, member.memberId, new Types.ObjectId(), ['vehicle:read']),
+  );
+  const target = { vehicleId: vehicle._id, membershipId: member.membershipId };
+
+  // Non-owners: FORBIDDEN when they can read the vehicle, NOT_FOUND otherwise; nothing changes.
+  const snapshot = await vehiclePersistenceSnapshot(vehicle._id);
+  for (const [actor, code] of [
+    [manager.memberId, 'FORBIDDEN'],
+    [outsider, 'NOT_FOUND'],
+  ] as const) {
+    await rejectsWithCode(() => suspendMembership({ ...target, actorUserId: actor }), code);
+    await rejectsWithCode(() => reactivateMembership({ ...target, actorUserId: actor }), code);
+    await rejectsWithCode(() => revokeMembership({ ...target, actorUserId: actor }), code);
+    await rejectsWithCode(
+      () => updateMembershipPermissions({ ...target, actorUserId: actor, permissions: [] }),
+      code,
+    );
+    await rejectsWithCode(() => listVehicleMembers(vehicle._id, actor), code);
+  }
+  await rejectsWithCode(
+    () =>
+      suspendMembership({
+        vehicleId: otherVehicle._id,
+        membershipId: member.membershipId,
+        actorUserId: ownerId,
+      }),
+    'NOT_FOUND',
+  );
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), snapshot);
+
+  // The OWNER membership is never a valid target and the OWNER cannot leave.
+  const ownerTarget = {
+    vehicleId: vehicle._id,
+    membershipId: ownerMembership._id,
+    actorUserId: ownerId,
+  };
+  await rejectsWithCode(() => suspendMembership(ownerTarget), 'CONFLICT');
+  await rejectsWithCode(() => reactivateMembership(ownerTarget), 'CONFLICT');
+  await rejectsWithCode(() => revokeMembership(ownerTarget), 'CONFLICT');
+  await rejectsWithCode(
+    () => updateMembershipPermissions({ ...ownerTarget, permissions: ['vehicle:read'] }),
+    'CONFLICT',
+  );
+  await rejectsWithCode(
+    () =>
+      leaveVehicle({
+        vehicleId: vehicle._id,
+        actorUserId: ownerId,
+        membershipId: ownerMembership._id,
+      }),
+    'CONFLICT',
+  );
+  const ownerAfter = await MembershipModel.findById(ownerMembership._id).lean();
+  assert.equal(ownerAfter?.status, 'ACTIVE');
+  assert.equal(ownerAfter?.role, 'OWNER');
+  assert.deepEqual(ownerAfter?.permissions, ownerMembership.permissions);
+
+  // Permission replacement: validated, full replace, empty allowed, grants untouched.
+  await rejectsWithCode(
+    () =>
+      updateMembershipPermissions({
+        ...target,
+        actorUserId: ownerId,
+        permissions: ['vehicle:fly'],
+      }),
+    'VALIDATION_ERROR',
+  );
+  await rejectsWithCode(
+    () =>
+      updateMembershipPermissions({
+        ...target,
+        actorUserId: ownerId,
+        permissions: ['vehicle:read', 'vehicle:read'],
+      }),
+    'VALIDATION_ERROR',
+  );
+  const unchanged = await updateMembershipPermissions({
+    ...target,
+    actorUserId: ownerId,
+    permissions: ['vehicle:read', 'device:read', 'invitation:create'],
+  });
+  assert.equal(unchanged.changed, false);
+  const emptied = await updateMembershipPermissions({
+    ...target,
+    actorUserId: ownerId,
+    permissions: [],
+  });
+  assert.equal(emptied.changed, true);
+  assert.deepEqual(emptied.membership.permissions, []);
+  assert.equal(emptied.membership.role, 'MEMBER');
+  assert.equal(emptied.membership.status, 'ACTIVE');
+  assert.equal(emptied.membership.userId.equals(member.memberId), true);
+  assert.equal(emptied.revokedInvitationsCount, 1);
+  assert.equal((await AccessGrantModel.findById(grantId).lean())?.status, 'ACTIVE');
+  await updateMembershipPermissions({
+    ...target,
+    actorUserId: ownerId,
+    permissions: ['vehicle:read', 'invitation:create'],
+  });
+
+  // Suspension revokes grants and issued invitations, keeps base permissions.
+  const issuedBeforeSuspend = await inviteMember(
+    vehicle._id,
+    member.memberId,
+    new Types.ObjectId(),
+    ['vehicle:read'],
+  );
+  assert.ok(issuedBeforeSuspend);
+  const suspended = await suspendMembership({
+    ...target,
+    actorUserId: ownerId,
+    reason: 'Lost keys',
+  });
+  assert.equal(suspended.membership.status, 'SUSPENDED');
+  assert.equal(suspended.revokedGrantsCount, 1);
+  assert.equal(suspended.revokedInvitationsCount, 1);
+  assert.deepEqual(suspended.membership.permissions, ['vehicle:read', 'invitation:create']);
+  assert.equal((await AccessGrantModel.findById(grantId).lean())?.status, 'REVOKED');
+  const suspendedInvite = await InvitationModel.findById(issuedBeforeSuspend._id).lean();
+  assert.equal(suspendedInvite?.revokeReason, INVITATION_ISSUER_AUTHORITY_LOST_REASON);
+  await rejectsWithCode(() => suspendMembership({ ...target, actorUserId: ownerId }), 'CONFLICT');
+  await assert.rejects(
+    () =>
+      createAccessGrant({
+        vehicleId: vehicle._id,
+        membershipId: member.membershipId,
+        subjectUserId: member.memberId,
+        actorUserId: ownerId,
+        scopeType: 'VEHICLE',
+        channel: 'ONLINE',
+        permissions: ['vehicle:read'],
+      }),
+    (err: unknown) => err instanceof VehicleServiceError,
+  );
+  const whileSuspended = await updateMembershipPermissions({
+    ...target,
+    actorUserId: ownerId,
+    permissions: ['vehicle:read', 'device:read', 'invitation:create'],
+  });
+  assert.equal(whileSuspended.membership.status, 'SUSPENDED');
+
+  // Reactivation restores base permissions only.
+  const reactivated = await reactivateMembership({ ...target, actorUserId: ownerId });
+  assert.equal(reactivated.status, 'ACTIVE');
+  assert.equal(reactivated.suspendedAt, null);
+  assert.deepEqual(reactivated.permissions, ['vehicle:read', 'device:read', 'invitation:create']);
+  assert.equal((await AccessGrantModel.findById(grantId).lean())?.status, 'REVOKED');
+  assert.equal((await InvitationModel.findById(issuedBeforeSuspend._id).lean())?.status, 'REVOKED');
+  await rejectsWithCode(
+    () => reactivateMembership({ ...target, actorUserId: ownerId }),
+    'CONFLICT',
+  );
+
+  // Revocation cascades once; a repeated revocation returns the original record.
+  assert.ok(
+    await inviteMember(vehicle._id, member.memberId, new Types.ObjectId(), ['device:read']),
+  );
+  await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:read'],
+  });
+  const revoked = await revokeMembership({ ...target, actorUserId: ownerId, reason: 'Moved away' });
+  assert.equal(revoked.alreadyRevoked, false);
+  assert.equal(revoked.revokedGrantsCount, 1);
+  assert.equal(revoked.revokedInvitationsCount, 1);
+  const revokedAgain = await revokeMembership({ ...target, actorUserId: ownerId, reason: 'Other' });
+  assert.equal(revokedAgain.alreadyRevoked, true);
+  assert.equal(revokedAgain.revokedGrantsCount, 0);
+  assert.equal(revokedAgain.revokedInvitationsCount, 0);
+  assert.equal(
+    revokedAgain.membership.revokedAt?.getTime(),
+    revoked.membership.revokedAt?.getTime(),
+  );
+  assert.equal(
+    (await MembershipModel.findById(member.membershipId).lean())?.revokeReason,
+    'Moved away',
+  );
+  for (const terminal of [
+    () => reactivateMembership({ ...target, actorUserId: ownerId }),
+    () => suspendMembership({ ...target, actorUserId: ownerId }),
+    () => updateMembershipPermissions({ ...target, actorUserId: ownerId, permissions: [] }),
+  ]) {
+    await rejectsWithCode(terminal, 'CONFLICT');
+  }
+
+  // Voluntary leave: cascades, idempotent per membership, never touches a later membership.
+  const leaver = await addAcceptedMember(vehicle._id, ownerId, [
+    'vehicle:read',
+    'invitation:create',
+  ]);
+  assert.ok(
+    await inviteMember(vehicle._id, leaver.memberId, new Types.ObjectId(), ['vehicle:read']),
+  );
+  await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: leaver.membershipId,
+    subjectUserId: leaver.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:read'],
+  });
+  const left = await leaveVehicle({
+    vehicleId: vehicle._id,
+    actorUserId: leaver.memberId,
+    membershipId: leaver.membershipId,
+  });
+  assert.equal(left.alreadyRevoked, false);
+  assert.equal(left.membership.status, 'REVOKED');
+  assert.equal(left.membership.revokeReason, MEMBER_LEFT_REASON);
+  assert.equal(left.membership.revokedByUserId?.equals(leaver.memberId), true);
+  assert.equal(left.revokedGrantsCount, 1);
+  assert.equal(left.revokedInvitationsCount, 1);
+  const leftAgain = await leaveVehicle({
+    vehicleId: vehicle._id,
+    actorUserId: leaver.memberId,
+    membershipId: leaver.membershipId,
+  });
+  assert.equal(leftAgain.alreadyRevoked, true);
+  assert.equal(leftAgain.membership.revokedAt?.getTime(), left.membership.revokedAt?.getTime());
+  const comeback = await inviteMember(vehicle._id, ownerId, leaver.memberId, ['vehicle:read']);
+  assert.ok(comeback);
+  const newMembership = await acceptInvitation(comeback._id, leaver.memberId);
+  assert.ok(newMembership);
+  const replayedLeave = await leaveVehicle({
+    vehicleId: vehicle._id,
+    actorUserId: leaver.memberId,
+    membershipId: leaver.membershipId,
+  });
+  assert.equal(replayedLeave.alreadyRevoked, true);
+  assert.equal(replayedLeave.membership._id.equals(leaver.membershipId), true);
+  assert.equal((await MembershipModel.findById(newMembership._id).lean())?.status, 'ACTIVE');
+  await rejectsWithCode(
+    () =>
+      leaveVehicle({
+        vehicleId: vehicle._id,
+        actorUserId: outsider,
+        membershipId: newMembership._id,
+      }),
+    'NOT_FOUND',
+  );
+  await rejectsWithCode(
+    () =>
+      leaveVehicle({
+        vehicleId: otherVehicle._id,
+        actorUserId: leaver.memberId,
+        membershipId: newMembership._id,
+      }),
+    'NOT_FOUND',
+  );
+  await suspendMembership({
+    vehicleId: vehicle._id,
+    membershipId: newMembership._id,
+    actorUserId: ownerId,
+  });
+  const leftWhileSuspended = await leaveVehicle({
+    vehicleId: vehicle._id,
+    actorUserId: leaver.memberId,
+    membershipId: newMembership._id,
+  });
+  assert.equal(leftWhileSuspended.membership._id.equals(newMembership._id), true);
+  assert.equal(leftWhileSuspended.membership.status, 'REVOKED');
+
+  // Invitation revocation scope: delegates revoke only their own; readers are FORBIDDEN.
+  const delegate = await addAcceptedMember(vehicle._id, ownerId, [
+    'vehicle:read',
+    'invitation:create',
+  ]);
+  const reader = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const delegateOwn = await inviteMember(vehicle._id, delegate.memberId, new Types.ObjectId(), [
+    'vehicle:read',
+  ]);
+  const ownerOwn = await inviteMember(vehicle._id, ownerId, new Types.ObjectId(), ['vehicle:read']);
+  assert.ok(delegateOwn && ownerOwn);
+  await rejectsWithCode(
+    () =>
+      revokeInvitation({
+        vehicleId: vehicle._id,
+        invitationId: ownerOwn._id,
+        actorUserId: delegate.memberId,
+      }),
+    'NOT_FOUND',
+  );
+  await rejectsWithCode(
+    () =>
+      revokeInvitation({
+        vehicleId: vehicle._id,
+        invitationId: delegateOwn._id,
+        actorUserId: reader.memberId,
+      }),
+    'FORBIDDEN',
+  );
+  await rejectsWithCode(
+    () =>
+      revokeInvitation({
+        vehicleId: otherVehicle._id,
+        invitationId: delegateOwn._id,
+        actorUserId: ownerId,
+      }),
+    'NOT_FOUND',
+  );
+  const firstRevoke = await revokeInvitation({
+    vehicleId: vehicle._id,
+    invitationId: delegateOwn._id,
+    actorUserId: delegate.memberId,
+    reason: 'Typo',
+  });
+  assert.equal(firstRevoke.alreadyRevoked, false);
+  const secondRevoke = await revokeInvitation({
+    vehicleId: vehicle._id,
+    invitationId: delegateOwn._id,
+    actorUserId: ownerId,
+    reason: 'Other',
+  });
+  assert.equal(secondRevoke.alreadyRevoked, true);
+  assert.equal(secondRevoke.invitation.revokeReason, 'Typo');
+  assert.equal(
+    secondRevoke.invitation.revokedAt?.getTime(),
+    firstRevoke.invitation.revokedAt?.getTime(),
+  );
+});
+
+test('23. TKT-012 keyset lists: bound cursors, effective EXPIRED without writes, defaults, limits, and per-page reauthorization', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Paging Van' });
+  const otherVehicle = await createVehicle(ownerId, { name: 'Other Van' });
+  const delegate = await addAcceptedMember(vehicle._id, ownerId, [
+    'vehicle:read',
+    'invitation:create',
+  ]);
+  const reader = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const invitees = Array.from({ length: 5 }, () => new Types.ObjectId());
+  for (const invitee of invitees.slice(0, 3)) {
+    assert.ok(await inviteMember(vehicle._id, ownerId, invitee, ['vehicle:read']));
+  }
+  const delegateIssued = await inviteMember(vehicle._id, delegate.memberId, invitees[3]!, [
+    'vehicle:read',
+  ]);
+  const delegateIssued2 = await inviteMember(vehicle._id, delegate.memberId, invitees[4]!, [
+    'vehicle:read',
+  ]);
+  assert.ok(delegateIssued && delegateIssued2);
+  await InvitationModel.collection.updateMany(
+    { vehicleId: vehicle._id, status: 'PENDING' },
+    { $set: { createdAt: new Date('2026-03-01T00:00:00.000Z') } },
+  );
+  const elapsedId = await insertRawPendingInvitation(
+    vehicle._id,
+    ownerId,
+    new Date(Date.now() - 1_000),
+  );
+
+  const snapshot = await vehiclePersistenceSnapshot(vehicle._id);
+  const seen: Array<{ id: string; createdAt: number; status: string }> = [];
+  let cursor: string | undefined;
+  do {
+    const page = await listVehicleInvitations(vehicle._id, ownerId, { limit: 2, cursor });
+    assert.ok(page.items.length <= 2);
+    for (const item of page.items) {
+      seen.push({
+        id: String(item.invitation._id),
+        createdAt: item.invitation.createdAt.getTime(),
+        status: item.status,
+      });
+    }
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor);
+  assert.equal(seen.length, 8);
+  assert.equal(new Set(seen.map((row) => row.id)).size, 8);
+  const sorted = [...seen].sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+  assert.deepEqual(seen, sorted);
+  assert.equal(seen.find((row) => row.id === String(elapsedId))?.status, 'EXPIRED');
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), snapshot, 'lists never write');
+
+  const countWith = async (status: 'PENDING' | 'EXPIRED' | 'ACCEPTED') =>
+    (await listVehicleInvitations(vehicle._id, ownerId, { status, limit: 100 })).items.length;
+  assert.equal(await countWith('PENDING'), 5);
+  assert.equal(await countWith('EXPIRED'), 1);
+  assert.equal(await countWith('ACCEPTED'), 2);
+  assert.deepEqual(
+    (await listVehicleInvitations(vehicle._id, delegate.memberId)).items
+      .map((item) => String(item.invitation._id))
+      .sort(),
+    [String(delegateIssued._id), String(delegateIssued2._id)].sort(),
+  );
+  await rejectsWithCode(() => listVehicleInvitations(vehicle._id, reader.memberId), 'FORBIDDEN');
+  await rejectsWithCode(
+    () => listVehicleInvitations(vehicle._id, new Types.ObjectId()),
+    'NOT_FOUND',
+  );
+  assert.equal((await listVehicleInvitations(otherVehicle._id, ownerId)).items.length, 0);
+
+  for (const limit of [0, 101, 1.5]) {
+    await rejectsWithCode(
+      () => listVehicleInvitations(vehicle._id, ownerId, { limit }),
+      'VALIDATION_ERROR',
+    );
+  }
+  assert.equal(
+    (await listVehicleInvitations(vehicle._id, ownerId, { limit: 100 })).nextCursor,
+    null,
+  );
+
+  // Cursors are bound to actor, resource, list type, and filters; tampering is rejected.
+  const first = await listVehicleInvitations(vehicle._id, ownerId, { limit: 1 });
+  const boundCursor = first.nextCursor;
+  assert.ok(boundCursor);
+  const payload = JSON.parse(Buffer.from(boundCursor, 'base64url').toString('utf8')) as Record<
+    string,
+    unknown
+  >;
+  const reencode = (changes: Record<string, unknown>) =>
+    Buffer.from(JSON.stringify({ ...payload, ...changes }), 'utf8').toString('base64url');
+  const invalidCursors: Array<() => Promise<unknown>> = [
+    () => listVehicleInvitations(vehicle._id, delegate.memberId, { cursor: boundCursor }),
+    () => listVehicleInvitations(vehicle._id, ownerId, { cursor: boundCursor, status: 'PENDING' }),
+    () => listVehicleInvitations(otherVehicle._id, ownerId, { cursor: boundCursor }),
+    () => listVehicleMembers(vehicle._id, ownerId, { cursor: boundCursor }),
+    () => listReceivedInvitations(ownerId, { cursor: boundCursor }),
+    () => listVehicleInvitations(vehicle._id, ownerId, { cursor: reencode({ v: 2 }) }),
+    () => listVehicleInvitations(vehicle._id, ownerId, { cursor: reencode({ b: 'x'.repeat(22) }) }),
+    () => listVehicleInvitations(vehicle._id, ownerId, { cursor: reencode({ k: 'members' }) }),
+    () => listVehicleInvitations(vehicle._id, ownerId, { cursor: reencode({ i: 'zz' }) }),
+    () => listVehicleInvitations(vehicle._id, ownerId, { cursor: reencode({ c: 'yesterday' }) }),
+    () => listVehicleInvitations(vehicle._id, ownerId, { cursor: 'not-a-cursor' }),
+    () => listVehicleInvitations(vehicle._id, ownerId, { cursor: 'a'.repeat(2_000) }),
+  ];
+  for (const attempt of invalidCursors) {
+    await rejectsWithCode(attempt, 'VALIDATION_ERROR');
+  }
+
+  // Each page re-authorizes: a delegate who loses invite authority cannot continue paging.
+  const delegatePage = await listVehicleInvitations(vehicle._id, delegate.memberId, { limit: 1 });
+  assert.ok(delegatePage.nextCursor);
+  await updateMembershipPermissions({
+    vehicleId: vehicle._id,
+    membershipId: delegate.membershipId,
+    actorUserId: ownerId,
+    permissions: ['vehicle:read'],
+  });
+  await rejectsWithCode(
+    () =>
+      listVehicleInvitations(vehicle._id, delegate.memberId, {
+        limit: 1,
+        cursor: delegatePage.nextCursor ?? undefined,
+      }),
+    'FORBIDDEN',
+  );
+
+  // Received invitations: only the caller's, valid PENDING by default.
+  const received = await listReceivedInvitations(invitees[0]!);
+  assert.equal(received.items.length, 1);
+  assert.equal(received.items[0]?.vehicleName, 'Paging Van');
+  assert.equal(received.items[0]?.status, 'PENDING');
+  assert.equal((await listReceivedInvitations(delegate.memberId)).items.length, 0);
+  assert.equal(
+    (await listReceivedInvitations(delegate.memberId, { status: 'ACCEPTED' })).items.length,
+    1,
+  );
+  const revokedForInvitee = await listReceivedInvitations(invitees[3]!, { status: 'REVOKED' });
+  assert.equal(revokedForInvitee.items.length, 1);
+
+  // Members: owner-only, ACTIVE + SUSPENDED by default, REVOKED on request.
+  await suspendMembership({
+    vehicleId: vehicle._id,
+    membershipId: reader.membershipId,
+    actorUserId: ownerId,
+  });
+  const memberIds: string[] = [];
+  let memberCursor: string | undefined;
+  do {
+    const page = await listVehicleMembers(vehicle._id, ownerId, { limit: 1, cursor: memberCursor });
+    memberIds.push(...page.items.map((item) => `${String(item.userId)}:${item.status}`));
+    memberCursor = page.nextCursor ?? undefined;
+  } while (memberCursor);
+  assert.deepEqual(memberIds, [
+    `${String(ownerId)}:ACTIVE`,
+    `${String(delegate.memberId)}:ACTIVE`,
+    `${String(reader.memberId)}:SUSPENDED`,
+  ]);
+  await revokeMembership({
+    vehicleId: vehicle._id,
+    membershipId: reader.membershipId,
+    actorUserId: ownerId,
+  });
+  assert.equal((await listVehicleMembers(vehicle._id, ownerId)).items.length, 2);
+  assert.equal(
+    (await listVehicleMembers(vehicle._id, ownerId, { status: 'REVOKED' })).items.length,
+    1,
+  );
+  await rejectsWithCode(() => listVehicleMembers(vehicle._id, delegate.memberId), 'FORBIDDEN');
+});
+
+test('24. TKT-012 races: acceptance vs issuer changes, revocation and archive; grants vs suspension/revocation; leave vs admin', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Race Track Hatch' });
+
+  // Acceptance blocked behind an in-flight issuer change re-validates and revokes durably.
+  const issuerChanges: Array<[string, Record<string, unknown>]> = [
+    ['suspension', { status: 'SUSPENDED', suspendedAt: new Date(), suspendedByUserId: ownerId }],
+    [
+      'revocation',
+      {
+        status: 'REVOKED',
+        revokedAt: new Date(),
+        revokedByUserId: ownerId,
+        revokeReason: 'race',
+      },
+    ],
+    ['permission reduction', { permissions: ['vehicle:read'] }],
+  ];
+  for (const [label, update] of issuerChanges) {
+    const delegate = await addAcceptedMember(vehicle._id, ownerId, [
+      'vehicle:read',
+      'invitation:create',
+    ]);
+    const invitee = new Types.ObjectId();
+    const invitation = await inviteMember(vehicle._id, delegate.memberId, invitee, [
+      'vehicle:read',
+    ]);
+    assert.ok(invitation);
+    const barrier = await holdMembershipChange(vehicle._id, delegate.membershipId, update);
+    const accept = acceptInvitation(invitation._id, invitee);
+    accept.catch(() => undefined);
+    assert.equal(await stillPendingAfter(accept, 400), true, `${label}: accept waits`);
+    await barrier.commit();
+    await rejectsWithCode(() => accept, 'CONFLICT');
+    const after = await InvitationModel.findById(invitation._id).lean();
+    assert.equal(after?.status, 'REVOKED', label);
+    assert.equal(after?.revokeReason, INVITATION_ISSUER_AUTHORITY_LOST_REASON, label);
+    assert.equal(
+      await MembershipModel.countDocuments({ vehicleId: vehicle._id, userId: invitee }),
+      0,
+      label,
+    );
+  }
+
+  // Acceptance vs invitation revocation: exactly one wins, state is consistent.
+  for (let round = 0; round < 3; round += 1) {
+    const invitee = new Types.ObjectId();
+    const invitation = await inviteMember(vehicle._id, ownerId, invitee, ['vehicle:read']);
+    assert.ok(invitation);
+    const [accepted, revoked] = await Promise.allSettled([
+      acceptInvitation(invitation._id, invitee),
+      revokeInvitation({
+        vehicleId: vehicle._id,
+        invitationId: invitation._id,
+        actorUserId: ownerId,
+      }),
+    ]);
+    const final = await InvitationModel.findById(invitation._id).lean();
+    const memberships = await MembershipModel.countDocuments({
+      vehicleId: vehicle._id,
+      userId: invitee,
+    });
+    if (final?.status === 'ACCEPTED') {
+      assert.ok(accepted.status === 'fulfilled' && accepted.value);
+      assert.equal(revoked.status, 'rejected');
+      assert.equal(memberships, 1);
+    } else {
+      assert.equal(final?.status, 'REVOKED');
+      assert.equal(revoked.status, 'fulfilled');
+      assert.equal(accepted.status, 'rejected');
+      assert.equal(memberships, 0);
+    }
+  }
+
+  // Acceptance vs archive: never a membership created on an archived vehicle after the archive.
+  const archiveTarget = await createVehicle(ownerId, { name: 'Race Archive Sedan' });
+  const archiveInvitee = new Types.ObjectId();
+  const archiveInvitation = await inviteMember(archiveTarget._id, ownerId, archiveInvitee, [
+    'vehicle:read',
+  ]);
+  assert.ok(archiveInvitation);
+  const [acceptVsArchive, archived] = await Promise.allSettled([
+    acceptInvitation(archiveInvitation._id, archiveInvitee),
+    archiveVehicle({ vehicleId: archiveTarget._id, actorUserId: ownerId }),
+  ]);
+  assert.equal(archived.status, 'fulfilled');
+  const archivedInvitation = await InvitationModel.findById(archiveInvitation._id).lean();
+  const archivedMemberships = await MembershipModel.countDocuments({
+    vehicleId: archiveTarget._id,
+    userId: archiveInvitee,
+  });
+  if (archivedInvitation?.status === 'ACCEPTED') {
+    assert.equal(archivedMemberships, 1);
+  } else {
+    assert.equal(archivedInvitation?.status, 'REVOKED');
+    assert.equal(archivedMemberships, 0);
+    assert.ok(
+      acceptVsArchive.status === 'rejected' ||
+        (acceptVsArchive.status === 'fulfilled' && acceptVsArchive.value === null),
+    );
+  }
+
+  // Permission change vs membership revocation.
+  const contested = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const [permissionChange, revocation] = await Promise.allSettled([
+    updateMembershipPermissions({
+      vehicleId: vehicle._id,
+      membershipId: contested.membershipId,
+      actorUserId: ownerId,
+      permissions: ['device:read'],
+    }),
+    revokeMembership({
+      vehicleId: vehicle._id,
+      membershipId: contested.membershipId,
+      actorUserId: ownerId,
+    }),
+  ]);
+  assert.equal(revocation.status, 'fulfilled');
+  if (permissionChange.status === 'rejected') {
+    assert.ok(permissionChange.reason instanceof VehicleServiceError);
+    assert.equal(permissionChange.reason.code, 'CONFLICT');
+  }
+  assert.equal((await MembershipModel.findById(contested.membershipId).lean())?.status, 'REVOKED');
+
+  // AccessGrant creation vs suspension / revocation: no ACTIVE grant survives on the membership.
+  for (const operation of ['suspend', 'revoke'] as const) {
+    const subject = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+    const frame = {
+      vehicleId: vehicle._id,
+      membershipId: subject.membershipId,
+      actorUserId: ownerId,
+    };
+    const [transition] = await Promise.allSettled([
+      operation === 'suspend' ? suspendMembership(frame) : revokeMembership(frame),
+      createAccessGrant({
+        vehicleId: vehicle._id,
+        membershipId: subject.membershipId,
+        subjectUserId: subject.memberId,
+        actorUserId: ownerId,
+        scopeType: 'VEHICLE',
+        channel: 'ONLINE',
+        permissions: ['vehicle:read'],
+      }),
+    ]);
+    assert.equal(transition.status, 'fulfilled', operation);
+    assert.equal(
+      await AccessGrantModel.countDocuments({
+        membershipId: subject.membershipId,
+        status: 'ACTIVE',
+      }),
+      0,
+      operation,
+    );
+  }
+  const barrierSubject = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const suspensionInFlight = await holdMembershipChange(vehicle._id, barrierSubject.membershipId, {
+    status: 'SUSPENDED',
+    suspendedAt: new Date(),
+    suspendedByUserId: ownerId,
+  });
+  const blockedGrant = createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: barrierSubject.membershipId,
+    subjectUserId: barrierSubject.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:read'],
+  });
+  blockedGrant.catch(() => undefined);
+  assert.equal(await stillPendingAfter(blockedGrant, 400), true, 'grant waits on the barrier');
+  await suspensionInFlight.commit();
+  await assert.rejects(
+    () => blockedGrant,
+    (err: unknown) => err instanceof VehicleServiceError,
+  );
+  assert.equal(
+    await AccessGrantModel.countDocuments({ membershipId: barrierSubject.membershipId }),
+    0,
+  );
+
+  // Leave vs administrative operations: the membership ends REVOKED exactly once.
+  const leaving = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const leaveFrame = {
+    vehicleId: vehicle._id,
+    membershipId: leaving.membershipId,
+    actorUserId: ownerId,
+  };
+  const [leaveResult, suspendResult, updateResult] = await Promise.allSettled([
+    leaveVehicle({
+      vehicleId: vehicle._id,
+      actorUserId: leaving.memberId,
+      membershipId: leaving.membershipId,
+    }),
+    suspendMembership(leaveFrame),
+    updateMembershipPermissions({ ...leaveFrame, permissions: ['device:read'] }),
+  ]);
+  assert.equal(leaveResult.status, 'fulfilled');
+  for (const result of [suspendResult, updateResult]) {
+    if (result.status === 'rejected') {
+      assert.ok(result.reason instanceof VehicleServiceError);
+      assert.equal(result.reason.code, 'CONFLICT');
+    }
+  }
+  const leftRecord = await MembershipModel.findById(leaving.membershipId).lean();
+  assert.equal(leftRecord?.status, 'REVOKED');
+  assert.equal(leftRecord?.revokeReason, MEMBER_LEFT_REASON);
+
+  const doubleExit = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const [selfExit, ownerExit] = await Promise.allSettled([
+    leaveVehicle({
+      vehicleId: vehicle._id,
+      actorUserId: doubleExit.memberId,
+      membershipId: doubleExit.membershipId,
+    }),
+    revokeMembership({
+      vehicleId: vehicle._id,
+      membershipId: doubleExit.membershipId,
+      actorUserId: ownerId,
+      reason: 'Owner removal',
+    }),
+  ]);
+  assert.ok(selfExit.status === 'fulfilled' && ownerExit.status === 'fulfilled');
+  assert.equal(
+    [selfExit.value.alreadyRevoked, ownerExit.value.alreadyRevoked].filter(Boolean).length,
+    1,
+  );
+  const exitRecord = await MembershipModel.findById(doubleExit.membershipId).lean();
+  assert.equal(
+    exitRecord?.revokeReason,
+    selfExit.value.alreadyRevoked ? 'Owner removal' : MEMBER_LEFT_REASON,
+  );
+});
+
+test('25. TKT-012 unauthorized membership and invitation operations leave no persistent trace', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Untouched Roadster' });
+  const reader = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const member = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read', 'device:read']);
+  const pending = await inviteMember(vehicle._id, ownerId, new Types.ObjectId(), ['vehicle:read']);
+  assert.ok(pending);
+  await insertRawPendingInvitation(vehicle._id, ownerId, new Date(Date.now() - 1_000));
+  const outsider = new Types.ObjectId();
+  const snapshot = await vehiclePersistenceSnapshot(vehicle._id);
+  const frame = { vehicleId: vehicle._id, membershipId: member.membershipId };
+  for (const actor of [reader.memberId, outsider]) {
+    const attempts: Array<() => Promise<unknown>> = [
+      () => suspendMembership({ ...frame, actorUserId: actor }),
+      () => reactivateMembership({ ...frame, actorUserId: actor }),
+      () => revokeMembership({ ...frame, actorUserId: actor }),
+      () => updateMembershipPermissions({ ...frame, actorUserId: actor, permissions: [] }),
+      () =>
+        revokeInvitation({ vehicleId: vehicle._id, invitationId: pending._id, actorUserId: actor }),
+      () => listVehicleMembers(vehicle._id, actor),
+      () => listVehicleInvitations(vehicle._id, actor),
+      () => inviteMember(vehicle._id, actor, new Types.ObjectId(), ['vehicle:read']),
+    ];
+    for (const attempt of attempts) {
+      await attempt().catch((error: unknown) => {
+        assert.ok(error instanceof VehicleServiceError);
+        assert.ok(['FORBIDDEN', 'NOT_FOUND'].includes(error.code), error.code);
+      });
+    }
+  }
+  assert.equal(await acceptInvitation(pending._id, outsider), null);
+  await rejectsWithCode(
+    () =>
+      leaveVehicle({
+        vehicleId: vehicle._id,
+        actorUserId: outsider,
+        membershipId: member.membershipId,
+      }),
+    'NOT_FOUND',
+  );
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), snapshot);
+});
+
+test('26. TKT-012 voluntary leave binds to the explicit membership and a replay never reaches a later one', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Explicit Leave Hatch' });
+  const otherVehicle = await createVehicle(ownerId, { name: 'Explicit Leave Wagon' });
+  const leaver = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const bystander = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const elsewhereInvite = await inviteMember(otherVehicle._id, ownerId, leaver.memberId, [
+    'vehicle:read',
+  ]);
+  assert.ok(elsewhereInvite);
+  const leaverElsewhere = await acceptInvitation(elsewhereInvite._id, leaver.memberId);
+  assert.ok(leaverElsewhere);
+
+  // Foreign, cross-vehicle and unknown memberships: NOT_FOUND without any write.
+  const before = await vehiclePersistenceSnapshot(vehicle._id);
+  const beforeOther = await vehiclePersistenceSnapshot(otherVehicle._id);
+  for (const attempt of [
+    { vehicleId: vehicle._id, membershipId: bystander.membershipId },
+    { vehicleId: vehicle._id, membershipId: leaverElsewhere._id },
+    { vehicleId: otherVehicle._id, membershipId: leaver.membershipId },
+    { vehicleId: vehicle._id, membershipId: new Types.ObjectId() },
+  ]) {
+    await rejectsWithCode(
+      () => leaveVehicle({ ...attempt, actorUserId: leaver.memberId }),
+      'NOT_FOUND',
+    );
+  }
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), before);
+  assert.equal(await vehiclePersistenceSnapshot(otherVehicle._id), beforeOther);
+
+  // 1. Leave.
+  const events: VehicleAuditEvent[] = [];
+  const leaveRequest = {
+    vehicleId: vehicle._id,
+    actorUserId: leaver.memberId,
+    membershipId: leaver.membershipId,
+    audit: (event: VehicleAuditEvent) => events.push(event),
+  };
+  const left = await leaveVehicle(leaveRequest);
+  assert.equal(left.alreadyRevoked, false);
+  const revokedRecord = await MembershipModel.findById(leaver.membershipId).lean();
+  assert.equal(revokedRecord?.status, 'REVOKED');
+  assert.equal(revokedRecord?.revokeReason, MEMBER_LEFT_REASON);
+  assert.equal(revokedRecord?.revokedByUserId?.equals(leaver.memberId), true);
+  assert.equal(revokedRecord?.updatedByUserId?.equals(leaver.memberId), true);
+  assert.deepEqual(
+    events.map((event) => `${event.action}:${event.outcome}`),
+    ['membership.leave:success'],
+  );
+
+  // 2. Idempotent repeat: same record, no cascades, no new audit event.
+  const repeated = await leaveVehicle(leaveRequest);
+  assert.equal(repeated.alreadyRevoked, true);
+  assert.equal(repeated.revokedGrantsCount, 0);
+  assert.equal(repeated.revokedInvitationsCount, 0);
+  assert.deepEqual(await MembershipModel.findById(leaver.membershipId).lean(), revokedRecord);
+  assert.equal(events.length, 1);
+
+  // 3. New OWNER invitation; 4. its acceptance creates another membership.
+  const rejoinInvite = await inviteMember(vehicle._id, ownerId, leaver.memberId, [
+    'vehicle:read',
+    'device:read',
+  ]);
+  assert.ok(rejoinInvite);
+  const rejoined = await acceptInvitation(rejoinInvite._id, leaver.memberId);
+  assert.ok(rejoined);
+  assert.equal(rejoined._id.equals(leaver.membershipId), false);
+  await createAccessGrant({
+    vehicleId: vehicle._id,
+    membershipId: rejoined._id,
+    subjectUserId: leaver.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE',
+    channel: 'ONLINE',
+    permissions: ['vehicle:read'],
+  });
+  const rejoinedBefore = await MembershipModel.findById(rejoined._id).lean();
+  const grantsBefore = await AccessGrantModel.find({ membershipId: rejoined._id }).lean();
+
+  // 5. Replay of the original leave request.
+  const replayed = await leaveVehicle(leaveRequest);
+  assert.equal(replayed.alreadyRevoked, true);
+  assert.equal(replayed.membership._id.equals(leaver.membershipId), true);
+  assert.equal(replayed.revokedGrantsCount, 0);
+  assert.equal(replayed.revokedInvitationsCount, 0);
+
+  // 6. The new membership stays ACTIVE with its permissions, grants and audit untouched.
+  const rejoinedAfter = await MembershipModel.findById(rejoined._id).lean();
+  assert.deepEqual(rejoinedAfter, rejoinedBefore);
+  assert.equal(rejoinedAfter?.status, 'ACTIVE');
+  assert.deepEqual(rejoinedAfter?.permissions, ['vehicle:read', 'device:read']);
+  assert.deepEqual(
+    await AccessGrantModel.find({ membershipId: rejoined._id }).lean(),
+    grantsBefore,
+  );
+  assert.deepEqual(await MembershipModel.findById(leaver.membershipId).lean(), revokedRecord);
+  assert.ok(await getVehicleForUser(vehicle._id, leaver.memberId));
+  assert.equal(events.length, 1);
+});
+
+test('27. TKT-012 historical invitations fail closed on ambiguous or foreign issuer bindings and stay revocable', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Legacy Coupe' });
+  const otherVehicle = await createVehicle(ownerId, { name: 'Legacy Van' });
+  const delegatePermissions = ['vehicle:read', 'invitation:create'];
+  const delegate = await addAcceptedMember(vehicle._id, ownerId, delegatePermissions);
+  const peer = await addAcceptedMember(vehicle._id, ownerId, delegatePermissions);
+  const elsewhereInvite = await inviteMember(
+    otherVehicle._id,
+    ownerId,
+    delegate.memberId,
+    delegatePermissions,
+  );
+  assert.ok(elsewhereInvite);
+  const delegateElsewhere = await acceptInvitation(elsewhereInvite._id, delegate.memberId);
+  assert.ok(delegateElsewhere);
+  const ownerMembership = await MembershipModel.findOne({
+    vehicleId: vehicle._id,
+    role: 'OWNER',
+  }).lean();
+  assert.ok(ownerMembership);
+
+  const expectDurablyRevoked = async (invitationId: Types.ObjectId, invitee: Types.ObjectId) => {
+    await rejectsWithCode(() => acceptInvitation(invitationId, invitee), 'CONFLICT');
+    const record = await InvitationModel.findById(invitationId).lean();
+    assert.equal(record?.status, 'REVOKED');
+    assert.equal(record?.revokeReason, INVITATION_ISSUER_AUTHORITY_LOST_REASON);
+    await rejectsWithCode(() => acceptInvitation(invitationId, invitee), 'CONFLICT');
+    assert.deepEqual(await InvitationModel.findById(invitationId).lean(), record);
+    assert.equal(
+      await MembershipModel.countDocuments({ vehicleId: vehicle._id, userId: invitee }),
+      0,
+    );
+  };
+
+  // Bindings that do not belong to the inviter, the vehicle, or the canonical OWNER.
+  const foreignBindings = [
+    { inviterUserId: delegate.memberId, issuerMembershipId: peer.membershipId },
+    { inviterUserId: delegate.memberId, issuerMembershipId: delegateElsewhere._id },
+    { inviterUserId: delegate.memberId, issuerMembershipId: new Types.ObjectId() },
+    { inviterUserId: ownerId, issuerMembershipId: delegate.membershipId },
+    { inviterUserId: delegate.memberId },
+  ];
+  for (const binding of foreignBindings) {
+    const invitee = new Types.ObjectId();
+    const invitationId = await insertBoundInvitation({
+      vehicleId: vehicle._id,
+      inviteeUserId: invitee,
+      ...binding,
+    });
+    await expectDurablyRevoked(invitationId, invitee);
+  }
+
+  // Legitimate OWNER invitations, unbound legacy or bound to the OWNER membership, stay valid.
+  for (const issuerMembershipId of [undefined, ownerMembership._id]) {
+    const invitee = new Types.ObjectId();
+    const invitationId = await insertBoundInvitation({
+      vehicleId: vehicle._id,
+      inviterUserId: ownerId,
+      inviteeUserId: invitee,
+      ...(issuerMembershipId ? { issuerMembershipId } : {}),
+    });
+    assert.ok(await acceptInvitation(invitationId, invitee));
+  }
+
+  // An invalid legacy invitation lists as PENDING until processed, the OWNER revokes it without
+  // granting access, and a new valid invitation for the same invitee can then be issued.
+  const legacyInvitee = new Types.ObjectId();
+  const legacyId = await insertBoundInvitation({
+    vehicleId: vehicle._id,
+    inviterUserId: delegate.memberId,
+    inviteeUserId: legacyInvitee,
+  });
+  const pendingIds = (
+    await listVehicleInvitations(vehicle._id, ownerId, { status: 'PENDING', limit: 100 })
+  ).items.map((item) => String(item.invitation._id));
+  assert.ok(pendingIds.includes(String(legacyId)));
+  await rejectsWithCode(
+    () => inviteMember(vehicle._id, ownerId, legacyInvitee, ['vehicle:read']),
+    'CONFLICT',
+  );
+  const revoked = await revokeInvitation({
+    vehicleId: vehicle._id,
+    invitationId: legacyId,
+    actorUserId: ownerId,
+  });
+  assert.equal(revoked.alreadyRevoked, false);
+  assert.equal(revoked.invitation.status, 'REVOKED');
+  assert.equal(revoked.invitation.revokedByUserId?.equals(ownerId), true);
+  const afterRevoke = await acceptInvitation(legacyId, legacyInvitee).catch(
+    (error: unknown) => error,
+  );
+  assert.ok(
+    afterRevoke === null ||
+      (afterRevoke instanceof VehicleServiceError && afterRevoke.code === 'CONFLICT'),
+  );
+  assert.equal(
+    await MembershipModel.countDocuments({ vehicleId: vehicle._id, userId: legacyInvitee }),
+    0,
+  );
+  const reissued = await inviteMember(vehicle._id, ownerId, legacyInvitee, ['vehicle:read']);
+  assert.ok(reissued);
+  assert.equal(reissued.issuerMembershipId?.equals(ownerMembership._id), true);
+  assert.ok(await acceptInvitation(reissued._id, legacyInvitee));
+});
+
+test('28. TKT-012 permission updates audit actor and date without touching identity, history, or AccessGrants', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'Audit Saloon' });
+  const member = await addAcceptedMember(vehicle._id, ownerId, [
+    'vehicle:read',
+    'device:read',
+    'invitation:create',
+  ]);
+  const reader = await addAcceptedMember(vehicle._id, ownerId, ['vehicle:read']);
+  const grantFrame = {
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    subjectUserId: member.memberId,
+    actorUserId: ownerId,
+    scopeType: 'VEHICLE' as const,
+    channel: 'ONLINE' as const,
+  };
+  await createAccessGrant({ ...grantFrame, permissions: ['vehicle:read'] });
+  const revokedGrant = await createAccessGrant({ ...grantFrame, permissions: ['device:read'] });
+  await revokeAccessGrant({
+    vehicleId: vehicle._id,
+    grantId: revokedGrant._id,
+    actorUserId: ownerId,
+    reason: 'Temporary access ended',
+  });
+  const delegated = await inviteMember(vehicle._id, member.memberId, new Types.ObjectId(), [
+    'device:read',
+  ]);
+  assert.ok(delegated);
+  const grantsOf = () =>
+    AccessGrantModel.find({ membershipId: member.membershipId }).sort({ _id: 1 }).lean();
+  const grantsBefore = await grantsOf();
+  const original = await MembershipModel.findById(member.membershipId).lean();
+  assert.ok(original);
+  const events: VehicleAuditEvent[] = [];
+  const audit = (event: VehicleAuditEvent) => events.push(event);
+  const frame = { vehicleId: vehicle._id, membershipId: member.membershipId, audit };
+
+  // Unauthorized callers change nothing and leave no success audit.
+  const snapshot = await vehiclePersistenceSnapshot(vehicle._id);
+  for (const actor of [reader.memberId, member.memberId, new Types.ObjectId()]) {
+    await updateMembershipPermissions({
+      ...frame,
+      actorUserId: actor,
+      permissions: ['vehicle:read'],
+    }).catch((error: unknown) => {
+      assert.ok(error instanceof VehicleServiceError);
+      assert.ok(['FORBIDDEN', 'NOT_FOUND'].includes(error.code), error.code);
+    });
+  }
+  assert.equal(await vehiclePersistenceSnapshot(vehicle._id), snapshot);
+  assert.equal(
+    events.some((event) => event.outcome === 'success'),
+    false,
+  );
+
+  // Effective change: actor and date recorded, creation audit and identity preserved.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const changed = await updateMembershipPermissions({
+    ...frame,
+    actorUserId: ownerId,
+    permissions: ['vehicle:read', 'invitation:create'],
+  });
+  assert.equal(changed.changed, true);
+  assert.equal(changed.revokedInvitationsCount, 1);
+  const updated = await MembershipModel.findById(member.membershipId).lean();
+  assert.ok(updated);
+  assert.deepEqual(updated.permissions, ['vehicle:read', 'invitation:create']);
+  assert.equal(updated.updatedByUserId?.equals(ownerId), true);
+  assert.ok(updated.updatedAt.getTime() > original.updatedAt.getTime());
+  assert.equal(updated.createdAt.getTime(), original.createdAt.getTime());
+  assert.equal(updated.grantedByUserId.equals(original.grantedByUserId), true);
+  assert.equal(String(updated.sourceInvitationId), String(original.sourceInvitationId));
+  assert.equal(updated.role, original.role);
+  assert.equal(updated.userId.equals(original.userId), true);
+  assert.equal(updated.vehicleId.equals(original.vehicleId), true);
+  assert.equal(updated.status, 'ACTIVE');
+  assert.equal(updated.revokedAt, null);
+  assert.equal(updated.suspendedAt, null);
+  assert.deepEqual(await grantsOf(), grantsBefore);
+  const cascaded = await InvitationModel.findById(delegated._id).lean();
+  assert.equal(cascaded?.status, 'REVOKED');
+  assert.equal(cascaded?.revokeReason, INVITATION_ISSUER_AUTHORITY_LOST_REASON);
+  assert.equal(cascaded?.revokedByUserId?.equals(ownerId), true);
+  const successEvents = () =>
+    events.filter((event) => event.action === 'membership.update' && event.outcome === 'success');
+  assert.equal(successEvents().length, 1);
+  assert.equal(successEvents()[0]?.actorUserId, String(ownerId));
+
+  // Idempotent repeat (same set, any order): membership audit and grants stay untouched.
+  const repeated = await updateMembershipPermissions({
+    ...frame,
+    actorUserId: ownerId,
+    permissions: ['invitation:create', 'vehicle:read'],
+  });
+  assert.equal(repeated.changed, false);
+  assert.deepEqual(await MembershipModel.findById(member.membershipId).lean(), updated);
+  assert.deepEqual(await grantsOf(), grantsBefore);
+  assert.equal(successEvents().length, 1);
+
+  // Revocation cascade records its reason and actor on the grants it revokes.
+  await revokeMembership({
+    vehicleId: vehicle._id,
+    membershipId: member.membershipId,
+    actorUserId: ownerId,
+    reason: 'Sold the car',
+  });
+  const grantsAfterRevoke = await grantsOf();
+  const cascadedGrant = grantsAfterRevoke.find((grant) => !grant._id.equals(revokedGrant._id));
+  assert.equal(cascadedGrant?.status, 'REVOKED');
+  assert.equal(cascadedGrant?.revokeReason, 'Sold the car');
+  assert.equal(cascadedGrant?.revokedByUserId?.equals(ownerId), true);
+  assert.deepEqual(
+    grantsAfterRevoke.find((grant) => grant._id.equals(revokedGrant._id)),
+    grantsBefore.find((grant) => grant._id.equals(revokedGrant._id)),
+  );
+  await rejectsWithCode(
+    () =>
+      updateMembershipPermissions({
+        ...frame,
+        actorUserId: ownerId,
+        permissions: ['vehicle:read'],
+      }),
+    'CONFLICT',
+  );
 });

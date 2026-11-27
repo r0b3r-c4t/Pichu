@@ -135,6 +135,19 @@ export const DELEGABLE_MEMBERSHIP_PERMISSIONS = [
 ] as const;
 export type DelegableMembershipPermission = (typeof DELEGABLE_MEMBERSHIP_PERMISSIONS)[number];
 
+/** Base permissions that let a MEMBER issue invitations. AccessGrants never confer this. */
+export const INVITATION_AUTHORITY_PERMISSIONS = ['vehicle:manage', 'invitation:create'] as const;
+
+/**
+ * The only permissions a MEMBER may delegate through an invitation, and only when held directly
+ * in their own ACTIVE membership. Every other delegable permission is OWNER-only.
+ */
+export const MEMBER_DELEGABLE_INVITATION_PERMISSIONS = [
+  'vehicle:read',
+  'device:read',
+  'module:read',
+] as const;
+
 export const ALL_KNOWN_PERMISSIONS = [
   ...OWNER_RESERVED_PERMISSIONS,
   ...DELEGABLE_MEMBERSHIP_PERMISSIONS,

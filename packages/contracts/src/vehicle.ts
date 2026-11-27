@@ -65,6 +65,7 @@ export const vehicleYearSchema = z
   .min(VEHICLE_YEAR_RANGE.min)
   .max(VEHICLE_YEAR_RANGE.max);
 export const membershipRoleSchema = z.enum(['OWNER', 'MEMBER']);
+export const membershipStatusSchema = z.enum(['ACTIVE', 'SUSPENDED', 'REVOKED']);
 export const membershipPermissionSchema = z.string().trim().min(1).max(64);
 export const invitationStatusSchema = z.enum(['PENDING', 'ACCEPTED', 'REVOKED', 'EXPIRED']);
 
@@ -196,13 +197,24 @@ export const vehicleArchiveResponseSchema = z.strictObject({
 });
 export type VehicleArchiveResponse = z.infer<typeof vehicleArchiveResponseSchema>;
 
+/** Membership as returned to its own holder (acceptance and voluntary leave). */
 export const membershipSchema = z.strictObject({
+  membershipId: objectIdSchema,
   vehicleId: objectIdSchema,
   userId: objectIdSchema,
   role: membershipRoleSchema,
   permissions: z.array(membershipPermissionSchema).max(100),
+  status: membershipStatusSchema,
 });
 export type Membership = z.infer<typeof membershipSchema>;
+
+/** Administrative member view, visible only to the canonical vehicle owner. */
+export const memberViewSchema = membershipSchema.extend({
+  createdAt: z.string().datetime(),
+  suspendedAt: z.string().datetime().nullable(),
+  revokedAt: z.string().datetime().nullable(),
+});
+export type MemberView = z.infer<typeof memberViewSchema>;
 
 /**
  * Opaque keyset cursor (base64url). It is neither encrypted nor signed: it only positions the
@@ -273,20 +285,42 @@ export const internalInvitationCreateRequestSchema = z.strictObject({
 });
 export type InternalInvitationCreateRequest = z.infer<typeof internalInvitationCreateRequestSchema>;
 
+/**
+ * Invitation as seen by its issuer or by the vehicle owner. `status` is the effective state:
+ * an elapsed PENDING invitation is reported as EXPIRED even before it is persisted as such.
+ */
+export const invitationAdminViewSchema = z.strictObject({
+  invitationId: objectIdSchema,
+  vehicleId: objectIdSchema,
+  inviterUserId: objectIdSchema,
+  inviteeUserId: objectIdSchema,
+  permissions: z.array(membershipPermissionSchema).max(100),
+  status: invitationStatusSchema,
+  expiresAt: z.string().datetime(),
+  createdAt: z.string().datetime(),
+  acceptedAt: z.string().datetime().nullable(),
+  revokedAt: z.string().datetime().nullable(),
+  revokeReason: z.string().max(256).nullable(),
+});
+export type InvitationAdminView = z.infer<typeof invitationAdminViewSchema>;
+
+/** Invitation as seen by its invitee; `vehicleName` is null when the vehicle is unavailable. */
+export const receivedInvitationViewSchema = z.strictObject({
+  invitationId: objectIdSchema,
+  vehicleId: objectIdSchema,
+  vehicleName: z.string().min(1).max(VEHICLE_TEXT_LIMITS.name).nullable(),
+  permissions: z.array(membershipPermissionSchema).max(100),
+  status: invitationStatusSchema,
+  expiresAt: z.string().datetime(),
+  createdAt: z.string().datetime(),
+});
+export type ReceivedInvitationView = z.infer<typeof receivedInvitationViewSchema>;
+
 export const invitationCreateResponseSchema = z.strictObject({
   invitationId: objectIdSchema,
   status: invitationStatusSchema,
   message: z.string().optional(),
-  data: z
-    .strictObject({
-      id: objectIdSchema,
-      vehicleId: objectIdSchema,
-      inviteeUserId: objectIdSchema,
-      permissions: z.array(membershipPermissionSchema).max(100),
-      status: invitationStatusSchema,
-      expiresAt: z.string().datetime(),
-    })
-    .optional(),
+  data: invitationAdminViewSchema.optional(),
   requestId: requestIdSchema.optional(),
 });
 export type InvitationCreateResponse = z.infer<typeof invitationCreateResponseSchema>;
@@ -304,6 +338,158 @@ export const invitationAcceptResponseSchema = z.strictObject({
   requestId: requestIdSchema.optional(),
 });
 export type InvitationAcceptResponse = z.infer<typeof invitationAcceptResponseSchema>;
+
+/** Optional audit reason for administrative transitions; same bounds as the archive reason. */
+export const membershipAuditReasonSchema = vehicleTextSchema(VEHICLE_TEXT_LIMITS.archiveReason);
+
+export const vehicleInvitationListQuerySchema = paginationQuerySchema.extend({
+  cursor: vehicleListCursorSchema.optional(),
+  status: invitationStatusSchema.optional(),
+});
+export type VehicleInvitationListQuery = z.infer<typeof vehicleInvitationListQuerySchema>;
+
+export const internalVehicleInvitationListQuerySchema = vehicleInvitationListQuerySchema.extend({
+  userId: objectIdSchema,
+});
+export type InternalVehicleInvitationListQuery = z.infer<
+  typeof internalVehicleInvitationListQuerySchema
+>;
+
+/** Received invitations; without `status` only effective PENDING invitations are listed. */
+export const receivedInvitationListQuerySchema = vehicleInvitationListQuerySchema;
+export type ReceivedInvitationListQuery = z.infer<typeof receivedInvitationListQuerySchema>;
+
+export const internalReceivedInvitationListQuerySchema = internalVehicleInvitationListQuerySchema;
+export type InternalReceivedInvitationListQuery = z.infer<
+  typeof internalReceivedInvitationListQuerySchema
+>;
+
+export const vehicleInvitationListResponseSchema = z.strictObject({
+  invitations: z.array(invitationAdminViewSchema),
+  page: vehicleListPageSchema,
+  requestId: requestIdSchema.optional(),
+});
+export type VehicleInvitationListResponse = z.infer<typeof vehicleInvitationListResponseSchema>;
+
+export const receivedInvitationListResponseSchema = z.strictObject({
+  invitations: z.array(receivedInvitationViewSchema),
+  page: vehicleListPageSchema,
+  requestId: requestIdSchema.optional(),
+});
+export type ReceivedInvitationListResponse = z.infer<typeof receivedInvitationListResponseSchema>;
+
+export const invitationRevokeParamsSchema = z.strictObject({
+  vehicleId: objectIdSchema,
+  invitationId: objectIdSchema,
+});
+export type InvitationRevokeParams = z.infer<typeof invitationRevokeParamsSchema>;
+
+/** Optional revocation body; a request without a body is equivalent to `{}`. */
+export const invitationRevokeRequestSchema = z.strictObject({
+  reason: membershipAuditReasonSchema.optional(),
+});
+export type InvitationRevokeRequest = z.infer<typeof invitationRevokeRequestSchema>;
+
+export const internalInvitationRevokeRequestSchema = invitationRevokeRequestSchema.extend({
+  userId: objectIdSchema,
+});
+export type InternalInvitationRevokeRequest = z.infer<typeof internalInvitationRevokeRequestSchema>;
+
+export const invitationRevokeResponseSchema = z.strictObject({
+  invitationId: objectIdSchema,
+  status: z.literal('REVOKED'),
+  message: z.string().optional(),
+  data: invitationAdminViewSchema,
+  requestId: requestIdSchema.optional(),
+});
+export type InvitationRevokeResponse = z.infer<typeof invitationRevokeResponseSchema>;
+
+/** Members default to ACTIVE and SUSPENDED; REVOKED history requires an explicit filter. */
+export const memberListQuerySchema = paginationQuerySchema.extend({
+  cursor: vehicleListCursorSchema.optional(),
+  status: membershipStatusSchema.optional(),
+});
+export type MemberListQuery = z.infer<typeof memberListQuerySchema>;
+
+export const internalMemberListQuerySchema = memberListQuerySchema.extend({
+  userId: objectIdSchema,
+});
+export type InternalMemberListQuery = z.infer<typeof internalMemberListQuerySchema>;
+
+export const memberListResponseSchema = z.strictObject({
+  members: z.array(memberViewSchema),
+  page: vehicleListPageSchema,
+  requestId: requestIdSchema.optional(),
+});
+export type MemberListResponse = z.infer<typeof memberListResponseSchema>;
+
+export const memberParamsSchema = z.strictObject({
+  vehicleId: objectIdSchema,
+  membershipId: objectIdSchema,
+});
+export type MemberParams = z.infer<typeof memberParamsSchema>;
+
+/** Replaces the complete base permission set; role, status, and audit fields are not editable. */
+export const memberPermissionsUpdateRequestSchema = z.strictObject({
+  permissions: z.array(membershipPermissionSchema).max(100),
+});
+export type MemberPermissionsUpdateRequest = z.infer<typeof memberPermissionsUpdateRequestSchema>;
+
+export const internalMemberPermissionsUpdateRequestSchema =
+  memberPermissionsUpdateRequestSchema.extend({ userId: objectIdSchema });
+export type InternalMemberPermissionsUpdateRequest = z.infer<
+  typeof internalMemberPermissionsUpdateRequestSchema
+>;
+
+/** Optional body for suspension and revocation; a request without a body equals `{}`. */
+export const memberTransitionRequestSchema = z.strictObject({
+  reason: membershipAuditReasonSchema.optional(),
+});
+export type MemberTransitionRequest = z.infer<typeof memberTransitionRequestSchema>;
+
+export const internalMemberTransitionRequestSchema = memberTransitionRequestSchema.extend({
+  userId: objectIdSchema,
+});
+export type InternalMemberTransitionRequest = z.infer<typeof internalMemberTransitionRequestSchema>;
+
+export const memberReactivateRequestSchema = z.strictObject({});
+export type MemberReactivateRequest = z.infer<typeof memberReactivateRequestSchema>;
+
+export const internalMemberReactivateRequestSchema = z.strictObject({ userId: objectIdSchema });
+export type InternalMemberReactivateRequest = z.infer<typeof internalMemberReactivateRequestSchema>;
+
+export const memberMutationResponseSchema = z.strictObject({
+  membershipId: objectIdSchema,
+  status: membershipStatusSchema,
+  message: z.string().optional(),
+  data: memberViewSchema,
+  requestId: requestIdSchema.optional(),
+});
+export type MemberMutationResponse = z.infer<typeof memberMutationResponseSchema>;
+
+/**
+ * Voluntary leave. Without `membershipId` the caller's current membership is revoked; with it,
+ * only that membership of the caller is targeted and repeating the request is idempotent.
+ */
+/** The leaving membership is always explicit so a retried request never targets a later one. */
+export const memberLeaveRequestSchema = z.strictObject({
+  membershipId: objectIdSchema,
+});
+export type MemberLeaveRequest = z.infer<typeof memberLeaveRequestSchema>;
+
+export const internalMemberLeaveRequestSchema = memberLeaveRequestSchema.extend({
+  userId: objectIdSchema,
+});
+export type InternalMemberLeaveRequest = z.infer<typeof internalMemberLeaveRequestSchema>;
+
+export const memberLeaveResponseSchema = z.strictObject({
+  membershipId: objectIdSchema,
+  status: z.literal('REVOKED'),
+  message: z.string().optional(),
+  data: membershipSchema,
+  requestId: requestIdSchema.optional(),
+});
+export type MemberLeaveResponse = z.infer<typeof memberLeaveResponseSchema>;
 
 /** Vehicle's public response after Device accepts a registration; activation is still pending. */
 export const vehicleDeviceRegistrationResponseSchema = z.strictObject({

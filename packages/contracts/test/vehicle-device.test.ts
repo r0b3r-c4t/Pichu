@@ -24,9 +24,37 @@ import {
   internalVehicleGetQuerySchema,
   internalVehicleListQuerySchema,
   internalVehicleUpdateRequestSchema,
+  internalInvitationRevokeRequestSchema,
+  internalMemberLeaveRequestSchema,
+  internalMemberListQuerySchema,
+  internalMemberPermissionsUpdateRequestSchema,
+  internalMemberReactivateRequestSchema,
+  internalMemberTransitionRequestSchema,
+  internalReceivedInvitationListQuerySchema,
+  internalVehicleInvitationListQuerySchema,
+  invitationAdminViewSchema,
+  invitationRevokeParamsSchema,
+  invitationRevokeRequestSchema,
+  invitationRevokeResponseSchema,
+  memberLeaveRequestSchema,
+  memberLeaveResponseSchema,
+  memberListQuerySchema,
+  memberListResponseSchema,
+  memberMutationResponseSchema,
+  memberParamsSchema,
+  memberPermissionsUpdateRequestSchema,
+  memberReactivateRequestSchema,
+  memberTransitionRequestSchema,
+  memberViewSchema,
   membershipSchema,
   membershipPermissionSchema,
   membershipRoleSchema,
+  membershipStatusSchema,
+  receivedInvitationListQuerySchema,
+  receivedInvitationListResponseSchema,
+  receivedInvitationViewSchema,
+  vehicleInvitationListQuerySchema,
+  vehicleInvitationListResponseSchema,
   VEHICLE_MUTABLE_FIELDS,
   vehicleAccessViewSchema,
   vehicleArchiveRequestSchema,
@@ -392,24 +420,207 @@ test('membership roles and permissions are bounded and explicit', () => {
   assert.equal(membershipRoleSchema.safeParse('ADMIN').success, false);
   assert.equal(membershipPermissionSchema.safeParse('vehicle:read').success, true);
   assert.equal(membershipPermissionSchema.safeParse('').success, false);
+  const membership = {
+    membershipId: deviceId,
+    vehicleId,
+    userId,
+    role: 'MEMBER',
+    permissions: ['vehicle:read'],
+    status: 'ACTIVE',
+  };
+  assert.equal(membershipSchema.safeParse(membership).success, true);
+  assert.equal(membershipSchema.safeParse({ ...membership, permissions: [] }).success, true);
+  assert.equal(membershipSchema.safeParse({ ...membership, owner: true }).success, false);
+  assert.equal(membershipSchema.safeParse({ ...membership, id: deviceId }).success, false);
+  assert.equal(membershipSchema.safeParse({ ...membership, status: 'DELETED' }).success, false);
+  const withoutId: Record<string, unknown> = { ...membership };
+  delete withoutId.membershipId;
+  assert.equal(membershipSchema.safeParse(withoutId).success, false);
+  assert.equal(membershipStatusSchema.safeParse('SUSPENDED').success, true);
+  assert.equal(membershipStatusSchema.safeParse('PENDING').success, false);
+  const memberView = {
+    ...membership,
+    createdAt: '2026-11-26T12:00:00.000Z',
+    suspendedAt: null,
+    revokedAt: null,
+  };
+  assert.equal(memberViewSchema.safeParse(memberView).success, true);
   assert.equal(
-    membershipSchema.safeParse({
-      vehicleId,
-      userId,
-      role: 'MEMBER',
-      permissions: ['vehicle:read'],
+    memberViewSchema.safeParse({ ...memberView, suspendedByUserId: userId }).success,
+    false,
+  );
+  assert.equal(
+    memberMutationResponseSchema.safeParse({
+      membershipId: deviceId,
+      status: 'SUSPENDED',
+      data: { ...memberView, status: 'SUSPENDED', suspendedAt: '2026-11-26T12:00:00.000Z' },
     }).success,
     true,
   );
   assert.equal(
-    membershipSchema.safeParse({
-      vehicleId,
-      userId,
-      role: 'MEMBER',
-      permissions: [],
-      owner: true,
+    memberLeaveResponseSchema.safeParse({
+      membershipId: deviceId,
+      status: 'ACTIVE',
+      data: membership,
     }).success,
     false,
+  );
+});
+
+test('membership administration requests reject actor, role, status and audit fields', () => {
+  assert.deepEqual(memberPermissionsUpdateRequestSchema.parse({ permissions: [] }), {
+    permissions: [],
+  });
+  assert.equal(
+    memberPermissionsUpdateRequestSchema.safeParse({ permissions: ['vehicle:read'] }).success,
+    true,
+  );
+  for (const forbidden of [
+    { userId },
+    { role: 'OWNER' },
+    { status: 'ACTIVE' },
+    { vehicleId },
+    { grantedByUserId: userId },
+    { updatedByUserId: userId },
+    { createdAt: '2026-01-01T00:00:00.000Z' },
+    { updatedAt: '2026-01-01T00:00:00.000Z' },
+    { revokedByUserId: userId },
+  ]) {
+    assert.equal(
+      memberPermissionsUpdateRequestSchema.safeParse({ permissions: [], ...forbidden }).success,
+      false,
+    );
+  }
+  assert.equal(memberPermissionsUpdateRequestSchema.safeParse({}).success, false);
+  assert.equal(
+    memberPermissionsUpdateRequestSchema.safeParse({
+      permissions: Array.from({ length: 101 }, () => 'vehicle:read'),
+    }).success,
+    false,
+  );
+  assert.equal(
+    internalMemberPermissionsUpdateRequestSchema.safeParse({ userId, permissions: [] }).success,
+    true,
+  );
+  assert.equal(memberTransitionRequestSchema.safeParse({}).success, true);
+  assert.equal(memberTransitionRequestSchema.safeParse({ reason: 'Lost key' }).success, true);
+  assert.equal(memberTransitionRequestSchema.safeParse({ reason: 'x'.repeat(257) }).success, false);
+  assert.equal(memberTransitionRequestSchema.safeParse({ reason: 'a\u0000b' }).success, false);
+  assert.equal(memberTransitionRequestSchema.safeParse({ userId }).success, false);
+  assert.equal(
+    internalMemberTransitionRequestSchema.safeParse({ userId, reason: 'Lost key' }).success,
+    true,
+  );
+  assert.equal(memberReactivateRequestSchema.safeParse({}).success, true);
+  assert.equal(memberReactivateRequestSchema.safeParse({ reason: 'x' }).success, false);
+  assert.equal(internalMemberReactivateRequestSchema.safeParse({ userId }).success, true);
+  assert.equal(memberLeaveRequestSchema.safeParse({}).success, false);
+  assert.equal(memberLeaveRequestSchema.safeParse(undefined).success, false);
+  assert.equal(memberLeaveRequestSchema.safeParse({ membershipId: deviceId }).success, true);
+  assert.equal(memberLeaveRequestSchema.safeParse({ membershipId: 'invalid' }).success, false);
+  assert.equal(memberLeaveRequestSchema.safeParse({ userId }).success, false);
+  assert.equal(
+    internalMemberLeaveRequestSchema.safeParse({ userId, membershipId: deviceId }).success,
+    true,
+  );
+  assert.equal(memberParamsSchema.safeParse({ vehicleId, membershipId: deviceId }).success, true);
+  assert.equal(memberParamsSchema.safeParse({ vehicleId, membershipId: 'leave' }).success, false);
+  assert.equal(invitationRevokeRequestSchema.safeParse({}).success, true);
+  assert.equal(invitationRevokeRequestSchema.safeParse({ userId }).success, false);
+  assert.equal(
+    internalInvitationRevokeRequestSchema.safeParse({ userId, reason: 'Wrong person' }).success,
+    true,
+  );
+  assert.equal(
+    invitationRevokeParamsSchema.safeParse({ vehicleId, invitationId: deviceId }).success,
+    true,
+  );
+});
+
+test('invitation and member list queries are bounded and strict', () => {
+  for (const schema of [vehicleInvitationListQuerySchema, receivedInvitationListQuerySchema]) {
+    assert.deepEqual(schema.parse({}), { limit: 20 });
+    assert.equal(schema.safeParse({ limit: '100' }).success, true);
+    assert.equal(schema.safeParse({ limit: '101' }).success, false);
+    assert.equal(schema.safeParse({ limit: '0' }).success, false);
+    assert.equal(schema.safeParse({ status: 'EXPIRED' }).success, true);
+    assert.equal(schema.safeParse({ status: 'DECLINED' }).success, false);
+    assert.equal(schema.safeParse({ cursor: 'a'.repeat(257) }).success, false);
+    assert.equal(schema.safeParse({ userId }).success, false);
+  }
+  assert.deepEqual(memberListQuerySchema.parse({}), { limit: 20 });
+  assert.equal(memberListQuerySchema.safeParse({ status: 'REVOKED' }).success, true);
+  assert.equal(memberListQuerySchema.safeParse({ status: 'PENDING' }).success, false);
+  assert.equal(memberListQuerySchema.safeParse({ userId }).success, false);
+  assert.equal(internalMemberListQuerySchema.safeParse({ userId, limit: '5' }).success, true);
+  assert.equal(
+    internalVehicleInvitationListQuerySchema.safeParse({ userId, status: 'PENDING' }).success,
+    true,
+  );
+  assert.equal(internalReceivedInvitationListQuerySchema.safeParse({}).success, false);
+  const adminView = {
+    invitationId: deviceId,
+    vehicleId,
+    inviterUserId: userId,
+    inviteeUserId: '507f1f77bcf86cd799439014',
+    permissions: ['vehicle:read'],
+    status: 'PENDING',
+    expiresAt: '2026-12-03T12:00:00.000Z',
+    createdAt: '2026-11-26T12:00:00.000Z',
+    acceptedAt: null,
+    revokedAt: null,
+    revokeReason: null,
+  };
+  assert.equal(invitationAdminViewSchema.safeParse(adminView).success, true);
+  assert.equal(invitationAdminViewSchema.safeParse({ ...adminView, id: deviceId }).success, false);
+  assert.equal(
+    vehicleInvitationListResponseSchema.safeParse({
+      invitations: [adminView],
+      page: { nextCursor: null },
+    }).success,
+    true,
+  );
+  const receivedView = {
+    invitationId: deviceId,
+    vehicleId,
+    vehicleName: 'Mazda',
+    permissions: ['vehicle:read'],
+    status: 'PENDING',
+    expiresAt: '2026-12-03T12:00:00.000Z',
+    createdAt: '2026-11-26T12:00:00.000Z',
+  };
+  assert.equal(receivedInvitationViewSchema.safeParse(receivedView).success, true);
+  assert.equal(
+    receivedInvitationViewSchema.safeParse({ ...receivedView, vehicleName: null }).success,
+    true,
+  );
+  assert.equal(
+    receivedInvitationViewSchema.safeParse({ ...receivedView, inviterUserId: userId }).success,
+    false,
+  );
+  assert.equal(
+    receivedInvitationListResponseSchema.safeParse({ invitations: [receivedView] }).success,
+    false,
+  );
+  assert.equal(
+    memberListResponseSchema.safeParse({ members: [], page: { nextCursor: 'eyJ2IjoxfQ' } }).success,
+    true,
+  );
+  assert.equal(
+    invitationRevokeResponseSchema.safeParse({
+      invitationId: deviceId,
+      status: 'REVOKED',
+      data: { ...adminView, status: 'REVOKED', revokedAt: adminView.createdAt },
+    }).success,
+    true,
+  );
+  assert.equal(
+    invitationCreateResponseSchema.safeParse({
+      invitationId: deviceId,
+      status: 'PENDING',
+      data: adminView,
+    }).success,
+    true,
   );
 });
 

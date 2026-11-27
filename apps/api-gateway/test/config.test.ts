@@ -34,6 +34,37 @@ test('gateway configuration rejects short secrets and invalid URLs', () => {
   );
 });
 
+test('gateway configuration validates the invitation issuance rate limits', () => {
+  const defaults = loadGatewayEnv(validEnvironment);
+  assert.equal(defaults.INVITATION_RATE_LIMIT_MAX, 10);
+  assert.equal(defaults.INVITATION_RATE_LIMIT_WINDOW_SECONDS, 60);
+  assert.equal(defaults.INVITATION_IP_RATE_LIMIT_MAX, 30);
+  const custom = loadGatewayEnv({
+    ...validEnvironment,
+    INVITATION_RATE_LIMIT_MAX: '1000',
+    INVITATION_RATE_LIMIT_WINDOW_SECONDS: '1',
+    INVITATION_IP_RATE_LIMIT_MAX: '1',
+  });
+  assert.equal(custom.INVITATION_RATE_LIMIT_MAX, 1000);
+  assert.equal(custom.INVITATION_RATE_LIMIT_WINDOW_SECONDS, 1);
+  assert.equal(custom.INVITATION_IP_RATE_LIMIT_MAX, 1);
+  for (const invalid of [
+    { INVITATION_RATE_LIMIT_MAX: '0' },
+    { INVITATION_RATE_LIMIT_MAX: '1001' },
+    { INVITATION_RATE_LIMIT_MAX: '2.5' },
+    { INVITATION_RATE_LIMIT_WINDOW_SECONDS: '0' },
+    { INVITATION_RATE_LIMIT_WINDOW_SECONDS: '86401' },
+    { INVITATION_IP_RATE_LIMIT_MAX: '0' },
+    { INVITATION_IP_RATE_LIMIT_MAX: 'many' },
+  ]) {
+    assert.throws(
+      () => loadGatewayEnv({ ...validEnvironment, ...invalid }),
+      GatewayConfigError,
+      JSON.stringify(invalid),
+    );
+  }
+});
+
 test('gateway configuration rejects unknown environment properties', () => {
   assert.throws(
     () => loadGatewayEnv({ ...validEnvironment, UNKNOWN_SETTING: 'unexpected' }),

@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto';
-import mongoose, { type ClientSession, type Model, type PipelineStage, Types } from 'mongoose';
+import mongoose, {
+  type ClientSession,
+  type Model,
+  type PipelineStage,
+  type QueryFilter,
+  Types,
+} from 'mongoose';
 import { z } from 'zod';
 import {
   VEHICLE_MUTABLE_FIELDS,
@@ -13,16 +19,22 @@ import { MembershipModel, type Membership } from '../models/membership.model.js'
 import {
   containsControlCharacter,
   DEFAULT_INVITATION_TTL_MS,
+  INVITATION_AUTHORITY_PERMISSIONS,
+  INVITATION_STATUSES,
   isAccessGrantPermissionForScope,
   isDelegableMembershipPermission,
   isKnownPermission,
   isOwnerReservedPermission,
+  MEMBER_DELEGABLE_INVITATION_PERMISSIONS,
+  MEMBERSHIP_STATUSES,
   normalizeOptionalText,
   MEMBERSHIP_ROLES,
   validatePermissionSet,
   type AccessGrantChannel,
   type AccessGrantScopeType,
+  type InvitationStatus,
   type MembershipRole,
+  type MembershipStatus,
 } from '../models/vehicle-constants.js';
 import { VehicleModel, type Vehicle } from '../models/vehicle.model.js';
 
@@ -75,6 +87,7 @@ type VehicleFieldChanges = Partial<
 
 type VehicleRecord = Vehicle & { _id: Types.ObjectId };
 type MembershipRecord = Membership & { _id: Types.ObjectId };
+type InvitationRecord = Invitation & { _id: Types.ObjectId };
 
 const VERIFIED_RESOURCE_BINDING_BRAND: unique symbol = Symbol('VerifiedExternalResourceBinding');
 
@@ -478,8 +491,33 @@ async function lockVerifiedActiveVehicle(
     actorUserId?: Types.ObjectId;
   } = {},
 ): Promise<(Vehicle & { _id: Types.ObjectId }) | null> {
+  return (await lockVerifiedActiveVehicleWithOwner(vehicleId, session, options))?.vehicle ?? null;
+}
+
+interface LockedVehicle {
+  vehicle: VehicleRecord;
+  ownerMembership: MembershipRecord;
+}
+
+/** Same barrier as `lockVerifiedActiveVehicle`, also returning the canonical OWNER membership. */
+async function lockVerifiedActiveVehicleWithOwner(
+  vehicleId: Types.ObjectId,
+  session: ClientSession | undefined,
+  options: {
+    now?: Date;
+    audit?: VehicleAuditLogger;
+    actorUserId?: Types.ObjectId;
+  } = {},
+): Promise<LockedVehicle | null> {
   if (!session) {
-    return loadVerifiedActiveVehicle(vehicleId, options);
+    const vehicle = await loadVerifiedActiveVehicle(vehicleId, options);
+    if (!vehicle) {
+      return null;
+    }
+    const ownerMembership = (await loadOwnerMembershipsByVehicle([vehicleId])).get(
+      String(vehicleId),
+    )?.[0];
+    return ownerMembership ? { vehicle, ownerMembership } : null;
   }
 
   const audit = options.audit ?? defaultAuditLogger;
@@ -503,7 +541,7 @@ async function lockVerifiedActiveVehicle(
     return null;
   }
 
-  const lockedOwner = await MembershipModel.findOneAndUpdate(
+  const lockedOwner = (await MembershipModel.findOneAndUpdate(
     {
       _id: ownerRecord._id,
       vehicleId,
@@ -515,13 +553,13 @@ async function lockVerifiedActiveVehicle(
     },
     { $set: { updatedAt: now } },
     { returnDocument: 'after', session },
-  ).lean();
+  ).lean()) as MembershipRecord | null;
 
   if (!lockedOwner) {
     return null;
   }
 
-  return lockedVehicle;
+  return { vehicle: lockedVehicle, ownerMembership: lockedOwner };
 }
 
 export async function createVehicle(
@@ -969,11 +1007,8 @@ function encodeVehicleListCursor(
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 
-function decodeVehicleListCursor(
-  cursor: string,
-  userId: Types.ObjectId,
-  role: VehicleListRoleFilter,
-): VehicleListPosition {
+/** Strict base64url JSON decoding shared by every keyset cursor; any anomaly is rejected. */
+function decodeCursorJson(cursor: string): unknown {
   if (
     typeof cursor !== 'string' ||
     cursor.length < 1 ||
@@ -986,20 +1021,31 @@ function decodeVehicleListCursor(
   if (bytes.toString('base64url') !== cursor) {
     throw invalidVehicleCursor();
   }
-  let decoded: unknown;
   try {
-    decoded = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
   } catch {
     throw invalidVehicleCursor();
   }
-  const parsed = vehicleListCursorPayloadSchema.safeParse(decoded);
+}
+
+function decodeCursorTimestamp(value: string): Date {
+  const createdAt = new Date(value);
+  if (Number.isNaN(createdAt.getTime()) || createdAt.toISOString() !== value) {
+    throw invalidVehicleCursor();
+  }
+  return createdAt;
+}
+
+function decodeVehicleListCursor(
+  cursor: string,
+  userId: Types.ObjectId,
+  role: VehicleListRoleFilter,
+): VehicleListPosition {
+  const parsed = vehicleListCursorPayloadSchema.safeParse(decodeCursorJson(cursor));
   if (!parsed.success) {
     throw invalidVehicleCursor();
   }
-  const createdAt = new Date(parsed.data.c);
-  if (Number.isNaN(createdAt.getTime()) || createdAt.toISOString() !== parsed.data.c) {
-    throw invalidVehicleCursor();
-  }
+  const createdAt = decodeCursorTimestamp(parsed.data.c);
   if (parsed.data.u !== vehicleCursorUserBinding(userId) || parsed.data.r !== role) {
     throw invalidVehicleCursor();
   }
@@ -1255,7 +1301,13 @@ async function resolveVehicleRelation(
     : { kind: 'READER', vehicle, membership };
 }
 
-type OwnerMutationAction = 'vehicle.update' | 'vehicle.archive';
+type OwnerMutationAction =
+  | 'vehicle.update'
+  | 'vehicle.archive'
+  | 'membership.update'
+  | 'membership.suspend'
+  | 'membership.reactivate'
+  | 'membership.revoke';
 
 /**
  * Central translation of non-owner relations into domain errors for owner-only mutations:
@@ -1318,45 +1370,231 @@ export async function getVehicleForUser(
   return relation.kind === 'OWNER' || relation.kind === 'READER' ? relation.vehicle : null;
 }
 
+// ---------------------------------------------------------------------------
+// Invitations and membership administration
+// ---------------------------------------------------------------------------
+
+/** Revocation reason for invitations whose issuer no longer holds the delegated authority. */
+export const INVITATION_ISSUER_AUTHORITY_LOST_REASON = 'issuer_authority_lost';
+/** Revocation reason of a membership ended by its own holder. */
+export const MEMBER_LEFT_REASON = 'member_left';
+
+const memberDelegableInvitationSet = new Set<string>(MEMBER_DELEGABLE_INVITATION_PERMISSIONS);
+
+function holdsInvitationAuthority(permissions: readonly string[]): boolean {
+  return INVITATION_AUTHORITY_PERMISSIONS.some((permission) => permissions.includes(permission));
+}
+
+/** A MEMBER may only delegate member-delegable permissions held directly in their membership. */
+function isMemberDelegationAllowed(
+  permissions: readonly string[],
+  issuerPermissions: readonly string[],
+): boolean {
+  return permissions.every(
+    (permission) =>
+      memberDelegableInvitationSet.has(permission) && issuerPermissions.includes(permission),
+  );
+}
+
+type InvitationIssuerResolution =
+  | { kind: 'OWNER'; vehicle: VehicleRecord; membership: MembershipRecord }
+  | { kind: 'DELEGATE'; vehicle: VehicleRecord; membership: MembershipRecord }
+  | { kind: 'VISIBLE_WITHOUT_AUTHORITY' }
+  | { kind: 'NONE' };
+
 /**
- * Read-only invitation authorization mirroring the in-transaction check of `inviteMember`:
- * the canonical OWNER, or an ACTIVE MEMBER holding `vehicle:manage` or `invitation:create`.
+ * Read-only issuer resolution: the canonical OWNER, or an ACTIVE MEMBER holding
+ * `vehicle:manage` / `invitation:create` directly (AccessGrants never confer it). Callers
+ * without authority are split into visible readers (FORBIDDEN) and everyone else (NOT_FOUND).
  */
-async function authorizeInvitationIssuer(
+async function resolveInvitationIssuer(
   vehicleId: Types.ObjectId,
-  inviterUserId: Types.ObjectId,
-  audit: VehicleAuditLogger,
-): Promise<'ALLOWED' | 'DENIED' | 'VEHICLE_UNAVAILABLE'> {
+  actorUserId: Types.ObjectId,
+  options: { now: Date; audit: VehicleAuditLogger },
+): Promise<InvitationIssuerResolution> {
   const vehicle = await loadVerifiedActiveVehicle(vehicleId, {
-    audit,
-    actorUserId: inviterUserId,
+    audit: options.audit,
+    actorUserId,
   });
   if (!vehicle) {
-    return 'VEHICLE_UNAVAILABLE';
-  }
-  if (vehicle.ownerUserId.equals(inviterUserId)) {
-    return 'ALLOWED';
+    return { kind: 'NONE' };
   }
   const membership = (await MembershipModel.findOne({
     vehicleId,
-    userId: inviterUserId,
-    role: 'MEMBER',
+    userId: actorUserId,
     ...ACTIVE_MEMBERSHIP_CRITERIA,
   }).lean()) as MembershipRecord | null;
-  return membership !== null &&
-    (membership.permissions.includes('vehicle:manage') ||
-      membership.permissions.includes('invitation:create'))
-    ? 'ALLOWED'
-    : 'DENIED';
+  if (!membership) {
+    return { kind: 'NONE' };
+  }
+  const isOwner = vehicle.ownerUserId.equals(actorUserId);
+  if (membership.role === 'OWNER') {
+    return isOwner ? { kind: 'OWNER', vehicle, membership } : { kind: 'NONE' };
+  }
+  if (isOwner) {
+    return { kind: 'NONE' };
+  }
+  if (holdsInvitationAuthority(membership.permissions)) {
+    return { kind: 'DELEGATE', vehicle, membership };
+  }
+  const [readable] = await filterReadableVehicleCandidates(
+    actorUserId,
+    [{ vehicle, membership }],
+    options.now,
+  );
+  return readable ? { kind: 'VISIBLE_WITHOUT_AUTHORITY' } : { kind: 'NONE' };
 }
 
+/**
+ * Whether the issuer of a PENDING invitation still holds the authority it was issued with.
+ * Owner invitations stay valid while bound to the canonical OWNER membership (or unbound legacy
+ * documents). Delegate invitations require the exact issuing membership to remain ACTIVE, keep
+ * invitation authority, and still hold every delegated permission directly; a new membership of
+ * the same user never revalidates them. Unbound legacy delegate invitations fail closed.
+ */
+function isInvitationIssuerAuthorityCurrent(
+  invitation: InvitationRecord,
+  locked: LockedVehicle,
+  issuerMembership: MembershipRecord | null,
+): boolean {
+  const issuerMembershipId = invitation.issuerMembershipId ?? null;
+  if (locked.vehicle.ownerUserId.equals(invitation.inviterUserId)) {
+    return issuerMembershipId === null || issuerMembershipId.equals(locked.ownerMembership._id);
+  }
+  if (issuerMembershipId === null || issuerMembership === null) {
+    return false;
+  }
+  return (
+    issuerMembership._id.equals(issuerMembershipId) &&
+    issuerMembership.vehicleId.equals(invitation.vehicleId) &&
+    issuerMembership.userId.equals(invitation.inviterUserId) &&
+    issuerMembership.role === 'MEMBER' &&
+    issuerMembership.status === 'ACTIVE' &&
+    issuerMembership.suspendedAt === null &&
+    issuerMembership.revokedAt === null &&
+    holdsInvitationAuthority(issuerMembership.permissions) &&
+    isMemberDelegationAllowed(invitation.permissions, issuerMembership.permissions)
+  );
+}
+
+type InvitationFilter = QueryFilter<Invitation>;
+
+async function persistElapsedInvitations(
+  filter: InvitationFilter,
+  now: Date,
+  session?: ClientSession,
+): Promise<void> {
+  await InvitationModel.updateMany(
+    { $and: [filter, { status: 'PENDING', expiresAt: { $lte: now } }] },
+    { $set: { status: 'EXPIRED', expiredAt: now } },
+    { session },
+  );
+}
+
+/**
+ * PENDING invitations issued through `membership`, including unbound legacy invitations of the
+ * same non-owner user (which can never be accepted). Elapsed ones become EXPIRED; the rest are
+ * REVOKED with `issuer_authority_lost`. `extraFilter` narrows the revoked subset.
+ */
+async function revokeIssuedInvitations(
+  session: ClientSession | undefined,
+  input: {
+    vehicleId: Types.ObjectId;
+    membership: MembershipRecord;
+    actorUserId: Types.ObjectId;
+    now: Date;
+    extraFilter?: InvitationFilter;
+  },
+): Promise<number> {
+  const issued: InvitationFilter = {
+    vehicleId: input.vehicleId,
+    status: 'PENDING',
+    $or: [
+      { issuerMembershipId: input.membership._id },
+      { issuerMembershipId: null, inviterUserId: input.membership.userId },
+    ],
+  };
+  await InvitationModel.updateMany(
+    { $and: [issued, { expiresAt: { $lte: input.now } }] },
+    { $set: { status: 'EXPIRED', expiredAt: input.now } },
+    { session },
+  );
+  const revoked = await InvitationModel.updateMany(
+    { $and: [issued, { expiresAt: { $gt: input.now } }, input.extraFilter ?? {}] },
+    {
+      $set: {
+        status: 'REVOKED',
+        revokedAt: input.now,
+        revokedByUserId: input.actorUserId,
+        revokeReason: INVITATION_ISSUER_AUTHORITY_LOST_REASON,
+        updatedByUserId: input.actorUserId,
+      },
+    },
+    { session },
+  );
+  return revoked.modifiedCount;
+}
+
+/** Elapsed AccessGrants of the membership become EXPIRED; the remaining ACTIVE ones REVOKED. */
+async function revokeMembershipGrants(
+  session: ClientSession | undefined,
+  input: {
+    vehicleId: Types.ObjectId;
+    membershipId: Types.ObjectId;
+    actorUserId: Types.ObjectId;
+    now: Date;
+    reason: string;
+  },
+): Promise<number> {
+  const scope = {
+    vehicleId: input.vehicleId,
+    membershipId: input.membershipId,
+    status: 'ACTIVE' as const,
+  };
+  await AccessGrantModel.updateMany(
+    { ...scope, expiresAt: { $ne: null, $lte: input.now } },
+    { $set: { status: 'EXPIRED', expiredAt: input.now } },
+    { session },
+  );
+  const revoked = await AccessGrantModel.updateMany(
+    { ...scope, revokedAt: null },
+    {
+      $set: {
+        status: 'REVOKED',
+        revokedAt: input.now,
+        revokedByUserId: input.actorUserId,
+        revokeReason: input.reason,
+        updatedByUserId: input.actorUserId,
+      },
+    },
+    { session },
+  );
+  return revoked.modifiedCount;
+}
+
+export interface InviteMemberOptions {
+  ttlMs?: number;
+  now?: Date;
+  audit?: VehicleAuditLogger;
+  /**
+   * Recipient existence check (Identity). Invoked only after the issuer is authorized and the
+   * delegated permissions are validated, so unauthorized callers never trigger a lookup.
+   */
+  confirmInviteeExists?: () => Promise<boolean>;
+}
+
+/**
+ * Issues a MEMBER invitation. Returns null when the vehicle is not visible to the issuer.
+ * Duplicate valid PENDING invitations are a CONFLICT and are never overwritten; to change an
+ * invitation it must be revoked and issued again.
+ */
 export async function inviteMember(
   vehicleId: Types.ObjectId,
   inviterUserId: Types.ObjectId,
   inviteeUserId: Types.ObjectId,
   permissions: string[],
-  options: { ttlMs?: number; now?: Date; audit?: VehicleAuditLogger } = {},
-): Promise<(Invitation & { _id: Types.ObjectId }) | null> {
+  options: InviteMemberOptions = {},
+): Promise<InvitationRecord | null> {
   const audit = options.audit ?? defaultAuditLogger;
   const now = options.now ?? new Date();
   const ttlMs = options.ttlMs ?? DEFAULT_INVITATION_TTL_MS;
@@ -1364,11 +1602,9 @@ export async function inviteMember(
   if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
     throw new VehicleServiceError('VALIDATION_ERROR', 'Invalid invitation TTL');
   }
-
   if (inviterUserId.equals(inviteeUserId)) {
     throw new VehicleServiceError('VALIDATION_ERROR', 'Self-invitations are not allowed');
   }
-
   if (
     !validatePermissionSet(permissions, {
       maxItems: 100,
@@ -1381,102 +1617,100 @@ export async function inviteMember(
     );
   }
 
-  const preAuthorization = await authorizeInvitationIssuer(vehicleId, inviterUserId, audit);
-  if (preAuthorization !== 'ALLOWED') {
-    if (preAuthorization === 'DENIED') {
-      audit({
-        action: 'invitation.create',
-        actorUserId: String(inviterUserId),
-        vehicleId: String(vehicleId),
-        targetId: String(inviteeUserId),
-        outcome: 'denied',
-        reason: 'insufficient_permissions',
-      });
-    }
+  const record = (outcome: VehicleAuditEvent['outcome'], reason?: string): void =>
+    audit({
+      action: 'invitation.create',
+      actorUserId: String(inviterUserId),
+      vehicleId: String(vehicleId),
+      targetId: String(inviteeUserId),
+      outcome,
+      reason,
+    });
+
+  const issuer = await resolveInvitationIssuer(vehicleId, inviterUserId, { now, audit });
+  if (issuer.kind === 'NONE') {
+    record('denied', 'vehicle_not_visible');
     return null;
   }
+  if (issuer.kind === 'VISIBLE_WITHOUT_AUTHORITY') {
+    record('denied', 'insufficient_permissions');
+    throw new VehicleServiceError('FORBIDDEN', 'Insufficient permissions to invite members');
+  }
+  if (
+    issuer.kind === 'DELEGATE' &&
+    !isMemberDelegationAllowed(permissions, issuer.membership.permissions)
+  ) {
+    record('denied', 'delegation_not_allowed');
+    throw new VehicleServiceError(
+      'FORBIDDEN',
+      'Members may only delegate vehicle:read, device:read or module:read permissions they hold directly',
+    );
+  }
 
-  // Persist transition of any elapsed PENDING invitations BEFORE starting an abortable
-  // transaction so EXPIRED history is preserved even if domain validation/conflicts fail.
-  // Only reached by authorized issuers; the transaction re-checks authorization under lock.
-  await InvitationModel.updateMany(
-    {
-      vehicleId,
-      inviteeUserId,
-      status: 'PENDING',
-      expiresAt: { $lte: now },
-    },
-    {
-      $set: {
-        status: 'EXPIRED',
-        expiredAt: now,
-      },
-    },
-  );
+  if (options.confirmInviteeExists && !(await options.confirmInviteeExists())) {
+    record('denied', 'invitee_not_found');
+    throw new VehicleServiceError('NOT_FOUND', 'User not found');
+  }
+
+  // Durable EXPIRED transition outside the abortable transaction; only authorized issuers get here.
+  await persistElapsedInvitations({ vehicleId, inviteeUserId }, now);
 
   const expiresAt = new Date(now.getTime() + ttlMs);
 
+  let invitation: InvitationRecord;
   try {
-    const outcome = await runInVehicleTransaction(async (session) => {
-      const vehicle = await lockVerifiedActiveVehicle(vehicleId, session, {
+    invitation = await runInVehicleTransaction(async (session) => {
+      const locked = await lockVerifiedActiveVehicleWithOwner(vehicleId, session, {
         now,
         actorUserId: inviterUserId,
         audit,
       });
-      if (!vehicle) {
-        return null;
+      if (!locked) {
+        throw new TransactionAbortDomainError('REJECT_NULL', 'vehicle_unavailable');
       }
 
-      if (!vehicle.ownerUserId.equals(inviterUserId)) {
-        const inviterMembership = session
-          ? ((await MembershipModel.findOneAndUpdate(
-              {
-                vehicleId,
-                userId: inviterUserId,
-                role: 'MEMBER',
-                status: 'ACTIVE',
-                suspendedAt: null,
-                revokedAt: null,
-              },
-              { $set: { updatedAt: now } },
-              { returnDocument: 'after', session },
-            ).lean()) as (Membership & { _id: Types.ObjectId }) | null)
-          : ((await MembershipModel.findOne({
-              vehicleId,
-              userId: inviterUserId,
-              role: 'MEMBER',
-              status: 'ACTIVE',
-              suspendedAt: null,
-              revokedAt: null,
-            }).lean()) as (Membership & { _id: Types.ObjectId }) | null);
-
-        const canInviteViaMembership =
-          inviterMembership !== null &&
-          (inviterMembership.permissions.includes('vehicle:manage') ||
-            inviterMembership.permissions.includes('invitation:create'));
-
-        if (!canInviteViaMembership) {
-          throw new TransactionAbortDomainError('REJECT_NULL', 'insufficient_permissions');
+      let issuerMembershipId: Types.ObjectId;
+      let issuedByDelegate = false;
+      if (locked.vehicle.ownerUserId.equals(inviterUserId)) {
+        issuerMembershipId = locked.ownerMembership._id;
+      } else {
+        // Conditional write on the issuing membership: serializes against concurrent
+        // suspension, revocation, or permission changes of the issuer.
+        const issuerMembership = (await MembershipModel.findOneAndUpdate(
+          { vehicleId, userId: inviterUserId, role: 'MEMBER', ...ACTIVE_MEMBERSHIP_CRITERIA },
+          { $set: { updatedAt: now } },
+          { returnDocument: 'after', session },
+        ).lean()) as MembershipRecord | null;
+        if (!issuerMembership || !holdsInvitationAuthority(issuerMembership.permissions)) {
+          throw new TransactionAbortDomainError(
+            'FORBIDDEN',
+            'Insufficient permissions to invite members',
+          );
         }
+        if (!isMemberDelegationAllowed(permissions, issuerMembership.permissions)) {
+          throw new TransactionAbortDomainError(
+            'FORBIDDEN',
+            'Members may only delegate vehicle:read, device:read or module:read permissions they hold directly',
+          );
+        }
+        issuerMembershipId = issuerMembership._id;
+        issuedByDelegate = true;
       }
 
-      if (vehicle.ownerUserId.equals(inviteeUserId)) {
+      if (locked.vehicle.ownerUserId.equals(inviteeUserId)) {
         throw new TransactionAbortDomainError(
           'CONFLICT',
           'Vehicle owner cannot be invited as a member',
         );
       }
 
-      const existingMembershipQuery = MembershipModel.findOne({
+      const existingMembership = await MembershipModel.findOne({
         vehicleId,
         userId: inviteeUserId,
         revokedAt: null,
-      });
-      if (session) {
-        existingMembershipQuery.session(session);
-      }
-      const existingMembership = await existingMembershipQuery.lean();
-
+      })
+        .session(session ?? null)
+        .lean();
       if (existingMembership) {
         throw new TransactionAbortDomainError(
           'CONFLICT',
@@ -1484,28 +1718,31 @@ export async function inviteMember(
         );
       }
 
-      const updateQuery = InvitationModel.findOneAndUpdate(
-        {
+      if (issuedByDelegate) {
+        const previouslyRevoked = await MembershipModel.exists({
           vehicleId,
-          inviteeUserId,
-          status: 'PENDING',
-          expiresAt: { $gt: now },
-        },
-        {
-          $set: {
-            permissions,
-            expiresAt,
-            updatedByUserId: inviterUserId,
-          },
-        },
-        { returnDocument: 'after', runValidators: true, session },
-      );
+          userId: inviteeUserId,
+          status: 'REVOKED',
+        }).session(session ?? null);
+        if (previouslyRevoked) {
+          throw new TransactionAbortDomainError(
+            'FORBIDDEN',
+            'Only the vehicle owner may invite a user whose membership was revoked',
+          );
+        }
+      }
 
-      const updatedExistingPending = (await updateQuery.lean()) as
-        (Invitation & { _id: Types.ObjectId }) | null;
-
-      if (updatedExistingPending) {
-        return { invitation: updatedExistingPending, refreshed: true };
+      await persistElapsedInvitations({ vehicleId, inviteeUserId }, now, session);
+      const pending = await InvitationModel.exists({
+        vehicleId,
+        inviteeUserId,
+        status: 'PENDING',
+      }).session(session ?? null);
+      if (pending) {
+        throw new TransactionAbortDomainError(
+          'CONFLICT',
+          'A pending invitation already exists for this user',
+        );
       }
 
       const created = await createDocumentWithSession(
@@ -1514,6 +1751,7 @@ export async function inviteMember(
           vehicleId,
           inviterUserId,
           inviteeUserId,
+          issuerMembershipId,
           targetRole: 'MEMBER',
           permissions,
           status: 'PENDING',
@@ -1528,116 +1766,182 @@ export async function inviteMember(
         },
         session,
       );
-
-      const invitation = (
+      return (
         typeof created.toObject === 'function' ? created.toObject() : created
-      ) as Invitation & { _id: Types.ObjectId };
-
-      return { invitation, refreshed: false };
+      ) as InvitationRecord;
     });
-
-    if (!outcome) {
-      return null;
-    }
-
-    audit({
-      action: outcome.refreshed ? 'invitation.refresh_pending' : 'invitation.create',
-      actorUserId: String(inviterUserId),
-      vehicleId: String(vehicleId),
-      targetId: String(outcome.invitation._id),
-      outcome: 'success',
-    });
-
-    return outcome.invitation;
   } catch (error) {
     if (error instanceof TransactionAbortDomainError) {
       if (error.code === 'REJECT_NULL') {
-        audit({
-          action: 'invitation.create',
-          actorUserId: String(inviterUserId),
-          vehicleId: String(vehicleId),
-          targetId: String(inviteeUserId),
-          outcome: 'denied',
-          reason: error.message,
-        });
+        record('denied', error.message);
         return null;
       }
-      audit({
-        action: 'invitation.create',
-        actorUserId: String(inviterUserId),
-        vehicleId: String(vehicleId),
-        targetId: String(inviteeUserId),
-        outcome: 'conflict',
-        reason: error.message,
-      });
+      record(error.code === 'CONFLICT' ? 'conflict' : 'denied', error.message);
       throw new VehicleServiceError(error.code, error.message);
     }
     if (isDuplicateKeyError(error)) {
-      const concurrent = (await InvitationModel.findOne({
-        vehicleId,
-        inviteeUserId,
-        status: 'PENDING',
-        expiresAt: { $gt: now },
-      }).lean()) as (Invitation & { _id: Types.ObjectId }) | null;
-      if (concurrent) {
-        const activeVehicle = await loadVerifiedActiveVehicle(vehicleId, {
-          actorUserId: inviterUserId,
-        });
-        if (activeVehicle) {
-          return concurrent;
-        }
-        return null;
-      }
-      throw new VehicleServiceError('CONFLICT', 'Concurrent pending invitation conflict', {
-        cause: error,
-      });
+      record('conflict', 'concurrent_pending_invitation');
+      throw new VehicleServiceError(
+        'CONFLICT',
+        'A pending invitation already exists for this user',
+        {
+          cause: error,
+        },
+      );
     }
     throw error;
   }
+
+  audit({
+    action: 'invitation.create',
+    actorUserId: String(inviterUserId),
+    vehicleId: String(vehicleId),
+    targetId: String(invitation._id),
+    outcome: 'success',
+  });
+  return invitation;
 }
 
+type AcceptInvitationOutcome =
+  | { kind: 'NOT_FOUND' }
+  | { kind: 'AUTHORITY_LOST'; vehicleId: Types.ObjectId }
+  | { kind: 'ACCEPTED'; membership: MembershipRecord };
+
+/**
+ * Accepts the caller's own invitation. Returns null for inexistent, foreign, or invisible
+ * invitations. Own non-pending or elapsed invitations raise CONFLICT (elapsed ones are durably
+ * persisted as EXPIRED first). When the issuer no longer holds the delegated authority, the
+ * invitation is durably REVOKED with `issuer_authority_lost` in a committed transaction and
+ * the acceptance is rejected with CONFLICT.
+ */
 export async function acceptInvitation(
   invitationId: Types.ObjectId,
   userId: Types.ObjectId,
   options: { now?: Date; audit?: VehicleAuditLogger } = {},
-): Promise<(Membership & { _id: Types.ObjectId }) | null> {
+): Promise<MembershipRecord | null> {
   const audit = options.audit ?? defaultAuditLogger;
   const now = options.now ?? new Date();
-
-  // Persist EXPIRED outside the acceptance transaction so it is never lost on rollback.
-  const newlyExpired = await InvitationModel.findOneAndUpdate(
-    {
-      _id: invitationId,
-      inviteeUserId: userId,
-      status: 'PENDING',
-      expiresAt: { $lte: now },
-    },
-    {
-      $set: {
-        status: 'EXPIRED',
-        expiredAt: now,
-      },
-    },
-    { returnDocument: 'after' },
-  ).lean();
-
-  if (newlyExpired) {
+  const record = (
+    vehicleId: Types.ObjectId | undefined,
+    outcome: VehicleAuditEvent['outcome'],
+    reason?: string,
+  ): void =>
     audit({
       action: 'invitation.accept',
       actorUserId: String(userId),
-      vehicleId: String(newlyExpired.vehicleId),
+      vehicleId: vehicleId ? String(vehicleId) : undefined,
       targetId: String(invitationId),
-      outcome: 'denied',
-      reason: 'invitation_expired',
+      outcome,
+      reason,
     });
-    return null;
+
+  // Persist EXPIRED outside the acceptance transaction so it is never lost on rollback.
+  const newlyExpired = (await InvitationModel.findOneAndUpdate(
+    { _id: invitationId, inviteeUserId: userId, status: 'PENDING', expiresAt: { $lte: now } },
+    { $set: { status: 'EXPIRED', expiredAt: now } },
+    { returnDocument: 'after' },
+  ).lean()) as InvitationRecord | null;
+  if (newlyExpired) {
+    record(newlyExpired.vehicleId, 'conflict', 'invitation_expired');
+    throw new VehicleServiceError('CONFLICT', 'Invitation is no longer pending');
   }
 
+  let outcome: AcceptInvitationOutcome;
   try {
-    const createdMembership = await runInVehicleTransaction(async (session) => {
-      const claimQuery = InvitationModel.findOneAndUpdate(
+    outcome = await runInVehicleTransaction(async (session): Promise<AcceptInvitationOutcome> => {
+      const invitation = (await InvitationModel.findOne({
+        _id: invitationId,
+        inviteeUserId: userId,
+      })
+        .session(session ?? null)
+        .lean()) as InvitationRecord | null;
+      if (!invitation) {
+        return { kind: 'NOT_FOUND' };
+      }
+      if (invitation.status !== 'PENDING' || invitation.expiresAt.getTime() <= now.getTime()) {
+        throw new TransactionAbortDomainError('CONFLICT', 'Invitation is no longer pending');
+      }
+      if (
+        invitation.targetRole !== 'MEMBER' ||
+        !validatePermissionSet(invitation.permissions, {
+          maxItems: 100,
+          allowPermission: isDelegableMembershipPermission,
+        })
+      ) {
+        throw new TransactionAbortDomainError(
+          'VALIDATION_ERROR',
+          'Invitation contains invalid role or permissions',
+        );
+      }
+
+      const locked = await lockVerifiedActiveVehicleWithOwner(invitation.vehicleId, session, {
+        now,
+        actorUserId: userId,
+        audit,
+      });
+      if (!locked) {
+        return { kind: 'NOT_FOUND' };
+      }
+      if (locked.vehicle.ownerUserId.equals(userId)) {
+        throw new TransactionAbortDomainError(
+          'CONFLICT',
+          'Canonical vehicle owner cannot accept a member invitation',
+        );
+      }
+
+      const issuerMembershipId = invitation.issuerMembershipId ?? null;
+      const issuerMembership =
+        issuerMembershipId !== null && !locked.vehicle.ownerUserId.equals(invitation.inviterUserId)
+          ? ((await MembershipModel.findOne({ _id: issuerMembershipId })
+              .session(session ?? null)
+              .lean()) as MembershipRecord | null)
+          : null;
+      if (!isInvitationIssuerAuthorityCurrent(invitation, locked, issuerMembership)) {
+        // Committed (not aborted) so the revocation survives the rejected acceptance.
+        const revoked = await InvitationModel.findOneAndUpdate(
+          {
+            _id: invitation._id,
+            inviteeUserId: userId,
+            status: 'PENDING',
+            expiresAt: { $gt: now },
+          },
+          {
+            $set: {
+              status: 'REVOKED',
+              revokedAt: now,
+              revokedByUserId: userId,
+              revokeReason: INVITATION_ISSUER_AUTHORITY_LOST_REASON,
+              updatedByUserId: userId,
+            },
+          },
+          { returnDocument: 'after', runValidators: true, session },
+        ).lean();
+        if (!revoked) {
+          throw new TransactionAbortDomainError(
+            'CONFLICT',
+            'Concurrent state change prevented invitation acceptance',
+          );
+        }
+        return { kind: 'AUTHORITY_LOST', vehicleId: invitation.vehicleId };
+      }
+
+      const existingMembership = await MembershipModel.findOne({
+        vehicleId: invitation.vehicleId,
+        userId,
+        revokedAt: null,
+      })
+        .session(session ?? null)
+        .lean();
+      if (existingMembership) {
+        throw new TransactionAbortDomainError(
+          'CONFLICT',
+          'User already holds a non-revoked membership for this vehicle',
+        );
+      }
+
+      const claimed = await InvitationModel.findOneAndUpdate(
         {
-          _id: invitationId,
+          _id: invitation._id,
           inviteeUserId: userId,
           targetRole: 'MEMBER',
           status: 'PENDING',
@@ -1652,58 +1956,11 @@ export async function acceptInvitation(
           },
         },
         { returnDocument: 'after', runValidators: true, session },
-      );
-
-      const invitation = (await claimQuery.lean()) as (Invitation & { _id: Types.ObjectId }) | null;
-      if (!invitation) {
-        return null;
-      }
-
-      if (
-        invitation.targetRole !== 'MEMBER' ||
-        !validatePermissionSet(invitation.permissions, {
-          maxItems: 100,
-          allowPermission: isDelegableMembershipPermission,
-        })
-      ) {
-        throw new TransactionAbortDomainError(
-          'VALIDATION_ERROR',
-          'Invitation contains invalid role or permissions',
-        );
-      }
-
-      const vehicle = await lockVerifiedActiveVehicle(invitation.vehicleId, session, {
-        now,
-        actorUserId: userId,
-        audit,
-      });
-      if (!vehicle) {
-        throw new TransactionAbortDomainError(
-          'REJECT_NULL',
-          'Target vehicle is unavailable, archived, or ownership-inconsistent',
-        );
-      }
-
-      if (vehicle.ownerUserId.equals(userId)) {
+      ).lean();
+      if (!claimed) {
         throw new TransactionAbortDomainError(
           'CONFLICT',
-          'Canonical vehicle owner cannot accept a member invitation',
-        );
-      }
-
-      const existingMembershipQuery = MembershipModel.findOne({
-        vehicleId: invitation.vehicleId,
-        userId,
-        revokedAt: null,
-      });
-      if (session) {
-        existingMembershipQuery.session(session);
-      }
-      const existingMembership = await existingMembershipQuery.lean();
-      if (existingMembership) {
-        throw new TransactionAbortDomainError(
-          'CONFLICT',
-          'User already holds a non-revoked membership for this vehicle',
+          'Concurrent state change prevented invitation acceptance',
         );
       }
 
@@ -1727,31 +1984,23 @@ export async function acceptInvitation(
         },
         session,
       );
-
-      return (
-        typeof membershipDoc.toObject === 'function' ? membershipDoc.toObject() : membershipDoc
-      ) as Membership & { _id: Types.ObjectId };
+      return {
+        kind: 'ACCEPTED',
+        membership: (typeof membershipDoc.toObject === 'function'
+          ? membershipDoc.toObject()
+          : membershipDoc) as MembershipRecord,
+      };
     });
-
-    if (createdMembership) {
-      audit({
-        action: 'invitation.accept',
-        actorUserId: String(userId),
-        vehicleId: String(createdMembership.vehicleId),
-        targetId: String(invitationId),
-        outcome: 'success',
-      });
-    }
-
-    return createdMembership;
   } catch (error) {
     if (error instanceof TransactionAbortDomainError) {
+      record(undefined, error.code === 'CONFLICT' ? 'conflict' : 'denied', error.message);
       if (error.code === 'REJECT_NULL') {
         return null;
       }
       throw new VehicleServiceError(error.code, error.message);
     }
     if (isDuplicateKeyError(error)) {
+      record(undefined, 'conflict', 'concurrent_membership_creation');
       throw new VehicleServiceError(
         'CONFLICT',
         'Concurrent membership creation conflict during invitation acceptance',
@@ -1760,8 +2009,41 @@ export async function acceptInvitation(
     }
     throw error;
   }
+
+  if (outcome.kind === 'NOT_FOUND') {
+    record(undefined, 'denied', 'invitation_not_visible');
+    return null;
+  }
+  if (outcome.kind === 'AUTHORITY_LOST') {
+    audit({
+      action: 'invitation.revoke',
+      actorUserId: String(userId),
+      vehicleId: String(outcome.vehicleId),
+      targetId: String(invitationId),
+      outcome: 'success',
+      reason: INVITATION_ISSUER_AUTHORITY_LOST_REASON,
+    });
+    record(outcome.vehicleId, 'conflict', INVITATION_ISSUER_AUTHORITY_LOST_REASON);
+    throw new VehicleServiceError(
+      'CONFLICT',
+      'The invitation issuer no longer holds the required authority; the invitation was revoked',
+    );
+  }
+  record(outcome.membership.vehicleId, 'success');
+  return outcome.membership;
 }
 
+export interface RevokeInvitationResult {
+  invitation: InvitationRecord;
+  /** True when the invitation was already REVOKED; the original record is returned unchanged. */
+  alreadyRevoked: boolean;
+}
+
+/**
+ * Revokes a PENDING invitation. The OWNER may revoke any invitation of the vehicle; an
+ * authorized delegate only those issued through their current membership. Anything else is
+ * NOT_FOUND (or FORBIDDEN for visible readers without invitation authority).
+ */
 export async function revokeInvitation(input: {
   vehicleId: Types.ObjectId;
   invitationId: Types.ObjectId;
@@ -1769,273 +2051,95 @@ export async function revokeInvitation(input: {
   reason?: string | null;
   now?: Date;
   audit?: VehicleAuditLogger;
-}): Promise<(Invitation & { _id: Types.ObjectId }) | null> {
+}): Promise<RevokeInvitationResult> {
   const audit = input.audit ?? defaultAuditLogger;
   const now = input.now ?? new Date();
   const reason = validateOptionalAuditReason(input.reason);
-
-  const vehicle = await loadVerifiedActiveVehicle(input.vehicleId, {
-    actorUserId: input.actorUserId,
-    audit,
-  });
-  if (!vehicle || !vehicle.ownerUserId.equals(input.actorUserId)) {
-    return null;
-  }
-
-  // If the invitation already elapsed, record EXPIRED rather than falsely marking REVOKED.
-  const newlyExpired = await InvitationModel.findOneAndUpdate(
-    {
-      _id: input.invitationId,
-      vehicleId: input.vehicleId,
-      status: 'PENDING',
-      expiresAt: { $lte: now },
-    },
-    {
-      $set: {
-        status: 'EXPIRED',
-        expiredAt: now,
-      },
-    },
-    { returnDocument: 'after' },
-  ).lean();
-
-  if (newlyExpired) {
-    return null;
-  }
-
-  const revoked = (await InvitationModel.findOneAndUpdate(
-    {
-      _id: input.invitationId,
-      vehicleId: input.vehicleId,
-      status: 'PENDING',
-      expiresAt: { $gt: now },
-    },
-    {
-      $set: {
-        status: 'REVOKED',
-        revokedAt: now,
-        revokedByUserId: input.actorUserId,
-        revokeReason: reason,
-        updatedByUserId: input.actorUserId,
-      },
-    },
-    { returnDocument: 'after', runValidators: true },
-  ).lean()) as (Invitation & { _id: Types.ObjectId }) | null;
-
-  if (revoked) {
+  const record = (outcome: VehicleAuditEvent['outcome'], auditReason?: string): void =>
     audit({
       action: 'invitation.revoke',
       actorUserId: String(input.actorUserId),
       vehicleId: String(input.vehicleId),
       targetId: String(input.invitationId),
-      outcome: 'success',
-      reason: reason ?? undefined,
+      outcome,
+      reason: auditReason,
     });
-  }
+  const notFound = (): VehicleServiceError =>
+    new VehicleServiceError('NOT_FOUND', 'Invitation not found');
 
-  return revoked;
-}
-
-export async function suspendMembership(input: {
-  vehicleId: Types.ObjectId;
-  membershipId: Types.ObjectId;
-  actorUserId: Types.ObjectId;
-  reason?: string | null;
-  now?: Date;
-  audit?: VehicleAuditLogger;
-}): Promise<(Membership & { _id: Types.ObjectId }) | null> {
-  const audit = input.audit ?? defaultAuditLogger;
-  const now = input.now ?? new Date();
-  const reason = validateOptionalAuditReason(input.reason);
-
-  const vehicle = await loadVerifiedActiveVehicle(input.vehicleId, {
-    actorUserId: input.actorUserId,
+  const issuer = await resolveInvitationIssuer(input.vehicleId, input.actorUserId, {
+    now,
     audit,
   });
-  if (!vehicle || !vehicle.ownerUserId.equals(input.actorUserId)) {
-    throw new VehicleServiceError(
-      'FORBIDDEN',
-      'Only the canonical vehicle owner may suspend members',
-    );
+  if (issuer.kind === 'NONE') {
+    record('denied', 'vehicle_not_visible');
+    throw notFound();
+  }
+  if (issuer.kind === 'VISIBLE_WITHOUT_AUTHORITY') {
+    record('denied', 'insufficient_permissions');
+    throw new VehicleServiceError('FORBIDDEN', 'Insufficient permissions to revoke invitations');
   }
 
-  const target = await MembershipModel.findOne({
-    _id: input.membershipId,
-    vehicleId: input.vehicleId,
-  }).lean();
-  if (!target) {
-    return null;
+  const scope =
+    issuer.kind === 'OWNER'
+      ? { _id: input.invitationId, vehicleId: input.vehicleId }
+      : {
+          _id: input.invitationId,
+          vehicleId: input.vehicleId,
+          issuerMembershipId: issuer.membership._id,
+        };
+  const current = (await InvitationModel.findOne(scope).lean()) as InvitationRecord | null;
+  if (!current) {
+    record('denied', 'invitation_not_visible');
+    throw notFound();
   }
-  if (target.role === 'OWNER' || target.userId.equals(vehicle.ownerUserId)) {
-    throw new VehicleServiceError('CONFLICT', 'OWNER membership cannot be suspended');
+  if (current.status === 'REVOKED') {
+    return { invitation: current, alreadyRevoked: true };
   }
-  if (target.status !== 'ACTIVE' || target.revokedAt !== null) {
-    throw new VehicleServiceError(
-      'CONFLICT',
-      `Cannot suspend membership in status ${target.status}`,
-    );
+  if (current.status === 'PENDING' && current.expiresAt.getTime() <= now.getTime()) {
+    await persistElapsedInvitations(scope, now);
+    record('conflict', 'invitation_expired');
+    throw new VehicleServiceError('CONFLICT', 'Invitation already expired');
   }
-
-  const suspended = (await MembershipModel.findOneAndUpdate(
-    {
-      _id: input.membershipId,
-      vehicleId: input.vehicleId,
-      role: 'MEMBER',
-      status: 'ACTIVE',
-      suspendedAt: null,
-      revokedAt: null,
-    },
-    {
-      $set: {
-        status: 'SUSPENDED',
-        suspendedAt: now,
-        suspendedByUserId: input.actorUserId,
-        suspensionReason: reason,
-        updatedByUserId: input.actorUserId,
-      },
-    },
-    { returnDocument: 'after', runValidators: true },
-  ).lean()) as (Membership & { _id: Types.ObjectId }) | null;
-
-  if (suspended) {
-    audit({
-      action: 'membership.suspend',
-      actorUserId: String(input.actorUserId),
-      vehicleId: String(input.vehicleId),
-      targetId: String(input.membershipId),
-      outcome: 'success',
-      reason: reason ?? undefined,
-    });
+  if (current.status !== 'PENDING') {
+    record('conflict', `invitation_${current.status.toLowerCase()}`);
+    throw new VehicleServiceError('CONFLICT', `Invitation is already ${current.status}`);
   }
 
-  return suspended;
-}
-
-export async function reactivateMembership(input: {
-  vehicleId: Types.ObjectId;
-  membershipId: Types.ObjectId;
-  actorUserId: Types.ObjectId;
-  now?: Date;
-  audit?: VehicleAuditLogger;
-}): Promise<(Membership & { _id: Types.ObjectId }) | null> {
-  const audit = input.audit ?? defaultAuditLogger;
-
-  const vehicle = await loadVerifiedActiveVehicle(input.vehicleId, {
-    actorUserId: input.actorUserId,
-    audit,
-  });
-  if (!vehicle || !vehicle.ownerUserId.equals(input.actorUserId)) {
-    throw new VehicleServiceError(
-      'FORBIDDEN',
-      'Only the canonical vehicle owner may reactivate suspended members',
-    );
-  }
-
-  const target = await MembershipModel.findOne({
-    _id: input.membershipId,
-    vehicleId: input.vehicleId,
-  }).lean();
-  if (!target) {
-    return null;
-  }
-  if (target.role === 'OWNER') {
-    throw new VehicleServiceError('CONFLICT', 'OWNER membership is already permanently active');
-  }
-  if (target.status !== 'SUSPENDED' || target.revokedAt !== null) {
-    throw new VehicleServiceError(
-      'CONFLICT',
-      `Cannot reactivate membership in status ${target.status}`,
-    );
-  }
-
-  const reactivated = (await MembershipModel.findOneAndUpdate(
-    {
-      _id: input.membershipId,
-      vehicleId: input.vehicleId,
-      role: 'MEMBER',
-      status: 'SUSPENDED',
-      revokedAt: null,
-    },
-    {
-      $set: {
-        status: 'ACTIVE',
-        suspendedAt: null,
-        suspendedByUserId: null,
-        suspensionReason: null,
-        updatedByUserId: input.actorUserId,
-      },
-    },
-    { returnDocument: 'after', runValidators: true },
-  ).lean()) as (Membership & { _id: Types.ObjectId }) | null;
-
-  if (reactivated) {
-    audit({
-      action: 'membership.reactivate',
-      actorUserId: String(input.actorUserId),
-      vehicleId: String(input.vehicleId),
-      targetId: String(input.membershipId),
-      outcome: 'success',
-    });
-  }
-
-  return reactivated;
-}
-
-export async function revokeMembership(input: {
-  vehicleId: Types.ObjectId;
-  membershipId: Types.ObjectId;
-  actorUserId: Types.ObjectId;
-  reason?: string | null;
-  now?: Date;
-  audit?: VehicleAuditLogger;
-}): Promise<{
-  membership: Membership & { _id: Types.ObjectId };
-  revokedGrantsCount: number;
-} | null> {
-  const audit = input.audit ?? defaultAuditLogger;
-  const now = input.now ?? new Date();
-  const reason = validateOptionalAuditReason(input.reason);
-
+  let result: RevokeInvitationResult;
   try {
-    const result = await runInVehicleTransaction(async (session) => {
-      const vehicle = await lockVerifiedActiveVehicle(input.vehicleId, session, {
+    result = await runInVehicleTransaction(async (session) => {
+      const locked = await lockVerifiedActiveVehicleWithOwner(input.vehicleId, session, {
         now,
         actorUserId: input.actorUserId,
         audit,
       });
-      if (!vehicle || !vehicle.ownerUserId.equals(input.actorUserId)) {
-        throw new TransactionAbortDomainError(
-          'FORBIDDEN',
-          'Only the canonical vehicle owner may revoke memberships',
-        );
+      if (!locked) {
+        throw new TransactionAbortDomainError('REJECT_NULL', 'vehicle_unavailable');
+      }
+      if (issuer.kind === 'OWNER') {
+        if (!locked.vehicle.ownerUserId.equals(input.actorUserId)) {
+          throw new TransactionAbortDomainError('REJECT_NULL', 'ownership_changed');
+        }
+      } else {
+        const issuerMembership = (await MembershipModel.findOneAndUpdate(
+          {
+            _id: issuer.membership._id,
+            vehicleId: input.vehicleId,
+            userId: input.actorUserId,
+            role: 'MEMBER',
+            ...ACTIVE_MEMBERSHIP_CRITERIA,
+          },
+          { $set: { updatedAt: now } },
+          { returnDocument: 'after', session },
+        ).lean()) as MembershipRecord | null;
+        if (!issuerMembership || !holdsInvitationAuthority(issuerMembership.permissions)) {
+          throw new TransactionAbortDomainError('REJECT_NULL', 'issuer_authority_lost');
+        }
       }
 
-      const targetQuery = MembershipModel.findOne({
-        _id: input.membershipId,
-        vehicleId: input.vehicleId,
-      });
-      if (session) {
-        targetQuery.session(session);
-      }
-      const target = await targetQuery.lean();
-      if (!target) {
-        return null;
-      }
-      if (target.role === 'OWNER' || target.userId.equals(vehicle.ownerUserId)) {
-        throw new TransactionAbortDomainError('CONFLICT', 'OWNER membership cannot be revoked');
-      }
-      if (target.status === 'REVOKED' || target.revokedAt !== null) {
-        throw new TransactionAbortDomainError('CONFLICT', 'Membership is already REVOKED');
-      }
-
-      const revokedMembership = (await MembershipModel.findOneAndUpdate(
-        {
-          _id: input.membershipId,
-          vehicleId: input.vehicleId,
-          role: 'MEMBER',
-          status: { $in: ['ACTIVE', 'SUSPENDED'] },
-          revokedAt: null,
-        },
+      const revoked = (await InvitationModel.findOneAndUpdate(
+        { ...scope, status: 'PENDING', expiresAt: { $gt: now } },
         {
           $set: {
             status: 'REVOKED',
@@ -2046,21 +2150,539 @@ export async function revokeMembership(input: {
           },
         },
         { returnDocument: 'after', runValidators: true, session },
-      ).lean()) as (Membership & { _id: Types.ObjectId }) | null;
+      ).lean()) as InvitationRecord | null;
+      if (revoked) {
+        return { invitation: revoked, alreadyRevoked: false };
+      }
+      const latest = (await InvitationModel.findOne(scope)
+        .session(session ?? null)
+        .lean()) as InvitationRecord | null;
+      if (latest?.status === 'REVOKED') {
+        return { invitation: latest, alreadyRevoked: true };
+      }
+      throw new TransactionAbortDomainError('CONFLICT', 'Invitation is no longer pending');
+    });
+  } catch (error) {
+    if (error instanceof TransactionAbortDomainError) {
+      if (error.code === 'REJECT_NULL') {
+        record('denied', error.message);
+        throw notFound();
+      }
+      record('conflict', error.message);
+      throw new VehicleServiceError(error.code, error.message);
+    }
+    throw error;
+  }
 
-      if (!revokedMembership) {
+  if (!result.alreadyRevoked) {
+    record('success', reason ?? undefined);
+  }
+  return result;
+}
+
+export interface MembershipTransitionResult {
+  membership: MembershipRecord;
+  revokedGrantsCount: number;
+  revokedInvitationsCount: number;
+}
+
+export interface MembershipRevocationResult extends MembershipTransitionResult {
+  /** True when the membership was already REVOKED; the original record is returned unchanged. */
+  alreadyRevoked: boolean;
+}
+
+export interface MembershipPermissionsUpdateResult {
+  membership: MembershipRecord;
+  /** False when the requested set equals the current one; nothing is written. */
+  changed: boolean;
+  revokedInvitationsCount: number;
+}
+
+interface OwnerMembershipMutationInput {
+  vehicleId: Types.ObjectId;
+  membershipId: Types.ObjectId;
+  actorUserId: Types.ObjectId;
+  now: Date;
+  audit: VehicleAuditLogger;
+  action: OwnerMutationAction;
+}
+
+/**
+ * Shared frame for OWNER-only membership administration: read-only pre-authorization (no
+ * persistent effects for unauthorized callers), then a transaction that locks the vehicle and
+ * canonical owner membership before reading the target, which must be a MEMBER of the same
+ * vehicle. The OWNER membership is never a valid target.
+ */
+async function runOwnerMembershipMutation<T>(
+  input: OwnerMembershipMutationInput,
+  work: (
+    session: ClientSession | undefined,
+    context: { locked: LockedVehicle; target: MembershipRecord },
+  ) => Promise<T>,
+): Promise<T> {
+  const context = {
+    action: input.action,
+    vehicleId: input.vehicleId,
+    actorUserId: input.actorUserId,
+    audit: input.audit,
+  };
+  const relation = await resolveVehicleRelation(input.vehicleId, input.actorUserId, {
+    now: input.now,
+    audit: input.audit,
+  });
+  if (relation.kind !== 'OWNER') {
+    denyOwnerMutation(relation, context);
+  }
+
+  try {
+    return await runInVehicleTransaction(async (session) => {
+      const locked = await lockVerifiedActiveVehicleWithOwner(input.vehicleId, session, {
+        now: input.now,
+        audit: input.audit,
+        actorUserId: input.actorUserId,
+      });
+      if (!locked || !locked.vehicle.ownerUserId.equals(input.actorUserId)) {
+        throw new TransactionAbortDomainError('REJECT_NULL', 'Vehicle state changed');
+      }
+      const target = (await MembershipModel.findOne({
+        _id: input.membershipId,
+        vehicleId: input.vehicleId,
+      })
+        .session(session ?? null)
+        .lean()) as MembershipRecord | null;
+      if (!target) {
+        throw new TransactionAbortDomainError('NOT_FOUND', 'Membership not found');
+      }
+      if (target.role === 'OWNER' || target.userId.equals(locked.vehicle.ownerUserId)) {
+        throw new TransactionAbortDomainError(
+          'CONFLICT',
+          'The OWNER membership cannot be modified through member administration',
+        );
+      }
+      return work(session, { locked, target });
+    });
+  } catch (error) {
+    if (error instanceof TransactionAbortDomainError) {
+      if (error.code === 'REJECT_NULL') {
+        const current = await resolveVehicleRelation(input.vehicleId, input.actorUserId, {
+          now: input.now,
+          audit: input.audit,
+        });
+        if (current.kind !== 'OWNER') {
+          denyOwnerMutation(current, context);
+        }
+        throw new VehicleServiceError(
+          'CONFLICT',
+          'Concurrent state change prevented the membership operation',
+        );
+      }
+      input.audit({
+        action: input.action,
+        actorUserId: String(input.actorUserId),
+        vehicleId: String(input.vehicleId),
+        targetId: String(input.membershipId),
+        outcome: error.code === 'CONFLICT' ? 'conflict' : 'denied',
+        reason: error.message,
+      });
+      throw new VehicleServiceError(error.code, error.message);
+    }
+    throw error;
+  }
+}
+
+function auditMembershipSuccess(
+  input:
+    | OwnerMembershipMutationInput
+    | (Omit<OwnerMembershipMutationInput, 'action'> & {
+        action: 'membership.leave';
+      }),
+  reason?: string | null,
+): void {
+  input.audit({
+    action: input.action,
+    actorUserId: String(input.actorUserId),
+    vehicleId: String(input.vehicleId),
+    targetId: String(input.membershipId),
+    outcome: 'success',
+    reason: reason ?? undefined,
+  });
+}
+
+/**
+ * OWNER-only ACTIVE → SUSPENDED. In the same transaction the membership's ACTIVE AccessGrants
+ * are revoked (elapsed ones expire) and its PENDING issued invitations are revoked. Base
+ * permissions and history are preserved; reactivation restores neither grants nor invitations.
+ */
+export async function suspendMembership(input: {
+  vehicleId: Types.ObjectId;
+  membershipId: Types.ObjectId;
+  actorUserId: Types.ObjectId;
+  reason?: string | null;
+  now?: Date;
+  audit?: VehicleAuditLogger;
+}): Promise<MembershipTransitionResult> {
+  const reason = validateOptionalAuditReason(input.reason);
+  const frame: OwnerMembershipMutationInput = {
+    vehicleId: input.vehicleId,
+    membershipId: input.membershipId,
+    actorUserId: input.actorUserId,
+    now: input.now ?? new Date(),
+    audit: input.audit ?? defaultAuditLogger,
+    action: 'membership.suspend',
+  };
+  const result = await runOwnerMembershipMutation(frame, async (session, { target }) => {
+    if (target.status !== 'ACTIVE' || target.suspendedAt !== null || target.revokedAt !== null) {
+      throw new TransactionAbortDomainError(
+        'CONFLICT',
+        `Cannot suspend membership in status ${target.status}`,
+      );
+    }
+    const suspended = (await MembershipModel.findOneAndUpdate(
+      {
+        _id: target._id,
+        vehicleId: input.vehicleId,
+        role: 'MEMBER',
+        ...ACTIVE_MEMBERSHIP_CRITERIA,
+      },
+      {
+        $set: {
+          status: 'SUSPENDED',
+          suspendedAt: frame.now,
+          suspendedByUserId: input.actorUserId,
+          suspensionReason: reason,
+          updatedByUserId: input.actorUserId,
+        },
+      },
+      { returnDocument: 'after', runValidators: true, session },
+    ).lean()) as MembershipRecord | null;
+    if (!suspended) {
+      throw new TransactionAbortDomainError(
+        'CONFLICT',
+        'Concurrent state change prevented membership suspension',
+      );
+    }
+    const revokedGrantsCount = await revokeMembershipGrants(session, {
+      vehicleId: input.vehicleId,
+      membershipId: suspended._id,
+      actorUserId: input.actorUserId,
+      now: frame.now,
+      reason: reason ?? 'membership_suspended',
+    });
+    const revokedInvitationsCount = await revokeIssuedInvitations(session, {
+      vehicleId: input.vehicleId,
+      membership: suspended,
+      actorUserId: input.actorUserId,
+      now: frame.now,
+    });
+    return { membership: suspended, revokedGrantsCount, revokedInvitationsCount };
+  });
+  auditMembershipSuccess(frame, reason);
+  return result;
+}
+
+/**
+ * OWNER-only SUSPENDED → ACTIVE. Only the current base permissions apply again; AccessGrants
+ * and invitations revoked by the suspension stay revoked. REVOKED is terminal.
+ */
+export async function reactivateMembership(input: {
+  vehicleId: Types.ObjectId;
+  membershipId: Types.ObjectId;
+  actorUserId: Types.ObjectId;
+  now?: Date;
+  audit?: VehicleAuditLogger;
+}): Promise<MembershipRecord> {
+  const frame: OwnerMembershipMutationInput = {
+    vehicleId: input.vehicleId,
+    membershipId: input.membershipId,
+    actorUserId: input.actorUserId,
+    now: input.now ?? new Date(),
+    audit: input.audit ?? defaultAuditLogger,
+    action: 'membership.reactivate',
+  };
+  const reactivated = await runOwnerMembershipMutation(frame, async (session, { target }) => {
+    if (target.status !== 'SUSPENDED' || target.revokedAt !== null) {
+      throw new TransactionAbortDomainError(
+        'CONFLICT',
+        `Cannot reactivate membership in status ${target.status}`,
+      );
+    }
+    const updated = (await MembershipModel.findOneAndUpdate(
+      {
+        _id: target._id,
+        vehicleId: input.vehicleId,
+        role: 'MEMBER',
+        status: 'SUSPENDED',
+        revokedAt: null,
+      },
+      {
+        $set: {
+          status: 'ACTIVE',
+          suspendedAt: null,
+          suspendedByUserId: null,
+          suspensionReason: null,
+          updatedByUserId: input.actorUserId,
+        },
+      },
+      { returnDocument: 'after', runValidators: true, session },
+    ).lean()) as MembershipRecord | null;
+    if (!updated) {
+      throw new TransactionAbortDomainError(
+        'CONFLICT',
+        'Concurrent state change prevented membership reactivation',
+      );
+    }
+    return updated;
+  });
+  auditMembershipSuccess(frame);
+  return reactivated;
+}
+
+/**
+ * OWNER-only revocation of an ACTIVE or SUSPENDED MEMBER membership, revoking its AccessGrants
+ * and PENDING issued invitations in the same transaction. Repeating it returns the original
+ * revocation without rewriting audit fields or repeating cascades.
+ */
+export async function revokeMembership(input: {
+  vehicleId: Types.ObjectId;
+  membershipId: Types.ObjectId;
+  actorUserId: Types.ObjectId;
+  reason?: string | null;
+  now?: Date;
+  audit?: VehicleAuditLogger;
+}): Promise<MembershipRevocationResult> {
+  const reason = validateOptionalAuditReason(input.reason);
+  const frame: OwnerMembershipMutationInput = {
+    vehicleId: input.vehicleId,
+    membershipId: input.membershipId,
+    actorUserId: input.actorUserId,
+    now: input.now ?? new Date(),
+    audit: input.audit ?? defaultAuditLogger,
+    action: 'membership.revoke',
+  };
+  const result = await runOwnerMembershipMutation(
+    frame,
+    async (session, { target }): Promise<MembershipRevocationResult> => {
+      if (target.status === 'REVOKED' || target.revokedAt !== null) {
+        return {
+          membership: target,
+          revokedGrantsCount: 0,
+          revokedInvitationsCount: 0,
+          alreadyRevoked: true,
+        };
+      }
+      const revoked = (await MembershipModel.findOneAndUpdate(
+        {
+          _id: target._id,
+          vehicleId: input.vehicleId,
+          role: 'MEMBER',
+          status: { $in: ['ACTIVE', 'SUSPENDED'] },
+          revokedAt: null,
+        },
+        {
+          $set: {
+            status: 'REVOKED',
+            revokedAt: frame.now,
+            revokedByUserId: input.actorUserId,
+            revokeReason: reason,
+            updatedByUserId: input.actorUserId,
+          },
+        },
+        { returnDocument: 'after', runValidators: true, session },
+      ).lean()) as MembershipRecord | null;
+      if (!revoked) {
         throw new TransactionAbortDomainError(
           'CONFLICT',
           'Concurrent state change prevented membership revocation',
         );
       }
+      const revokedGrantsCount = await revokeMembershipGrants(session, {
+        vehicleId: input.vehicleId,
+        membershipId: revoked._id,
+        actorUserId: input.actorUserId,
+        now: frame.now,
+        reason: reason ?? 'membership_revoked',
+      });
+      const revokedInvitationsCount = await revokeIssuedInvitations(session, {
+        vehicleId: input.vehicleId,
+        membership: revoked,
+        actorUserId: input.actorUserId,
+        now: frame.now,
+      });
+      return {
+        membership: revoked,
+        revokedGrantsCount,
+        revokedInvitationsCount,
+        alreadyRevoked: false,
+      };
+    },
+  );
+  if (!result.alreadyRevoked) {
+    auditMembershipSuccess(frame, reason);
+  }
+  return result;
+}
 
-      const cascadeReason = reason ?? 'membership_revoked';
-      const grantCascade = await AccessGrantModel.updateMany(
+function samePermissionSet(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((permission) => right.includes(permission));
+}
+
+/**
+ * OWNER-only full replacement of a MEMBER's base permissions (ACTIVE or SUSPENDED). Role,
+ * identity, status, and audit fields are not editable. AccessGrants are independent and are
+ * not revoked implicitly. PENDING invitations issued by the member that the new set no longer
+ * authorizes are revoked in the same transaction.
+ */
+export async function updateMembershipPermissions(input: {
+  vehicleId: Types.ObjectId;
+  membershipId: Types.ObjectId;
+  actorUserId: Types.ObjectId;
+  permissions: string[];
+  now?: Date;
+  audit?: VehicleAuditLogger;
+}): Promise<MembershipPermissionsUpdateResult> {
+  if (
+    !validatePermissionSet(input.permissions, {
+      maxItems: 100,
+      allowPermission: isDelegableMembershipPermission,
+    })
+  ) {
+    throw new VehicleServiceError(
+      'VALIDATION_ERROR',
+      'Membership permissions must be unique, known, non-wildcard, and delegable to MEMBER',
+    );
+  }
+  const permissions = [...input.permissions];
+  const frame: OwnerMembershipMutationInput = {
+    vehicleId: input.vehicleId,
+    membershipId: input.membershipId,
+    actorUserId: input.actorUserId,
+    now: input.now ?? new Date(),
+    audit: input.audit ?? defaultAuditLogger,
+    action: 'membership.update',
+  };
+  const result = await runOwnerMembershipMutation(
+    frame,
+    async (session, { target }): Promise<MembershipPermissionsUpdateResult> => {
+      if (target.status === 'REVOKED' || target.revokedAt !== null) {
+        throw new TransactionAbortDomainError(
+          'CONFLICT',
+          'Cannot update permissions of a REVOKED membership',
+        );
+      }
+      if (samePermissionSet(target.permissions, permissions)) {
+        return { membership: target, changed: false, revokedInvitationsCount: 0 };
+      }
+      const updated = (await MembershipModel.findOneAndUpdate(
         {
+          _id: target._id,
           vehicleId: input.vehicleId,
-          membershipId: revokedMembership._id,
-          status: 'ACTIVE',
+          role: 'MEMBER',
+          status: { $in: ['ACTIVE', 'SUSPENDED'] },
+          revokedAt: null,
+        },
+        { $set: { permissions, updatedByUserId: input.actorUserId } },
+        { returnDocument: 'after', runValidators: true, session },
+      ).lean()) as MembershipRecord | null;
+      if (!updated) {
+        throw new TransactionAbortDomainError(
+          'CONFLICT',
+          'Concurrent state change prevented the permission update',
+        );
+      }
+      const stillDelegable = holdsInvitationAuthority(permissions)
+        ? permissions.filter((permission) => memberDelegableInvitationSet.has(permission))
+        : null;
+      const revokedInvitationsCount = await revokeIssuedInvitations(session, {
+        vehicleId: input.vehicleId,
+        membership: updated,
+        actorUserId: input.actorUserId,
+        now: frame.now,
+        extraFilter:
+          stillDelegable === null
+            ? undefined
+            : { permissions: { $elemMatch: { $nin: stillDelegable } } },
+      });
+      return { membership: updated, changed: true, revokedInvitationsCount };
+    },
+  );
+  if (result.changed) {
+    auditMembershipSuccess(frame);
+  }
+  return result;
+}
+
+export interface LeaveVehicleResult {
+  membership: MembershipRecord;
+  /** True when the targeted membership was already REVOKED; it is returned unchanged. */
+  alreadyRevoked: boolean;
+  revokedGrantsCount: number;
+  revokedInvitationsCount: number;
+}
+
+/**
+ * Voluntary leave of the caller's own MEMBER membership (ACTIVE or SUSPENDED), always identified
+ * explicitly: it must belong to the caller and to the vehicle. Repeating returns it unchanged
+ * once REVOKED, and a retried request never resolves to a later membership of the same user.
+ * The canonical OWNER cannot leave.
+ */
+export async function leaveVehicle(input: {
+  vehicleId: Types.ObjectId;
+  actorUserId: Types.ObjectId;
+  membershipId: Types.ObjectId;
+  now?: Date;
+  audit?: VehicleAuditLogger;
+}): Promise<LeaveVehicleResult> {
+  const audit = input.audit ?? defaultAuditLogger;
+  const now = input.now ?? new Date();
+  const notFound = (): VehicleServiceError =>
+    new VehicleServiceError('NOT_FOUND', 'Membership not found');
+  const ownerCannotLeave = (): VehicleServiceError =>
+    new VehicleServiceError('CONFLICT', 'The vehicle owner cannot leave the vehicle');
+
+  const target = (await MembershipModel.findOne({
+    _id: input.membershipId,
+    vehicleId: input.vehicleId,
+    userId: input.actorUserId,
+  }).lean()) as MembershipRecord | null;
+  if (!target) {
+    throw notFound();
+  }
+  if (target.role === 'OWNER') {
+    throw ownerCannotLeave();
+  }
+  if (target.status === 'REVOKED' || target.revokedAt !== null) {
+    return {
+      membership: target,
+      alreadyRevoked: true,
+      revokedGrantsCount: 0,
+      revokedInvitationsCount: 0,
+    };
+  }
+
+  let result: LeaveVehicleResult;
+  try {
+    result = await runInVehicleTransaction(async (session): Promise<LeaveVehicleResult> => {
+      const locked = await lockVerifiedActiveVehicleWithOwner(input.vehicleId, session, {
+        now,
+        audit,
+        actorUserId: input.actorUserId,
+      });
+      if (!locked) {
+        throw new TransactionAbortDomainError('NOT_FOUND', 'Membership not found');
+      }
+      if (locked.vehicle.ownerUserId.equals(input.actorUserId)) {
+        throw new TransactionAbortDomainError(
+          'CONFLICT',
+          'The vehicle owner cannot leave the vehicle',
+        );
+      }
+      const left = (await MembershipModel.findOneAndUpdate(
+        {
+          _id: target._id,
+          vehicleId: input.vehicleId,
+          userId: input.actorUserId,
+          role: 'MEMBER',
+          status: { $in: ['ACTIVE', 'SUSPENDED'] },
           revokedAt: null,
         },
         {
@@ -2068,37 +2690,406 @@ export async function revokeMembership(input: {
             status: 'REVOKED',
             revokedAt: now,
             revokedByUserId: input.actorUserId,
-            revokeReason: cascadeReason,
+            revokeReason: MEMBER_LEFT_REASON,
             updatedByUserId: input.actorUserId,
           },
         },
-        { session },
-      );
-
+        { returnDocument: 'after', runValidators: true, session },
+      ).lean()) as MembershipRecord | null;
+      if (!left) {
+        const latest = (await MembershipModel.findOne({ _id: target._id })
+          .session(session ?? null)
+          .lean()) as MembershipRecord | null;
+        if (latest && (latest.status === 'REVOKED' || latest.revokedAt !== null)) {
+          return {
+            membership: latest,
+            alreadyRevoked: true,
+            revokedGrantsCount: 0,
+            revokedInvitationsCount: 0,
+          };
+        }
+        throw new TransactionAbortDomainError(
+          'CONFLICT',
+          'Concurrent state change prevented leaving the vehicle',
+        );
+      }
+      const revokedGrantsCount = await revokeMembershipGrants(session, {
+        vehicleId: input.vehicleId,
+        membershipId: left._id,
+        actorUserId: input.actorUserId,
+        now,
+        reason: MEMBER_LEFT_REASON,
+      });
+      const revokedInvitationsCount = await revokeIssuedInvitations(session, {
+        vehicleId: input.vehicleId,
+        membership: left,
+        actorUserId: input.actorUserId,
+        now,
+      });
       return {
-        membership: revokedMembership,
-        revokedGrantsCount: grantCascade.modifiedCount,
+        membership: left,
+        alreadyRevoked: false,
+        revokedGrantsCount,
+        revokedInvitationsCount,
       };
     });
-
-    if (result) {
+  } catch (error) {
+    if (error instanceof TransactionAbortDomainError) {
       audit({
-        action: 'membership.revoke',
+        action: 'membership.leave',
         actorUserId: String(input.actorUserId),
         vehicleId: String(input.vehicleId),
-        targetId: String(input.membershipId),
-        outcome: 'success',
-        reason: reason ?? undefined,
+        targetId: String(target._id),
+        outcome: error.code === 'CONFLICT' ? 'conflict' : 'denied',
+        reason: error.message,
       });
-    }
-
-    return result;
-  } catch (error) {
-    if (error instanceof TransactionAbortDomainError && error.code !== 'REJECT_NULL') {
+      if (error.code === 'REJECT_NULL') {
+        throw notFound();
+      }
       throw new VehicleServiceError(error.code, error.message);
     }
     throw error;
   }
+
+  if (!result.alreadyRevoked) {
+    auditMembershipSuccess(
+      {
+        vehicleId: input.vehicleId,
+        membershipId: result.membership._id,
+        actorUserId: input.actorUserId,
+        now,
+        audit,
+        action: 'membership.leave',
+      },
+      MEMBER_LEFT_REASON,
+    );
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Keyset listings of invitations and members
+// ---------------------------------------------------------------------------
+
+const COLLECTION_CURSOR_VERSION = 1;
+const COLLECTION_LIST_KINDS = ['vehicle-invitations', 'received-invitations', 'members'] as const;
+type CollectionListKind = (typeof COLLECTION_LIST_KINDS)[number];
+
+const collectionCursorPayloadSchema = z.strictObject({
+  v: z.literal(COLLECTION_CURSOR_VERSION),
+  k: z.enum(COLLECTION_LIST_KINDS),
+  b: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
+  c: z.string().max(32),
+  i: z.string().regex(/^[a-f0-9]{24}$/),
+});
+
+interface CollectionCursorScope {
+  kind: CollectionListKind;
+  actorUserId: Types.ObjectId;
+  /** Listed resource (vehicle id, or `self` for received invitations). */
+  resource: string;
+  /** Canonical filter description; a cursor is only valid for the same filters. */
+  filter: string;
+}
+
+interface CollectionListPosition {
+  createdAt: Date;
+  id: Types.ObjectId;
+}
+
+/** Binds a cursor to actor, resource, list kind, and filters. Not a secret. */
+function collectionCursorBinding(scope: CollectionCursorScope): string {
+  return createHash('sha256')
+    .update(
+      `pichu:collection-cursor:v${COLLECTION_CURSOR_VERSION}:${scope.kind}:${String(scope.actorUserId)}:${scope.resource}:${scope.filter}`,
+    )
+    .digest('base64url')
+    .slice(0, 22);
+}
+
+/**
+ * Keyset cursor `(createdAt, _id)` for invitation and member lists. Neither encrypted nor
+ * signed and never grants access: authorization is re-evaluated on each page.
+ */
+function encodeCollectionCursor(
+  scope: CollectionCursorScope,
+  position: CollectionListPosition,
+): string {
+  const payload = {
+    v: COLLECTION_CURSOR_VERSION,
+    k: scope.kind,
+    b: collectionCursorBinding(scope),
+    c: position.createdAt.toISOString(),
+    i: String(position.id),
+  };
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+}
+
+function decodeCollectionCursor(
+  cursor: string,
+  scope: CollectionCursorScope,
+): CollectionListPosition {
+  const parsed = collectionCursorPayloadSchema.safeParse(decodeCursorJson(cursor));
+  if (!parsed.success) {
+    throw invalidVehicleCursor();
+  }
+  const createdAt = decodeCursorTimestamp(parsed.data.c);
+  if (parsed.data.k !== scope.kind || parsed.data.b !== collectionCursorBinding(scope)) {
+    throw invalidVehicleCursor();
+  }
+  return { createdAt, id: Types.ObjectId.createFromHexString(parsed.data.i) };
+}
+
+function validateCollectionLimit(limit: number | undefined): number {
+  const value = limit ?? DEFAULT_VEHICLE_PAGE_LIMIT;
+  if (!Number.isInteger(value) || value < 1 || value > MAX_VEHICLE_PAGE_LIMIT) {
+    throw new VehicleServiceError('VALIDATION_ERROR', 'Invalid pagination limit');
+  }
+  return value;
+}
+
+function keysetAfter(position: CollectionListPosition | null): Record<string, unknown> {
+  return position
+    ? {
+        $or: [
+          { createdAt: { $gt: position.createdAt } },
+          { createdAt: position.createdAt, _id: { $gt: position.id } },
+        ],
+      }
+    : {};
+}
+
+/** Fetches at most `limit + 1` rows in `(createdAt ASC, _id ASC)` order; read-only. */
+async function fetchKeysetPage<TSchema extends { createdAt: Date }>(
+  model: Model<TSchema>,
+  criteria: QueryFilter<TSchema>[],
+  scope: CollectionCursorScope,
+  options: { limit?: number; cursor?: string },
+): Promise<{ rows: Array<TSchema & { _id: Types.ObjectId }>; nextCursor: string | null }> {
+  const limit = validateCollectionLimit(options.limit);
+  const position =
+    options.cursor === undefined ? null : decodeCollectionCursor(options.cursor, scope);
+  const rows = (await model
+    .find({ $and: [...criteria, keysetAfter(position)] } as QueryFilter<TSchema>)
+    .sort({ createdAt: 1, _id: 1 })
+    .limit(limit + 1)
+    .lean()) as unknown as Array<TSchema & { _id: Types.ObjectId }>;
+  const page = rows.slice(0, limit);
+  const last = page[page.length - 1];
+  return {
+    rows: page,
+    nextCursor:
+      rows.length > limit && last
+        ? encodeCollectionCursor(scope, { createdAt: last.createdAt, id: last._id })
+        : null,
+  };
+}
+
+/** Effective status: an elapsed PENDING invitation is EXPIRED even before it is persisted. */
+export function effectiveInvitationStatus(
+  invitation: Pick<Invitation, 'status' | 'expiresAt'>,
+  now: Date,
+): InvitationStatus {
+  return invitation.status === 'PENDING' && invitation.expiresAt.getTime() <= now.getTime()
+    ? 'EXPIRED'
+    : invitation.status;
+}
+
+function invitationStatusCriteria(
+  status: InvitationStatus | undefined,
+  now: Date,
+): InvitationFilter {
+  switch (status) {
+    case undefined:
+      return {};
+    case 'PENDING':
+      return { status: 'PENDING', expiresAt: { $gt: now } };
+    case 'EXPIRED':
+      return { $or: [{ status: 'EXPIRED' }, { status: 'PENDING', expiresAt: { $lte: now } }] };
+    default:
+      return { status };
+  }
+}
+
+function validateInvitationStatusFilter(status: InvitationStatus | undefined): void {
+  if (status !== undefined && !INVITATION_STATUSES.includes(status)) {
+    throw new VehicleServiceError('VALIDATION_ERROR', 'Invalid status filter');
+  }
+}
+
+export interface CollectionListOptions<TStatus extends string> {
+  limit?: number;
+  cursor?: string;
+  status?: TStatus;
+  now?: Date;
+  audit?: VehicleAuditLogger;
+}
+
+export interface CollectionPage<TItem> {
+  items: TItem[];
+  nextCursor: string | null;
+}
+
+export interface InvitationListItem {
+  invitation: InvitationRecord;
+  status: InvitationStatus;
+}
+
+export interface ReceivedInvitationListItem extends InvitationListItem {
+  vehicleName: string | null;
+}
+
+/**
+ * Invitations issued for a vehicle. The OWNER sees all of them; an authorized delegate only
+ * those issued through their current membership. Without `status`, every state is listed.
+ */
+export async function listVehicleInvitations(
+  vehicleId: Types.ObjectId,
+  actorUserId: Types.ObjectId,
+  options: CollectionListOptions<InvitationStatus> = {},
+): Promise<CollectionPage<InvitationListItem>> {
+  const audit = options.audit ?? defaultAuditLogger;
+  const now = options.now ?? new Date();
+  validateInvitationStatusFilter(options.status);
+  validateCollectionLimit(options.limit);
+
+  const issuer = await resolveInvitationIssuer(vehicleId, actorUserId, { now, audit });
+  if (issuer.kind === 'NONE') {
+    throw new VehicleServiceError('NOT_FOUND', 'Vehicle not found');
+  }
+  if (issuer.kind === 'VISIBLE_WITHOUT_AUTHORITY') {
+    audit({
+      action: 'invitation.list',
+      actorUserId: String(actorUserId),
+      vehicleId: String(vehicleId),
+      outcome: 'denied',
+      reason: 'insufficient_permissions',
+    });
+    throw new VehicleServiceError('FORBIDDEN', 'Insufficient permissions to list invitations');
+  }
+
+  const scopeCriteria =
+    issuer.kind === 'OWNER'
+      ? { vehicleId }
+      : { vehicleId, issuerMembershipId: issuer.membership._id };
+  const { rows, nextCursor } = await fetchKeysetPage(
+    InvitationModel,
+    [scopeCriteria, invitationStatusCriteria(options.status, now)],
+    {
+      kind: 'vehicle-invitations',
+      actorUserId,
+      resource: String(vehicleId),
+      filter: options.status ?? 'ALL',
+    },
+    options,
+  );
+  return {
+    items: rows.map((invitation) => ({
+      invitation,
+      status: effectiveInvitationStatus(invitation, now),
+    })),
+    nextCursor,
+  };
+}
+
+/**
+ * The caller's own received invitations; no membership is required. Without `status` only
+ * effective PENDING invitations are listed. Vehicle names are resolved in one batch and are
+ * withheld (null) for vehicles that are not ACTIVE or not ownership-consistent.
+ */
+export async function listReceivedInvitations(
+  userId: Types.ObjectId,
+  options: CollectionListOptions<InvitationStatus> = {},
+): Promise<CollectionPage<ReceivedInvitationListItem>> {
+  const now = options.now ?? new Date();
+  validateInvitationStatusFilter(options.status);
+  const status = options.status ?? 'PENDING';
+  const { rows, nextCursor } = await fetchKeysetPage(
+    InvitationModel,
+    [{ inviteeUserId: userId }, invitationStatusCriteria(status, now)],
+    { kind: 'received-invitations', actorUserId: userId, resource: 'self', filter: status },
+    options,
+  );
+
+  const vehicleIds = [
+    ...new Map(rows.map((row) => [String(row.vehicleId), row.vehicleId])).values(),
+  ];
+  const names = new Map<string, string>();
+  if (vehicleIds.length > 0) {
+    const vehicles = (await VehicleModel.find(
+      { _id: { $in: vehicleIds }, status: 'ACTIVE' },
+      { name: 1, ownerUserId: 1, status: 1 },
+    ).lean()) as VehicleRecord[];
+    const ownersByVehicle = await loadOwnerMembershipsByVehicle(
+      vehicles.map((vehicle) => vehicle._id),
+    );
+    for (const vehicle of vehicles) {
+      if (isCanonicalOwnershipConsistent(vehicle, ownersByVehicle.get(String(vehicle._id)) ?? [])) {
+        names.set(String(vehicle._id), vehicle.name);
+      }
+    }
+  }
+
+  return {
+    items: rows.map((invitation) => ({
+      invitation,
+      status: effectiveInvitationStatus(invitation, now),
+      vehicleName: names.get(String(invitation.vehicleId)) ?? null,
+    })),
+    nextCursor,
+  };
+}
+
+/**
+ * OWNER-only member listing. Defaults to ACTIVE and SUSPENDED; REVOKED history requires an
+ * explicit filter.
+ */
+export async function listVehicleMembers(
+  vehicleId: Types.ObjectId,
+  actorUserId: Types.ObjectId,
+  options: CollectionListOptions<MembershipStatus> = {},
+): Promise<CollectionPage<MembershipRecord>> {
+  const audit = options.audit ?? defaultAuditLogger;
+  const now = options.now ?? new Date();
+  if (options.status !== undefined && !MEMBERSHIP_STATUSES.includes(options.status)) {
+    throw new VehicleServiceError('VALIDATION_ERROR', 'Invalid status filter');
+  }
+  validateCollectionLimit(options.limit);
+
+  const relation = await resolveVehicleRelation(vehicleId, actorUserId, { now, audit });
+  if (relation.kind !== 'OWNER') {
+    if (relation.kind === 'READER') {
+      audit({
+        action: 'membership.list',
+        actorUserId: String(actorUserId),
+        vehicleId: String(vehicleId),
+        outcome: 'denied',
+        reason: 'not_canonical_owner',
+      });
+      throw new VehicleServiceError(
+        'FORBIDDEN',
+        'Only the canonical vehicle owner may list members',
+      );
+    }
+    throw new VehicleServiceError('NOT_FOUND', 'Vehicle not found');
+  }
+
+  const statusCriteria: QueryFilter<Membership> =
+    options.status === undefined
+      ? { status: { $in: ['ACTIVE', 'SUSPENDED'] as MembershipStatus[] } }
+      : { status: options.status };
+  const { rows, nextCursor } = await fetchKeysetPage(
+    MembershipModel,
+    [{ vehicleId }, statusCriteria],
+    {
+      kind: 'members',
+      actorUserId,
+      resource: String(vehicleId),
+      filter: options.status ?? 'DEFAULT',
+    },
+    options,
+  );
+  return { items: rows, nextCursor };
 }
 
 export async function createAccessGrant(

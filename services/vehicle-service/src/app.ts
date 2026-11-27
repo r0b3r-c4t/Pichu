@@ -2,11 +2,24 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { z } from 'zod';
 import mongoose, { Types } from 'mongoose';
 import {
+  internalInvitationCreateRequestSchema,
+  internalInvitationRevokeRequestSchema,
+  internalMemberLeaveRequestSchema,
+  internalMemberListQuerySchema,
+  internalMemberPermissionsUpdateRequestSchema,
+  internalMemberReactivateRequestSchema,
+  internalMemberTransitionRequestSchema,
+  internalReceivedInvitationListQuerySchema,
   internalVehicleArchiveRequestSchema,
   internalVehicleCreateRequestSchema,
   internalVehicleGetQuerySchema,
+  internalVehicleInvitationListQuerySchema,
   internalVehicleListQuerySchema,
   internalVehicleUpdateRequestSchema,
+  invitationAcceptRequestSchema,
+  invitationParamsSchema,
+  invitationRevokeParamsSchema,
+  memberParamsSchema,
   vehicleParamsSchema,
 } from '@pichu/contracts';
 import {
@@ -16,7 +29,16 @@ import {
   createVehicle,
   getAccessibleVehicle,
   inviteMember,
+  leaveVehicle,
   listAccessibleVehicles,
+  listReceivedInvitations,
+  listVehicleInvitations,
+  listVehicleMembers,
+  reactivateMembership,
+  revokeInvitation,
+  revokeMembership,
+  suspendMembership,
+  updateMembershipPermissions,
   updateVehicle,
   VehicleServiceError,
   type VehicleAuditLogger,
@@ -30,8 +52,10 @@ import {
 import { requireVerifiedEmail } from './security/email-verification.js';
 import { docsRoutes } from './routes/docs.js';
 import {
-  invitationPublicData,
+  invitationAdminViewData,
+  memberViewData,
   membershipPublicData,
+  receivedInvitationViewData,
   vehicleAccessPublicData,
   vehicleArchivePublicData,
   vehicleOwnerPublicData,
@@ -128,15 +152,13 @@ function sendValidationError(reply: FastifyReply, request: FastifyRequest, messa
   });
 }
 
-const invitationCreateInputSchema = z.strictObject({
-  inviterUserId: z.string().regex(/^[a-f0-9]{24}$/),
-  inviteeUserId: z.string().regex(/^[a-f0-9]{24}$/),
-  permissions: z.array(z.string().trim().min(1).max(64)).max(100),
-});
-
-const invitationAcceptInputSchema = z.strictObject({
-  userId: z.string().regex(/^[a-f0-9]{24}$/),
-});
+/** Identity could not confirm the invitee; mapped to 503/504 without disclosing existence. */
+class InviteeLookupError extends Error {
+  constructor(public readonly status: 503 | 504) {
+    super('Invitee lookup failed');
+    this.name = 'InviteeLookupError';
+  }
+}
 
 const deviceLinkInputSchema = z.strictObject({
   userId: z.string().regex(/^[a-f0-9]{24}$/),
@@ -379,74 +401,167 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
       },
     );
 
+    const authenticateActor = async (
+      request: FastifyRequest,
+      reply: FastifyReply,
+      userId: string,
+    ): Promise<{ runtime: VehicleRuntimeConfig; clientConfig: InternalClientConfig } | null> => {
+      const runtime = resolveRuntimeConfig();
+      const clientConfig = buildOutboundClientConfig(runtime);
+      if (!(await requireVerifiedEmail(request, reply, userId, clientConfig))) {
+        return null;
+      }
+      return { runtime, clientConfig };
+    };
+
     scope.post<{ Params: { vehicleId: string } }>(
       '/vehicles/:vehicleId/invitations',
       { config: { internalOperation: 'invitationCreate' } },
       async (request, reply) => {
-        const parsed = invitationCreateInputSchema.safeParse(request.body);
-        if (!parsed.success || !Types.ObjectId.isValid(request.params.vehicleId)) {
-          return reply.code(400).send({ message: 'Invalid invitation data' });
+        const params = vehicleParamsSchema.safeParse(request.params);
+        const parsed = internalInvitationCreateRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid invitation data');
         }
         if (parsed.data.inviterUserId === parsed.data.inviteeUserId) {
-          return reply.code(400).send({ message: 'Self-invitations are not allowed' });
+          return sendValidationError(reply, request, 'Self-invitations are not allowed');
         }
-
-        const runtime = resolveRuntimeConfig();
-        const clientConfig = buildOutboundClientConfig(runtime);
-        if (
-          !(await requireVerifiedEmail(request, reply, parsed.data.inviterUserId, clientConfig))
-        ) {
+        const actor = await authenticateActor(request, reply, parsed.data.inviterUserId);
+        if (!actor) {
           return;
         }
 
-        const identityPath = `/internal/users/${parsed.data.inviteeUserId}/exists`;
-        let identityResponse;
-        try {
-          identityResponse = await executeSignedInternalRequest(request, clientConfig, {
-            audience: 'identity-service',
-            baseUrl: runtime.identityServiceUrl,
-            method: 'GET',
-            path: identityPath,
-          });
-        } catch (error) {
-          if (error instanceof OutboundDeadlineExceededError) {
-            return reply.code(504).send({ message: 'Identity service timed out' });
+        // Runs only after the domain has authorized the issuer and the delegated permissions.
+        const confirmInviteeExists = async (): Promise<boolean> => {
+          let identityResponse;
+          try {
+            identityResponse = await executeSignedInternalRequest(request, actor.clientConfig, {
+              audience: 'identity-service',
+              baseUrl: actor.runtime.identityServiceUrl,
+              method: 'GET',
+              path: `/internal/users/${parsed.data.inviteeUserId}/exists`,
+            });
+          } catch (error) {
+            throw new InviteeLookupError(
+              error instanceof OutboundDeadlineExceededError ? 504 : 503,
+            );
           }
-          return reply.code(503).send({ message: 'Identity service unavailable' });
-        }
-
-        if (identityResponse.status === 504) {
-          return reply.code(504).send({ message: 'Identity service timed out' });
-        }
-        if (identityResponse.status < 200 || identityResponse.status >= 300) {
-          return reply.code(503).send({ message: 'Identity service unavailable' });
-        }
-        const identity = identityResponse.body as { exists?: boolean };
-        if (!identity.exists) {
-          return reply.code(404).send({ message: 'User not found' });
-        }
+          if (identityResponse.status === 504) {
+            throw new InviteeLookupError(504);
+          }
+          if (identityResponse.status < 200 || identityResponse.status >= 300) {
+            throw new InviteeLookupError(503);
+          }
+          return (identityResponse.body as { exists?: unknown }).exists === true;
+        };
 
         try {
           const invitation = await inviteMember(
-            new Types.ObjectId(request.params.vehicleId),
+            new Types.ObjectId(params.data.vehicleId),
             new Types.ObjectId(parsed.data.inviterUserId),
             new Types.ObjectId(parsed.data.inviteeUserId),
             parsed.data.permissions,
             {
-              ttlMs: runtime.invitationTtlMs,
+              ttlMs: actor.runtime.invitationTtlMs,
               audit: createRequestAuditLogger(request),
+              confirmInviteeExists,
             },
           );
           if (!invitation) {
-            return reply.code(404).send({ message: 'Vehicle not found' });
+            return sendDomainError(
+              reply,
+              request,
+              new VehicleServiceError('NOT_FOUND', 'Vehicle not found'),
+            );
           }
           return reply.code(201).send({
             invitationId: String(invitation._id),
             status: invitation.status,
             message: 'Invitation created',
-            data: invitationPublicData(invitation),
+            data: invitationAdminViewData(invitation, invitation.status),
             requestId: responseRequestId(request),
           });
+        } catch (error) {
+          if (error instanceof InviteeLookupError) {
+            return reply.code(error.status).send({
+              message:
+                error.status === 504
+                  ? 'Identity service timed out'
+                  : 'Identity service unavailable',
+              requestId: responseRequestId(request),
+            });
+          }
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
+      },
+    );
+
+    scope.get<{ Params: { vehicleId: string } }>(
+      '/vehicles/:vehicleId/invitations',
+      { config: { internalOperation: 'invitationList' } },
+      async (request, reply) => {
+        const params = vehicleParamsSchema.safeParse(request.params);
+        const parsed = internalVehicleInvitationListQuerySchema.safeParse(request.query);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid invitation query');
+        }
+        if (!(await authenticateActor(request, reply, parsed.data.userId))) {
+          return;
+        }
+        try {
+          const page = await listVehicleInvitations(
+            new Types.ObjectId(params.data.vehicleId),
+            new Types.ObjectId(parsed.data.userId),
+            {
+              limit: parsed.data.limit,
+              cursor: parsed.data.cursor,
+              status: parsed.data.status,
+              audit: createRequestAuditLogger(request),
+            },
+          );
+          return {
+            invitations: page.items.map((item) =>
+              invitationAdminViewData(item.invitation, item.status),
+            ),
+            page: { nextCursor: page.nextCursor },
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
+      },
+    );
+
+    scope.get(
+      '/invitations',
+      { config: { internalOperation: 'invitationReceivedList' } },
+      async (request, reply) => {
+        const parsed = internalReceivedInvitationListQuerySchema.safeParse(request.query);
+        if (!parsed.success) {
+          return sendValidationError(reply, request, 'Invalid invitation query');
+        }
+        if (!(await authenticateActor(request, reply, parsed.data.userId))) {
+          return;
+        }
+        try {
+          const page = await listReceivedInvitations(new Types.ObjectId(parsed.data.userId), {
+            limit: parsed.data.limit,
+            cursor: parsed.data.cursor,
+            status: parsed.data.status,
+          });
+          return {
+            invitations: page.items.map((item) =>
+              receivedInvitationViewData(item.invitation, item.status, item.vehicleName),
+            ),
+            page: { nextCursor: page.nextCursor },
+            requestId: responseRequestId(request),
+          };
         } catch (error) {
           if (error instanceof VehicleServiceError) {
             return sendDomainError(reply, request, error);
@@ -460,30 +575,282 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
       '/invitations/:invitationId/accept',
       { config: { internalOperation: 'invitationAccept' } },
       async (request, reply) => {
-        const parsed = invitationAcceptInputSchema.safeParse(request.body);
-        if (!parsed.success || !Types.ObjectId.isValid(request.params.invitationId)) {
-          return reply.code(400).send({ message: 'Invalid invitation data' });
+        const params = invitationParamsSchema.safeParse(request.params);
+        const parsed = invitationAcceptRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid invitation data');
         }
-        const runtime = resolveRuntimeConfig();
-        const clientConfig = buildOutboundClientConfig(runtime);
-        if (!(await requireVerifiedEmail(request, reply, parsed.data.userId, clientConfig))) {
+        if (!(await authenticateActor(request, reply, parsed.data.userId))) {
           return;
         }
-
         try {
           const membership = await acceptInvitation(
-            new Types.ObjectId(request.params.invitationId),
+            new Types.ObjectId(params.data.invitationId),
             new Types.ObjectId(parsed.data.userId),
             { audit: createRequestAuditLogger(request) },
           );
           if (!membership) {
-            return reply.code(404).send({ message: 'Invitation not found' });
+            return sendDomainError(
+              reply,
+              request,
+              new VehicleServiceError('NOT_FOUND', 'Invitation not found'),
+            );
           }
           return {
             accepted: true,
             vehicleId: String(membership.vehicleId),
             message: 'Invitation accepted',
             data: membershipPublicData(membership),
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
+      },
+    );
+
+    scope.delete<{ Params: { vehicleId: string; invitationId: string } }>(
+      '/vehicles/:vehicleId/invitations/:invitationId',
+      { config: { internalOperation: 'invitationRevoke' } },
+      async (request, reply) => {
+        const params = invitationRevokeParamsSchema.safeParse(request.params);
+        const parsed = internalInvitationRevokeRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid invitation revocation request');
+        }
+        if (!(await authenticateActor(request, reply, parsed.data.userId))) {
+          return;
+        }
+        try {
+          const result = await revokeInvitation({
+            vehicleId: new Types.ObjectId(params.data.vehicleId),
+            invitationId: new Types.ObjectId(params.data.invitationId),
+            actorUserId: new Types.ObjectId(parsed.data.userId),
+            reason: parsed.data.reason,
+            audit: createRequestAuditLogger(request),
+          });
+          return {
+            invitationId: String(result.invitation._id),
+            status: 'REVOKED',
+            message: result.alreadyRevoked ? 'Invitation already revoked' : 'Invitation revoked',
+            data: invitationAdminViewData(result.invitation, 'REVOKED'),
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
+      },
+    );
+
+    scope.get<{ Params: { vehicleId: string } }>(
+      '/vehicles/:vehicleId/members',
+      { config: { internalOperation: 'memberList' } },
+      async (request, reply) => {
+        const params = vehicleParamsSchema.safeParse(request.params);
+        const parsed = internalMemberListQuerySchema.safeParse(request.query);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid member query');
+        }
+        if (!(await authenticateActor(request, reply, parsed.data.userId))) {
+          return;
+        }
+        try {
+          const page = await listVehicleMembers(
+            new Types.ObjectId(params.data.vehicleId),
+            new Types.ObjectId(parsed.data.userId),
+            {
+              limit: parsed.data.limit,
+              cursor: parsed.data.cursor,
+              status: parsed.data.status,
+              audit: createRequestAuditLogger(request),
+            },
+          );
+          return {
+            members: page.items.map((membership) => memberViewData(membership)),
+            page: { nextCursor: page.nextCursor },
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
+      },
+    );
+
+    const memberMutationResponse = (
+      request: FastifyRequest,
+      membership: Parameters<typeof memberViewData>[0],
+      message: string,
+    ) => {
+      const data = memberViewData(membership);
+      return {
+        membershipId: data.membershipId,
+        status: data.status,
+        message,
+        data,
+        requestId: responseRequestId(request),
+      };
+    };
+
+    scope.patch<{ Params: { vehicleId: string; membershipId: string } }>(
+      '/vehicles/:vehicleId/members/:membershipId',
+      { config: { internalOperation: 'memberUpdate' } },
+      async (request, reply) => {
+        const params = memberParamsSchema.safeParse(request.params);
+        const parsed = internalMemberPermissionsUpdateRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid member permissions');
+        }
+        if (!(await authenticateActor(request, reply, parsed.data.userId))) {
+          return;
+        }
+        try {
+          const result = await updateMembershipPermissions({
+            vehicleId: new Types.ObjectId(params.data.vehicleId),
+            membershipId: new Types.ObjectId(params.data.membershipId),
+            actorUserId: new Types.ObjectId(parsed.data.userId),
+            permissions: parsed.data.permissions,
+            audit: createRequestAuditLogger(request),
+          });
+          return memberMutationResponse(
+            request,
+            result.membership,
+            result.changed ? 'Member permissions updated' : 'Member permissions unchanged',
+          );
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
+      },
+    );
+
+    scope.post<{ Params: { vehicleId: string; membershipId: string } }>(
+      '/vehicles/:vehicleId/members/:membershipId/suspend',
+      { config: { internalOperation: 'memberSuspend' } },
+      async (request, reply) => {
+        const params = memberParamsSchema.safeParse(request.params);
+        const parsed = internalMemberTransitionRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid member suspension request');
+        }
+        if (!(await authenticateActor(request, reply, parsed.data.userId))) {
+          return;
+        }
+        try {
+          const result = await suspendMembership({
+            vehicleId: new Types.ObjectId(params.data.vehicleId),
+            membershipId: new Types.ObjectId(params.data.membershipId),
+            actorUserId: new Types.ObjectId(parsed.data.userId),
+            reason: parsed.data.reason,
+            audit: createRequestAuditLogger(request),
+          });
+          return memberMutationResponse(request, result.membership, 'Member suspended');
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
+      },
+    );
+
+    scope.post<{ Params: { vehicleId: string; membershipId: string } }>(
+      '/vehicles/:vehicleId/members/:membershipId/reactivate',
+      { config: { internalOperation: 'memberReactivate' } },
+      async (request, reply) => {
+        const params = memberParamsSchema.safeParse(request.params);
+        const parsed = internalMemberReactivateRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid member reactivation request');
+        }
+        if (!(await authenticateActor(request, reply, parsed.data.userId))) {
+          return;
+        }
+        try {
+          const membership = await reactivateMembership({
+            vehicleId: new Types.ObjectId(params.data.vehicleId),
+            membershipId: new Types.ObjectId(params.data.membershipId),
+            actorUserId: new Types.ObjectId(parsed.data.userId),
+            audit: createRequestAuditLogger(request),
+          });
+          return memberMutationResponse(request, membership, 'Member reactivated');
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
+      },
+    );
+
+    scope.delete<{ Params: { vehicleId: string; membershipId: string } }>(
+      '/vehicles/:vehicleId/members/:membershipId',
+      { config: { internalOperation: 'memberRevoke' } },
+      async (request, reply) => {
+        const params = memberParamsSchema.safeParse(request.params);
+        const parsed = internalMemberTransitionRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid member revocation request');
+        }
+        if (!(await authenticateActor(request, reply, parsed.data.userId))) {
+          return;
+        }
+        try {
+          const result = await revokeMembership({
+            vehicleId: new Types.ObjectId(params.data.vehicleId),
+            membershipId: new Types.ObjectId(params.data.membershipId),
+            actorUserId: new Types.ObjectId(parsed.data.userId),
+            reason: parsed.data.reason,
+            audit: createRequestAuditLogger(request),
+          });
+          return memberMutationResponse(
+            request,
+            result.membership,
+            result.alreadyRevoked ? 'Member already revoked' : 'Member revoked',
+          );
+        } catch (error) {
+          if (error instanceof VehicleServiceError) {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
+      },
+    );
+
+    scope.post<{ Params: { vehicleId: string } }>(
+      '/vehicles/:vehicleId/members/leave',
+      { config: { internalOperation: 'memberLeave' } },
+      async (request, reply) => {
+        const params = vehicleParamsSchema.safeParse(request.params);
+        const parsed = internalMemberLeaveRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid leave request');
+        }
+        if (!(await authenticateActor(request, reply, parsed.data.userId))) {
+          return;
+        }
+        try {
+          const result = await leaveVehicle({
+            vehicleId: new Types.ObjectId(params.data.vehicleId),
+            actorUserId: new Types.ObjectId(parsed.data.userId),
+            membershipId: new Types.ObjectId(parsed.data.membershipId),
+            audit: createRequestAuditLogger(request),
+          });
+          return {
+            membershipId: String(result.membership._id),
+            status: 'REVOKED',
+            message: result.alreadyRevoked ? 'Membership already revoked' : 'Left vehicle',
+            data: membershipPublicData(result.membership),
             requestId: responseRequestId(request),
           };
         } catch (error) {
@@ -641,9 +1008,54 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
           route: '/vehicles/:vehicleId/invitations',
           senders: ['api-gateway'],
         },
+        invitationList: {
+          method: 'GET',
+          route: '/vehicles/:vehicleId/invitations',
+          senders: ['api-gateway'],
+        },
+        invitationReceivedList: {
+          method: 'GET',
+          route: '/invitations',
+          senders: ['api-gateway'],
+        },
         invitationAccept: {
           method: 'POST',
           route: '/invitations/:invitationId/accept',
+          senders: ['api-gateway'],
+        },
+        invitationRevoke: {
+          method: 'DELETE',
+          route: '/vehicles/:vehicleId/invitations/:invitationId',
+          senders: ['api-gateway'],
+        },
+        memberList: {
+          method: 'GET',
+          route: '/vehicles/:vehicleId/members',
+          senders: ['api-gateway'],
+        },
+        memberUpdate: {
+          method: 'PATCH',
+          route: '/vehicles/:vehicleId/members/:membershipId',
+          senders: ['api-gateway'],
+        },
+        memberSuspend: {
+          method: 'POST',
+          route: '/vehicles/:vehicleId/members/:membershipId/suspend',
+          senders: ['api-gateway'],
+        },
+        memberReactivate: {
+          method: 'POST',
+          route: '/vehicles/:vehicleId/members/:membershipId/reactivate',
+          senders: ['api-gateway'],
+        },
+        memberRevoke: {
+          method: 'DELETE',
+          route: '/vehicles/:vehicleId/members/:membershipId',
+          senders: ['api-gateway'],
+        },
+        memberLeave: {
+          method: 'POST',
+          route: '/vehicles/:vehicleId/members/leave',
           senders: ['api-gateway'],
         },
         deviceLink: {
