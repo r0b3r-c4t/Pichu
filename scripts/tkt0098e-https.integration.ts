@@ -355,6 +355,7 @@ async function main() {
     await wait(`https://localhost:${ports.identity}/health`, children[0], caCert);
     await wait(`https://localhost:${ports.vehicle}/health`, children[1], caCert);
     await wait(`https://localhost:${ports.device}/health`, children[2], caCert);
+    await wait(`https://localhost:${ports.device}/health/ready`, children[2], caCert);
     children.push(
       startGateway({
         ...process.env,
@@ -425,12 +426,41 @@ async function main() {
     });
     assert.equal(link.status, 201);
     const deviceId = (link.body as { deviceId: string }).deviceId;
+    const deviceObjectId = new mongoose.Types.ObjectId(deviceId);
+    // TKT-014: Vehicle→Device registration over HTTPS persists the requester and an ACTIVE
+    // credential, and leaves the device PENDING (registration is not a link).
+    const registered = await deviceDb.collection('devices').findOne({ _id: deviceObjectId });
+    assert.equal(registered?.status, 'PENDING');
+    assert.equal(String(registered?.requestedByUserId), userId);
+    assert.equal(registered?.linkedByUserId, null);
+    assert.equal(registered && 'publicKey' in registered, false);
+    assert.equal(
+      await deviceDb
+        .collection('device_credentials')
+        .countDocuments({ deviceId: deviceObjectId, status: 'ACTIVE' }),
+      1,
+    );
+    for (const disabledPath of ['challenge', 'link']) {
+      const disabled = await httpsJsonRequest({
+        url: `https://localhost:${ports.device}/devices/${deviceId}/${disabledPath}`,
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.from('{}'),
+        timeoutMs: 5000,
+        tls: { caPath: caCert, servername: 'localhost' },
+      });
+      assert.equal(disabled.status, 404);
+    }
+    // Transport fixture only, NOT evidence that linking works: the secure link protocol has no
+    // authenticated cross-service caller yet. Real linking is proven by Device domain integration
+    // tests. This write only enables the Gateway→Device HTTPS read regression below.
     await deviceDb.collection('devices').updateOne(
-      { _id: new mongoose.Types.ObjectId(deviceId) },
+      { _id: deviceObjectId, status: 'PENDING' },
       {
         $set: {
           status: 'ACTIVE',
           linkedByUserId: new mongoose.Types.ObjectId(userId),
+          linkedAt: new Date(),
           vehicleId: new mongoose.Types.ObjectId(vehicleId),
         },
       },
@@ -551,6 +581,9 @@ async function main() {
     assert.ok(unavailable.status === 502 || unavailable.status === 504);
     console.log(
       'TKT-009.8E.2 HTTPS integrations: PASS (Gateway→Vehicle/Device, Vehicle→Identity/Device, Device→Identity; security negatives rejected)',
+    );
+    console.log(
+      'TKT-009.8E.2 limitation: device linking is not exercised across services; the ACTIVE state used for the Gateway→Device read is a transport fixture.',
     );
   } finally {
     await mongoClient?.close().catch(() => undefined);

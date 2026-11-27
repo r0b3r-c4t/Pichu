@@ -3,20 +3,15 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import test from 'node:test';
 import { signRequest, type KeyEntry } from '@pichu/internal-auth';
 import type { InternalUnsignedHeadersV2 } from '@pichu/contracts';
-import { isEd25519PublicKey } from '../src/app.js';
+import { parseDevicePublicKey, verifyDeviceSignature } from '../src/security/device-public-key.js';
 
-test('Ed25519 signs and verifies a challenge', () => {
+test('Ed25519 signs and verifies a challenge with the canonical device key', () => {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519');
   const challenge = Buffer.from('pichu-device-challenge');
-  const signature = sign(null, challenge, privateKey);
-  assert.equal(publicKey.asymmetricKeyType, 'ed25519');
-  assert.equal(publicKey.asymmetricKeyType, 'ed25519');
-  assert.equal(signature.length > 0, true);
-  assert.equal(
-    isEd25519PublicKey(publicKey.export({ type: 'spki', format: 'pem' }).toString()),
-    true,
-  );
-  assert.equal(isEd25519PublicKey('not-a-public-key'), false);
+  const signature = sign(null, challenge, privateKey).toString('base64url');
+  const key = parseDevicePublicKey(publicKey.export({ type: 'spki', format: 'pem' }).toString());
+  assert.equal(verifyDeviceSignature(key.publicKeyPem, challenge, signature), true);
+  assert.throws(() => parseDevicePublicKey('not-a-public-key'));
 });
 
 test('pichu-s2s-v2 signature is deterministic and key-bound', () => {
