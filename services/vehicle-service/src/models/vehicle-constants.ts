@@ -154,6 +154,34 @@ export const ALL_KNOWN_PERMISSIONS = [
 ] as const;
 export type KnownVehiclePermission = (typeof ALL_KNOWN_PERMISSIONS)[number];
 
+/** Resource types an authorization decision can target (same values as AccessGrant scopes). */
+export const AUTHORIZATION_RESOURCE_TYPES = ACCESS_GRANT_SCOPE_TYPES;
+export type AuthorizationResourceType = AccessGrantScopeType;
+
+/**
+ * Permissions that may be evaluated on each resource type. Every known permission applies to
+ * exactly one resource type; any other combination is rejected before access is considered,
+ * even for the OWNER. `device:link` is evaluated on VEHICLE because the device may not be linked
+ * yet. This catalog is independent of the AccessGrant catalogs: `vehicle:manage` is evaluable
+ * but never grantable, and the historical VEHICLE-scoped `device:read` grant permission is still
+ * accepted on stored records but is neither issuable nor evaluable on VEHICLE (it never extends
+ * to DEVICE). See `isIssuableAccessGrantPermission`.
+ */
+export const EVALUABLE_PERMISSIONS_BY_RESOURCE: Readonly<
+  Record<AuthorizationResourceType, readonly KnownVehiclePermission[]>
+> = {
+  VEHICLE: [
+    ...OWNER_RESERVED_PERMISSIONS,
+    'vehicle:read',
+    'vehicle:update',
+    'vehicle:manage',
+    'invitation:create',
+    'device:link',
+  ],
+  DEVICE: ['device:read', 'device:connect', 'device:command'],
+  MODULE: ['module:read', 'module:configure', 'module:actuate'],
+};
+
 const ownerReservedSet = new Set<string>(OWNER_RESERVED_PERMISSIONS);
 const delegableMembershipSet = new Set<string>(DELEGABLE_MEMBERSHIP_PERMISSIONS);
 const allKnownSet = new Set<string>(ALL_KNOWN_PERMISSIONS);
@@ -161,6 +189,11 @@ const grantScopePermissions: Readonly<Record<AccessGrantScopeType, ReadonlySet<s
   VEHICLE: new Set<string>(ACCESS_GRANT_VEHICLE_PERMISSIONS),
   DEVICE: new Set<string>(ACCESS_GRANT_DEVICE_PERMISSIONS),
   MODULE: new Set<string>(ACCESS_GRANT_MODULE_PERMISSIONS),
+};
+const evaluablePermissions: Readonly<Record<AuthorizationResourceType, ReadonlySet<string>>> = {
+  VEHICLE: new Set<string>(EVALUABLE_PERMISSIONS_BY_RESOURCE.VEHICLE),
+  DEVICE: new Set<string>(EVALUABLE_PERMISSIONS_BY_RESOURCE.DEVICE),
+  MODULE: new Set<string>(EVALUABLE_PERMISSIONS_BY_RESOURCE.MODULE),
 };
 
 export function containsControlCharacter(value: string): boolean {
@@ -209,6 +242,11 @@ export function isDelegableMembershipPermission(
   return isKnownPermission(permission) && delegableMembershipSet.has(permission);
 }
 
+/**
+ * Storage catalog: permissions an AccessGrant record of the scope may hold, including historical
+ * combinations that can no longer be issued. Used to keep stored records valid for reading,
+ * auditing, expiry, and revocation; use `isIssuableAccessGrantPermission` for new grants.
+ */
 export function isAccessGrantPermissionForScope(
   scopeType: AccessGrantScopeType,
   permission: string,
@@ -217,6 +255,31 @@ export function isAccessGrantPermissionForScope(
     return false;
   }
   return grantScopePermissions[scopeType].has(permission);
+}
+
+export function isPermissionApplicableToResource(
+  resourceType: AuthorizationResourceType,
+  permission: string,
+): boolean {
+  return (
+    isKnownPermission(permission) &&
+    Object.hasOwn(evaluablePermissions, resourceType) &&
+    evaluablePermissions[resourceType].has(permission)
+  );
+}
+
+/**
+ * Creation catalog: a new AccessGrant may only carry permissions that are grantable for its
+ * scope and evaluable on the same resource type, so every issued grant can actually apply.
+ */
+export function isIssuableAccessGrantPermission(
+  scopeType: AccessGrantScopeType,
+  permission: string,
+): boolean {
+  return (
+    isAccessGrantPermissionForScope(scopeType, permission) &&
+    isPermissionApplicableToResource(scopeType, permission)
+  );
 }
 
 export function validatePermissionSet(

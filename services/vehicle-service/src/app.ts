@@ -904,10 +904,18 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
           return reply.code(404).send({ message: 'User or vehicle not found' });
         }
 
-        const allowed = await canLinkDeviceToVehicle(
-          new Types.ObjectId(vehicleId),
-          new Types.ObjectId(parsed.data.userId),
-        );
+        let allowed: boolean;
+        try {
+          allowed = await canLinkDeviceToVehicle(
+            new Types.ObjectId(vehicleId),
+            new Types.ObjectId(parsed.data.userId),
+          );
+        } catch (error) {
+          if (error instanceof VehicleServiceError && error.code === 'DATABASE_UNAVAILABLE') {
+            return sendDomainError(reply, request, error);
+          }
+          throw error;
+        }
         if (!allowed) {
           createRequestAuditLogger(request)({
             action: 'device.link_authorize',
