@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { createHmac, generateKeyPairSync, randomBytes, randomUUID } from 'node:crypto';
+import { createHmac, generateKeyPairSync, randomUUID, sign as signDetached } from 'node:crypto';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import mongoose from '../services/vehicle-service/node_modules/mongoose/index.js';
@@ -141,7 +141,9 @@ async function wait(url: string, child: ChildProcess, ca: string) {
         tls: { caPath: ca, servername: 'localhost' },
       });
       if (r.status === 200) return;
-    } catch {}
+    } catch {
+      /* retry until ready */
+    }
     await delay(200);
   }
   reportProcessFailure(child, 'readiness-timeout');
@@ -156,7 +158,9 @@ async function waitHttp(url: string, child: ChildProcess) {
     try {
       const response = await fetch(url);
       if (response.ok) return;
-    } catch {}
+    } catch {
+      /* retry until ready */
+    }
     await delay(200);
   }
   reportProcessFailure(child, 'readiness-timeout');
@@ -260,8 +264,8 @@ async function main() {
       ext,
     ]);
     authenticatedMongo = await startAuthenticatedMongo();
-    const binding = authenticatedMongo.binding;
-    mongoClient = new mongoose.mongo.MongoClient(authenticatedMongo.rootUri, {
+    const activeMongo = authenticatedMongo;
+    mongoClient = new mongoose.mongo.MongoClient(activeMongo.rootUri, {
       serverSelectionTimeoutMS: 3000,
     });
     await mongoClient.connect();
@@ -299,7 +303,7 @@ async function main() {
       device: await freePort(),
       gateway: await freePort(),
     };
-    const dbUrl = (service: 'identity' | 'vehicle' | 'device') => authenticatedMongo.uri(service);
+    const dbUrl = (service: 'identity' | 'vehicle' | 'device') => activeMongo.uri(service);
     const common = {
       NODE_ENV: 'test',
       HOST: '127.0.0.1',
@@ -401,37 +405,68 @@ async function main() {
       },
     });
     assert.equal(detail.status, 200);
-    const linkBody = Buffer.from(
-      JSON.stringify({
-        userId,
-        deviceIdentifier: `tls-device-${id}`,
-        publicKey: generateKeyPairSync('ed25519')
-          .publicKey.export({ type: 'spki', format: 'pem' })
-          .toString(),
-      }),
-    );
-    const link = await httpsJsonRequest({
-      url: `https://localhost:${ports.vehicle}/vehicles/${vehicleId}/devices/link`,
+    const deviceKeyPair = generateKeyPairSync('ed25519');
+    const devicePublicKeyPem = deviceKeyPair.publicKey
+      .export({ type: 'spki', format: 'pem' })
+      .toString();
+
+    // Alias retirado en TKT-015: POST /api/vehicles/:vehicleId/devices/link -> 404
+    const retiredAlias = await fetch(`${gateway}/api/vehicles/${vehicleId}/devices/link`, {
       method: 'POST',
-      headers: authHeaders(
-        findKey('api-gateway', 'vehicle-service'),
-        'vehicle-service',
-        'POST',
-        `/vehicles/${vehicleId}/devices/link`,
-        linkBody,
-      ),
-      body: linkBody,
-      timeoutMs: 5000,
-      tls: { caPath: caCert, servername: 'localhost' },
+      headers: {
+        authorization: `Bearer ${userJwt}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        identifier: `tls-device-retired-${id}`,
+        publicKey: devicePublicKeyPem,
+      }),
     });
-    assert.equal(link.status, 201);
-    const deviceId = (link.body as { deviceId: string }).deviceId;
+    assert.equal(retiredAlias.status, 404);
+
+    // 1. Registro transaccional real: Gateway -> Vehicle -> Device (PENDING + credencial ACTIVE)
+    const registerRes = await fetch(`${gateway}/api/vehicles/${vehicleId}/devices`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${userJwt}`,
+        'content-type': 'application/json',
+        'x-request-id': 'gateway-https-device-register',
+      },
+      body: JSON.stringify({
+        identifier: `tls-device-${id}`,
+        publicKey: devicePublicKeyPem,
+        metadata: {
+          name: '  Sunroof Controller  ',
+          manufacturer: 'Espressif',
+          hardwareModel: 'ESP32-S3',
+          firmwareVersion: '1.0.0',
+        },
+      }),
+    });
+    assert.equal(registerRes.status, 201);
+    const registerPayload = (await registerRes.json()) as {
+      deviceId: string;
+      status: string;
+      data: {
+        status: string;
+        operational: boolean;
+        credential: { credentialId: string; status: string; usable: boolean };
+        metadata: { name: string | null; serialNumber: string | null };
+      };
+    };
+    const deviceId = registerPayload.deviceId;
+    assert.equal(registerPayload.status, 'PENDING');
+    assert.equal(registerPayload.data.operational, false);
+    assert.equal(registerPayload.data.credential.status, 'ACTIVE');
+    assert.equal(registerPayload.data.credential.usable, true);
+    assert.equal(registerPayload.data.metadata.name, 'Sunroof Controller');
+    assert.equal(JSON.stringify(registerPayload).includes('publicKey'), false);
+
     const deviceObjectId = new mongoose.Types.ObjectId(deviceId);
-    // TKT-014: Vehicle→Device registration over HTTPS persists the requester and an ACTIVE
-    // credential, and leaves the device PENDING (registration is not a link).
     const registered = await deviceDb.collection('devices').findOne({ _id: deviceObjectId });
     assert.equal(registered?.status, 'PENDING');
     assert.equal(String(registered?.requestedByUserId), userId);
+    assert.ok(registered?.requestedByMembershipId);
     assert.equal(registered?.linkedByUserId, null);
     assert.equal(registered && 'publicKey' in registered, false);
     assert.equal(
@@ -440,7 +475,16 @@ async function main() {
         .countDocuments({ deviceId: deviceObjectId, status: 'ACTIVE' }),
       1,
     );
-    for (const disabledPath of ['challenge', 'link']) {
+
+    // Ninguna ruta directa de usuario existe en Device (incluido GET /devices/:deviceId retirado)
+    const directRead = await httpsJsonRequest({
+      url: `https://localhost:${ports.device}/devices/${deviceId}`,
+      method: 'GET',
+      timeoutMs: 5000,
+      tls: { caPath: caCert, servername: 'localhost' },
+    });
+    assert.equal(directRead.status, 404);
+    for (const disabledPath of ['challenge', 'link', 'revoke']) {
       const disabled = await httpsJsonRequest({
         url: `https://localhost:${ports.device}/devices/${deviceId}/${disabledPath}`,
         method: 'POST',
@@ -451,39 +495,213 @@ async function main() {
       });
       assert.equal(disabled.status, 404);
     }
-    // Transport fixture only, NOT evidence that linking works: the secure link protocol has no
-    // authenticated cross-service caller yet. Real linking is proven by Device domain integration
-    // tests. This write only enables the Gateway→Device HTTPS read regression below.
-    await deviceDb.collection('devices').updateOne(
-      { _id: deviceObjectId, status: 'PENDING' },
+
+    // 2. Desafío CSPRNG de un solo uso (solo hash almacenado en MongoDB)
+    const challengeRes = await fetch(
+      `${gateway}/api/vehicles/${vehicleId}/devices/${deviceId}/challenge`,
       {
-        $set: {
-          status: 'ACTIVE',
-          linkedByUserId: new mongoose.Types.ObjectId(userId),
-          linkedAt: new Date(),
-          vehicleId: new mongoose.Types.ObjectId(vehicleId),
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${userJwt}`,
+          'content-type': 'application/json',
+          'x-request-id': 'gateway-https-device-challenge',
         },
+        body: JSON.stringify({}),
       },
     );
+    assert.equal(challengeRes.status, 201);
+    const challengePayload = (await challengeRes.json()) as {
+      data: {
+        protocol: string;
+        challengeId: string;
+        deviceId: string;
+        vehicleId: string;
+        credentialId: string;
+        requestedByUserId: string;
+        challenge: string;
+        expiresAt: string;
+      };
+    };
+    assert.equal(challengePayload.data.protocol, 'pichu-device-link-v1');
+    assert.equal(challengePayload.data.deviceId, deviceId);
+    assert.equal(challengePayload.data.vehicleId, vehicleId);
+    assert.equal(challengePayload.data.requestedByUserId, userId);
+
+    const storedChallenge = await deviceDb
+      .collection('devicelinkchallenges')
+      .findOne({ _id: new mongoose.Types.ObjectId(challengePayload.data.challengeId) });
+    assert.ok(storedChallenge?.challengeHash);
+    assert.equal(storedChallenge && 'challenge' in storedChallenge, false);
+
+    // 3. Firma Ed25519 sobre mensaje canónico pichu-device-link-v1 (sin fixture manual ACTIVE)
+    const canonicalMessage = [
+      challengePayload.data.protocol,
+      challengePayload.data.deviceId,
+      challengePayload.data.vehicleId,
+      challengePayload.data.credentialId,
+      challengePayload.data.requestedByUserId,
+      challengePayload.data.challengeId,
+      challengePayload.data.challenge,
+    ].join('\n');
+    const signature = signDetached(
+      null,
+      Buffer.from(canonicalMessage, 'utf8'),
+      deviceKeyPair.privateKey,
+    ).toString('base64url');
+
+    const linkRes = await fetch(`${gateway}/api/vehicles/${vehicleId}/devices/${deviceId}/link`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${userJwt}`,
+        'content-type': 'application/json',
+        'x-request-id': 'gateway-https-device-link',
+      },
+      body: JSON.stringify({
+        challengeId: challengePayload.data.challengeId,
+        challenge: challengePayload.data.challenge,
+        signature,
+      }),
+    });
+    assert.equal(linkRes.status, 200);
+    const linkPayload = (await linkRes.json()) as {
+      status: string;
+      data: { status: string; operational: boolean };
+    };
+    assert.equal(linkPayload.status, 'ACTIVE');
+    assert.equal(linkPayload.data.operational, true);
+
+    // 4. Consultas y actualización de metadatos siempre vía Gateway -> Vehicle -> Device
     const read = await fetch(`${gateway}/api/devices/${deviceId}`, {
       headers: {
         authorization: `Bearer ${userJwt}`,
-        'x-request-id': 'gateway-https-device',
+        'x-request-id': 'gateway-https-device-read',
       },
     });
     assert.equal(read.status, 200);
+    const readPayload = (await read.json()) as {
+      status: string;
+      operational: boolean;
+      connectivity: { lastSeenAt: string | null };
+    };
+    assert.equal(readPayload.status, 'ACTIVE');
+    assert.equal(readPayload.operational, true);
+    assert.equal(readPayload.connectivity.lastSeenAt, null);
+    assert.equal(JSON.stringify(readPayload).includes('publicKey'), false);
+
+    const readScoped = await fetch(`${gateway}/api/vehicles/${vehicleId}/devices/${deviceId}`, {
+      headers: {
+        authorization: `Bearer ${userJwt}`,
+        'x-request-id': 'gateway-https-device-read-scoped',
+      },
+    });
+    assert.equal(readScoped.status, 200);
+    const readScopedPayload = (await readScoped.json()) as {
+      deviceId: string;
+      status: string;
+      operational: boolean;
+    };
+    assert.equal(readScopedPayload.deviceId, deviceId);
+    assert.equal(readScopedPayload.status, 'ACTIVE');
+    assert.equal(readScopedPayload.operational, true);
+
+    const listDevices = await fetch(`${gateway}/api/vehicles/${vehicleId}/devices`, {
+      headers: {
+        authorization: `Bearer ${userJwt}`,
+        'x-request-id': 'gateway-https-device-list',
+      },
+    });
+    assert.equal(listDevices.status, 200);
+    const listPayload = (await listDevices.json()) as {
+      devices: Array<{ deviceId: string; status: string }>;
+    };
+    assert.deepEqual(
+      listPayload.devices.map((item) => [item.deviceId, item.status]),
+      [[deviceId, 'ACTIVE']],
+    );
+
+    const patchRes = await fetch(`${gateway}/api/vehicles/${vehicleId}/devices/${deviceId}`, {
+      method: 'PATCH',
+      headers: {
+        authorization: `Bearer ${userJwt}`,
+        'content-type': 'application/json',
+        'x-request-id': 'gateway-https-device-patch',
+      },
+      body: JSON.stringify({
+        name: 'Sunroof Primary Module',
+        manufacturer: null,
+      }),
+    });
+    assert.equal(patchRes.status, 200);
+    const patchPayload = (await patchRes.json()) as {
+      data: { metadata: { name: string | null; manufacturer: string | null } };
+    };
+    assert.equal(patchPayload.data.metadata.name, 'Sunroof Primary Module');
+    assert.equal(patchPayload.data.metadata.manufacturer, null);
+
+    // 5. Revocación administrativa por OWNER (estado terminal REVOKED)
+    const revokeRes = await fetch(
+      `${gateway}/api/vehicles/${vehicleId}/devices/${deviceId}/revoke`,
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${userJwt}`,
+          'content-type': 'application/json',
+          'x-request-id': 'gateway-https-device-revoke',
+        },
+        body: JSON.stringify({ reason: 'SECURITY_COMPROMISE' }),
+      },
+    );
+    assert.equal(revokeRes.status, 200);
+    const revokePayload = (await revokeRes.json()) as {
+      status: string;
+      data: {
+        status: string;
+        operational: boolean;
+        credential: { status: string; usable: boolean };
+        revocationReason: string | null;
+      };
+    };
+    assert.equal(revokePayload.status, 'REVOKED');
+    assert.equal(revokePayload.data.operational, false);
+    assert.equal(revokePayload.data.credential.status, 'REVOKED');
+    assert.equal(revokePayload.data.credential.usable, false);
+    assert.equal(revokePayload.data.revocationReason, 'SECURITY_COMPROMISE');
+
+    // Gateway nunca llama directamente a Device; todas las operaciones pasaron por Vehicle
     assert.equal(
       await vehicleDb
         .collection(NONCE_COLLECTION)
         .countDocuments({ sender: 'api-gateway', audience: 'vehicle-service' }),
-      4,
+      11,
     );
     assert.equal(
       await deviceDb
         .collection(NONCE_COLLECTION)
         .countDocuments({ sender: 'api-gateway', audience: 'device-service' }),
-      1,
+      0,
     );
+    assert.equal(
+      await deviceDb
+        .collection(NONCE_COLLECTION)
+        .countDocuments({ sender: 'vehicle-service', audience: 'device-service' }),
+      12,
+    );
+
+    // Incluso con HMAC válido de api-gateway -> device-service, Device rechaza llamadores distintos de vehicle-service
+    const forbiddenGatewayInternal = await httpsJsonRequest({
+      url: `https://localhost:${ports.device}/internal/devices/${deviceId}`,
+      method: 'GET',
+      headers: authHeaders(
+        findKey('api-gateway', 'device-service'),
+        'device-service',
+        'GET',
+        `/internal/devices/${deviceId}`,
+        Buffer.alloc(0),
+      ),
+      timeoutMs: 5000,
+      tls: { caPath: caCert, servername: 'localhost' },
+    });
+    assert.equal(forbiddenGatewayInternal.status, 403);
     const invalidJwt = await fetch(`${gateway}/api/vehicles`, {
       headers: { authorization: 'Bearer invalid.token.value' },
     });
@@ -580,10 +798,7 @@ async function main() {
     });
     assert.ok(unavailable.status === 502 || unavailable.status === 504);
     console.log(
-      'TKT-009.8E.2 HTTPS integrations: PASS (Gateway→Vehicle/Device, Vehicle→Identity/Device, Device→Identity; security negatives rejected)',
-    );
-    console.log(
-      'TKT-009.8E.2 limitation: device linking is not exercised across services; the ACTIVE state used for the Gateway→Device read is a transport fixture.',
+      'TKT-009.8E.2 HTTPS integrations: PASS (Gateway→Vehicle→Device real Ed25519 enrollment, query, patch and revocation; Vehicle→Identity; security negatives rejected)',
     );
   } finally {
     await mongoClient?.close().catch(() => undefined);

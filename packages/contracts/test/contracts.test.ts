@@ -10,7 +10,7 @@ import {
   vehicleCreateRequestSchema,
   deviceSummarySchema,
   reportedStateSchema,
-  deviceLinkRequestSchema,
+  publicDeviceRegistrationRequestSchema,
   deviceLinkCompletionSchema,
 } from '../src/index.js';
 
@@ -79,14 +79,15 @@ test('vehicle, device and automation contracts validate their public DTOs', () =
   assert.equal(state.success, true);
 });
 
-test('device linking contracts require an account-scoped vehicle and a proof', () => {
-  const request = deviceLinkRequestSchema.safeParse({
-    vehicleId: '507f1f77bcf86cd799439011',
-    deviceIdentifier: 'esp32-01',
+test('device linking contracts require cryptographic key material and canonical proof', () => {
+  const request = publicDeviceRegistrationRequestSchema.safeParse({
+    identifier: 'esp32-01',
+    publicKey: '-----BEGIN PUBLIC KEY-----\n' + 'A'.repeat(44) + '\n-----END PUBLIC KEY-----',
   });
   const completion = deviceLinkCompletionSchema.safeParse({
     challengeId: '507f1f77bcf86cd799439011',
-    proof: 'signed-device-proof',
+    challenge: `${'A'.repeat(42)}A`,
+    signature: `${'A'.repeat(85)}A`,
   });
 
   assert.equal(request.success, true);

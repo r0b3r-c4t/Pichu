@@ -252,6 +252,7 @@ test('mutations that require transactions are rejected on standalone without par
         publicKey: pem,
         vehicleId: String(new Types.ObjectId()),
         userId: String(new Types.ObjectId()),
+        membershipId: String(new Types.ObjectId()),
       }),
     );
     const response = await app.inject({
@@ -268,11 +269,15 @@ test('mutations that require transactions are rejected on standalone without par
   assert.deepEqual(await count(), before);
 
   const legacyId = new Types.ObjectId();
+  const legacyVehicleId = new Types.ObjectId();
+  const legacyRequesterId = new Types.ObjectId();
+  const legacyMembershipId = new Types.ObjectId();
   await db().collection(DeviceModel.collection.name).insertOne({
     _id: legacyId,
     identifier: 'esp32-standalone-raw',
-    vehicleId: new Types.ObjectId(),
-    requestedByUserId: new Types.ObjectId(),
+    vehicleId: legacyVehicleId,
+    requestedByUserId: legacyRequesterId,
+    requestedByMembershipId: legacyMembershipId,
     linkedByUserId: null,
     linkedAt: null,
     status: 'PENDING',
@@ -290,7 +295,12 @@ test('mutations that require transactions are rejected on standalone without par
     }),
   );
   await assert.rejects(
-    createDeviceChallenge({ deviceId: legacyId, requestedByUserId: new Types.ObjectId() }),
+    createDeviceChallenge({
+      deviceId: legacyId,
+      vehicleId: legacyVehicleId,
+      requestedByUserId: legacyRequesterId,
+      requestedByMembershipId: legacyMembershipId,
+    }),
   );
   await assert.rejects(findEffectiveDeviceBinding(String(legacyId)));
   const raw = await db().collection(DeviceModel.collection.name).findOne({ _id: legacyId });

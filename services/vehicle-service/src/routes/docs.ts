@@ -4,6 +4,8 @@ import swaggerUi from '@fastify/swagger-ui';
 import type { OpenAPIV3 } from 'openapi-types';
 import { z } from 'zod';
 import {
+  deviceDetailSchema,
+  deviceStatusSchema,
   internalInvitationCreateRequestSchema,
   internalInvitationRevokeRequestSchema,
   internalMemberLeaveRequestSchema,
@@ -12,6 +14,11 @@ import {
   internalMemberTransitionRequestSchema,
   internalVehicleArchiveRequestSchema,
   internalVehicleCreateRequestSchema,
+  internalVehicleDeviceChallengeRequestSchema,
+  internalVehicleDeviceLinkCompletionRequestSchema,
+  internalVehicleDeviceMetadataUpdateRequestSchema,
+  internalVehicleDeviceRegistrationRequestSchema,
+  internalVehicleDeviceRevokeRequestSchema,
   internalVehicleUpdateRequestSchema,
   invitationAcceptRequestSchema,
   invitationAdminViewSchema,
@@ -20,6 +27,11 @@ import {
   membershipSchema,
   membershipStatusSchema,
   receivedInvitationViewSchema,
+  vehicleDeviceChallengeResponseSchema,
+  vehicleDeviceLinkResponseSchema,
+  vehicleDeviceMetadataUpdateResponseSchema,
+  vehicleDeviceRegistrationResponseSchema,
+  vehicleDeviceRevokeResponseSchema,
 } from '@pichu/contracts';
 import {
   vehicleAccessPublicSchema,
@@ -67,7 +79,26 @@ const document = {
     '/vehicles/{vehicleId}/members/{membershipId}/reactivate': {
       post: { summary: 'Reactivar membresía suspendida (solo propietario canónico)' },
     },
-    '/vehicles/{vehicleId}/devices/link': { post: { summary: 'Registrar dispositivo vinculado' } },
+    '/vehicles/{vehicleId}/devices': {
+      post: { summary: 'Registrar dispositivo PENDING para el vehículo' },
+      get: { summary: 'Listar dispositivos autorizados del vehículo con paginación keyset' },
+    },
+    '/vehicles/{vehicleId}/devices/{deviceId}': {
+      get: { summary: 'Consultar detalle de dispositivo en el ámbito del vehículo' },
+      patch: { summary: 'Actualizar metadatos descriptivos del dispositivo' },
+    },
+    '/devices/{deviceId}': {
+      get: { summary: 'Consultar detalle de dispositivo por identificador' },
+    },
+    '/vehicles/{vehicleId}/devices/{deviceId}/challenge': {
+      post: { summary: 'Emitir desafío criptográfico de enrolamiento' },
+    },
+    '/vehicles/{vehicleId}/devices/{deviceId}/link': {
+      post: { summary: 'Completar vinculación de dispositivo mediante firma Ed25519 canónica' },
+    },
+    '/vehicles/{vehicleId}/devices/{deviceId}/revoke': {
+      post: { summary: 'Revocar dispositivo irreversiblemente' },
+    },
   },
 };
 
@@ -91,11 +122,6 @@ const requestExamples: Record<string, unknown> = {
     permissions: ['vehicle:read'],
   },
   '/invitations/{invitationId}/accept': { userId: '507f1f77bcf86cd799439012' },
-  '/vehicles/{vehicleId}/devices/link': {
-    userId: '507f1f77bcf86cd799439011',
-    deviceIdentifier: 'esp32-node-01',
-    publicKey: '-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----',
-  },
 };
 
 const paths = document.paths as unknown as Record<string, Record<string, Record<string, unknown>>>;
@@ -104,7 +130,7 @@ const vehicleTags = [
   { name: 'Vehicles', description: 'Vehículos y acceso aislado por recurso' },
   { name: 'Invitations', description: 'Invitaciones' },
   { name: 'Members', description: 'Administración de membresías' },
-  { name: 'Devices', description: 'Vinculación autorizada de dispositivos' },
+  { name: 'Devices', description: 'Registro, enrolamiento, consulta y revocación de dispositivos' },
 ];
 (document as unknown as { tags: typeof vehicleTags }).tags = vehicleTags;
 for (const [path, operations] of Object.entries(paths)) {
@@ -114,7 +140,7 @@ for (const [path, operations] of Object.entries(paths)) {
       ? 'Invitations'
       : path.includes('/members')
         ? 'Members'
-        : path.includes('/devices/')
+        : path.includes('/devices')
           ? 'Devices'
           : 'Vehicles';
   for (const operation of Object.values(operations)) operation.tags = [tag];
@@ -720,36 +746,278 @@ paths['/vehicles/{vehicleId}/members/leave'].post.responses = {
     'The vehicle owner cannot leave the vehicle',
   ),
 };
-paths['/vehicles/{vehicleId}/devices/link'].post.responses = {
-  201: result(
-    'Device registration accepted',
+const deviceDetailExample = {
+  deviceId: '507f1f77bcf86cd799439015',
+  vehicleId: vehicleExample.id,
+  identifier: 'esp32-sunroof-01',
+  status: 'PENDING' as const,
+  operational: false,
+  credential: {
+    credentialId: '507f1f77bcf86cd799439017',
+    keyId: 'dk_AAAAAAAAAAAAAAAAAAAAAA',
+    algorithm: 'Ed25519' as const,
+    fingerprint: `sha256:${'a'.repeat(64)}`,
+    status: 'ACTIVE' as const,
+    usable: true,
+    activatedAt: '2026-11-26T12:00:00.000Z',
+    expiresAt: null,
+    revokedAt: null,
+  },
+  connectivity: { lastSeenAt: null },
+  metadata: {
+    name: 'Sunroof Node',
+    manufacturer: 'Espressif',
+    hardwareModel: 'ESP32-S3',
+    hardwareRevision: 'rev-1.0',
+    firmwareVersion: '1.0.0',
+    serialNumber: 'SN-001',
+  },
+  createdAt: '2026-11-26T12:00:00.000Z',
+  updatedAt: '2026-11-26T12:00:00.000Z',
+  linkedAt: null,
+  revokedAt: null,
+  revocationReason: null,
+};
+const deviceChallengeExample = {
+  protocol: 'pichu-device-link-v1' as const,
+  challengeId: '507f1f77bcf86cd799439018',
+  deviceId: deviceDetailExample.deviceId,
+  vehicleId: vehicleExample.id,
+  credentialId: deviceDetailExample.credential.credentialId,
+  requestedByUserId: actorUserIdExample,
+  challenge: 'ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8',
+  expiresAt: '2026-11-26T12:05:00.000Z',
+};
+const deviceNotFound = domainError(
+  'Inexistent, foreign, or invisible vehicle or device (uniform)',
+  'NOT_FOUND',
+  'Device not found',
+);
+const deviceForbidden = domainError(
+  'Caller can legitimately see the vehicle or device but lacks the required authority',
+  'FORBIDDEN',
+  'Insufficient permissions for this device',
+);
+const deviceConflict = stateConflict(
+  'Duplicate identifier/key, expired/used challenge, unusable credential, or terminal REVOKED state',
+  'Device cannot complete the requested transition',
+);
+const upstreamUnavailable = domainError(
+  'Upstream Device or Vehicle database unavailable',
+  'SERVICE_UNAVAILABLE',
+  'Device service unavailable',
+);
+const upstreamTimeout = domainError(
+  'Upstream Device call exceeded internal deadline',
+  'GATEWAY_TIMEOUT',
+  'Device service timed out',
+);
+
+paths['/vehicles/{vehicleId}/devices'].post.requestBody = jsonRequestBody(
+  internalVehicleDeviceRegistrationRequestSchema,
+  {
+    userId: actorUserIdExample,
+    identifier: 'esp32-sunroof-01',
+    publicKey:
+      '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAA6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=\n-----END PUBLIC KEY-----',
+    metadata: { name: 'Sunroof Node', manufacturer: 'Espressif' },
+  },
+);
+paths['/vehicles/{vehicleId}/devices'].post.responses = {
+  201: result('Device registered as PENDING', vehicleDeviceRegistrationResponseSchema, {
+    deviceId: deviceDetailExample.deviceId,
+    status: 'PENDING',
+    message: 'Device registration accepted',
+    data: deviceDetailExample,
+    requestId: 'request-1',
+  }),
+  400: vehicleValidationError,
+  401: error,
+  403: deviceForbidden,
+  404: vehicleNotFound,
+  409: deviceConflict,
+  503: upstreamUnavailable,
+  504: upstreamTimeout,
+};
+
+paths['/vehicles/{vehicleId}/devices'].get.parameters = [
+  ...(paths['/vehicles/{vehicleId}/devices'].get.parameters as unknown[]),
+  userIdQuery,
+  ...pageQuery,
+  statusQuery(deviceStatusSchema.options, 'Filtro opcional de estado de vinculación'),
+];
+paths['/vehicles/{vehicleId}/devices'].get.responses = {
+  200: result(
+    'Authorized vehicle devices ordered by createdAt ASC, _id ASC',
     z.strictObject({
-      deviceId: z.string(),
-      status: z.literal('PENDING'),
-      message,
-      data: z.strictObject({
-        deviceId: z.string(),
-        vehicleId: z.string(),
-        status: z.literal('PENDING'),
-      }),
+      devices: z.array(deviceDetailSchema),
+      page: pageSchema,
       requestId,
     }),
     {
-      deviceId: '507f1f77bcf86cd799439015',
-      status: 'PENDING',
-      message: 'Device registration accepted',
+      devices: [{ ...deviceDetailExample, status: 'ACTIVE', operational: true }],
+      page: { nextCursor: null },
+      requestId: 'request-1',
+    },
+  ),
+  400: vehicleValidationError,
+  401: error,
+  403: deviceForbidden,
+  404: vehicleNotFound,
+  503: upstreamUnavailable,
+  504: upstreamTimeout,
+};
+
+paths['/vehicles/{vehicleId}/devices/{deviceId}'].get.parameters = [
+  ...(paths['/vehicles/{vehicleId}/devices/{deviceId}'].get.parameters as unknown[]),
+  userIdQuery,
+];
+paths['/vehicles/{vehicleId}/devices/{deviceId}'].get.responses = {
+  200: result('Authorized vehicle device detail', deviceDetailSchema.extend({ requestId }), {
+    ...deviceDetailExample,
+    status: 'ACTIVE',
+    operational: true,
+    linkedAt: '2026-11-26T12:02:00.000Z',
+    requestId: 'request-1',
+  }),
+  400: vehicleValidationError,
+  401: error,
+  404: deviceNotFound,
+  503: upstreamUnavailable,
+  504: upstreamTimeout,
+};
+
+paths['/devices/{deviceId}'].get.parameters = [
+  ...(paths['/devices/{deviceId}'].get.parameters as unknown[]),
+  userIdQuery,
+];
+paths['/devices/{deviceId}'].get.responses = {
+  200: result('Authorized device detail', deviceDetailSchema.extend({ requestId }), {
+    ...deviceDetailExample,
+    status: 'ACTIVE',
+    operational: true,
+    linkedAt: '2026-11-26T12:02:00.000Z',
+    requestId: 'request-1',
+  }),
+  400: vehicleValidationError,
+  401: error,
+  404: deviceNotFound,
+  503: upstreamUnavailable,
+  504: upstreamTimeout,
+};
+
+paths['/vehicles/{vehicleId}/devices/{deviceId}'].patch.requestBody = jsonRequestBody(
+  internalVehicleDeviceMetadataUpdateRequestSchema,
+  { userId: actorUserIdExample, firmwareVersion: '1.1.0', serialNumber: null },
+);
+paths['/vehicles/{vehicleId}/devices/{deviceId}'].patch.responses = {
+  200: result('Device metadata updated', vehicleDeviceMetadataUpdateResponseSchema, {
+    deviceId: deviceDetailExample.deviceId,
+    status: 'ACTIVE',
+    message: 'Device metadata updated',
+    data: {
+      ...deviceDetailExample,
+      status: 'ACTIVE',
+      operational: true,
+      metadata: { ...deviceDetailExample.metadata, firmwareVersion: '1.1.0', serialNumber: null },
+    },
+    requestId: 'request-1',
+  }),
+  400: vehicleValidationError,
+  401: error,
+  403: deviceForbidden,
+  404: deviceNotFound,
+  409: deviceConflict,
+  503: upstreamUnavailable,
+  504: upstreamTimeout,
+};
+
+paths['/vehicles/{vehicleId}/devices/{deviceId}/challenge'].post.requestBody = jsonRequestBody(
+  internalVehicleDeviceChallengeRequestSchema,
+  { userId: actorUserIdExample },
+);
+paths['/vehicles/{vehicleId}/devices/{deviceId}/challenge'].post.responses = {
+  201: result('Single-use challenge issued', vehicleDeviceChallengeResponseSchema, {
+    challengeId: deviceChallengeExample.challengeId,
+    status: 'PENDING',
+    message: 'Device enrollment challenge issued',
+    data: deviceChallengeExample,
+    requestId: 'request-1',
+  }),
+  400: vehicleValidationError,
+  401: error,
+  403: deviceForbidden,
+  404: deviceNotFound,
+  409: deviceConflict,
+  503: upstreamUnavailable,
+  504: upstreamTimeout,
+};
+
+paths['/vehicles/{vehicleId}/devices/{deviceId}/link'].post.requestBody = jsonRequestBody(
+  internalVehicleDeviceLinkCompletionRequestSchema,
+  {
+    userId: actorUserIdExample,
+    challengeId: deviceChallengeExample.challengeId,
+    challenge: deviceChallengeExample.challenge,
+    signature:
+      'pobMhCedEBz-1oaWKnuirWj96o5UNkmbADvBNgNkBiI-x3RD1u0PzJ-TVXsE1P0h4udxA0izS_3vUtn4DeYpDw',
+  },
+);
+paths['/vehicles/{vehicleId}/devices/{deviceId}/link'].post.responses = {
+  200: result(
+    'Device linked after canonical Ed25519 proof verification',
+    vehicleDeviceLinkResponseSchema,
+    {
+      deviceId: deviceDetailExample.deviceId,
+      status: 'ACTIVE',
+      message: 'Device linked',
       data: {
-        deviceId: '507f1f77bcf86cd799439015',
-        vehicleId: vehicleExample.id,
-        status: 'PENDING',
+        ...deviceDetailExample,
+        status: 'ACTIVE',
+        operational: true,
+        linkedAt: '2026-11-26T12:02:00.000Z',
       },
       requestId: 'request-1',
     },
   ),
-  400: error,
+  400: vehicleValidationError,
   401: error,
-  404: error,
-  503: error,
+  403: deviceForbidden,
+  404: deviceNotFound,
+  409: deviceConflict,
+  503: upstreamUnavailable,
+  504: upstreamTimeout,
+};
+
+paths['/vehicles/{vehicleId}/devices/{deviceId}/revoke'].post.requestBody = jsonRequestBody(
+  internalVehicleDeviceRevokeRequestSchema,
+  { userId: actorUserIdExample, reason: 'ADMINISTRATIVE' },
+);
+paths['/vehicles/{vehicleId}/devices/{deviceId}/revoke'].post.responses = {
+  200: result(
+    'Device irreversibly revoked (or idempotent repeat)',
+    vehicleDeviceRevokeResponseSchema,
+    {
+      deviceId: deviceDetailExample.deviceId,
+      status: 'REVOKED',
+      message: 'Device revoked',
+      data: {
+        ...deviceDetailExample,
+        status: 'REVOKED',
+        operational: false,
+        revokedAt: '2026-11-26T12:10:00.000Z',
+        revocationReason: 'ADMINISTRATIVE',
+      },
+      requestId: 'request-1',
+    },
+  ),
+  400: vehicleValidationError,
+  401: error,
+  403: deviceForbidden,
+  404: deviceNotFound,
+  409: deviceConflict,
+  503: upstreamUnavailable,
+  504: upstreamTimeout,
 };
 for (const [path, operations] of Object.entries(paths)) {
   if (path.startsWith('/health')) continue;

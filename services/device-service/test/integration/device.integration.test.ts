@@ -30,13 +30,22 @@ import { DeviceCredentialModel } from '../../src/models/device-credential.model.
 import { DeviceLinkChallengeModel } from '../../src/models/device-link-challenge.model.js';
 import { DeviceRevocationModel } from '../../src/models/device-revocation.model.js';
 import { DeviceModel } from '../../src/models/device.model.js';
-import { parseDevicePublicKey } from '../../src/security/device-public-key.js';
+import {
+  buildDeviceLinkProofMessage,
+  parseDevicePublicKey,
+  type DeviceLinkProofMessageFields,
+} from '../../src/security/device-public-key.js';
 import { findEffectiveDeviceBinding } from '../../src/services/device-binding.service.js';
 import { DeviceServiceError } from '../../src/services/device-errors.js';
 import {
   completeDeviceLink,
   createDeviceChallenge,
 } from '../../src/services/device-link.service.js';
+import { updateDeviceMetadata } from '../../src/services/device-metadata.service.js';
+import {
+  getInternalDeviceById,
+  listInternalVehicleDevices,
+} from '../../src/services/device-query.service.js';
 import { registerDevice } from '../../src/services/device-registration.service.js';
 import {
   revocationActorFromInternalPrincipal,
@@ -95,36 +104,50 @@ function keyPair(): { pem: string; privateKey: KeyObject } {
   return { pem: publicKey.export({ type: 'spki', format: 'pem' }).toString().trim(), privateKey };
 }
 
-function signChallenge(privateKey: KeyObject, challenge: string): string {
+function signCanonicalChallenge(
+  privateKey: KeyObject,
+  fields: DeviceLinkProofMessageFields,
+): string {
+  return sign(null, buildDeviceLinkProofMessage(fields), privateKey).toString('base64url');
+}
+
+function signBareChallenge(privateKey: KeyObject, challenge: string): string {
   return sign(null, Buffer.from(challenge), privateKey).toString('base64url');
 }
 
 let identifierSequence = 0;
 async function register(overrides: Partial<Parameters<typeof registerDevice>[0]> = {}) {
   const key = keyPair();
+  const requestedByMembershipId = overrides.requestedByMembershipId ?? String(new Types.ObjectId());
   const input = {
     identifier: `esp32-${(identifierSequence += 1)}`,
     publicKey: key.pem,
     vehicleId: String(new Types.ObjectId()),
     requestedByUserId: String(new Types.ObjectId()),
+    requestedByMembershipId,
     ...overrides,
   };
   const result = await registerDevice(input);
-  return { ...result, input, key };
+  return { ...result, input: { ...input, requestedByMembershipId }, key };
 }
 
 async function linkedDevice() {
   const device = await register();
   const challenge = await createDeviceChallenge({
     deviceId: device.deviceId,
+    vehicleId: device.input.vehicleId,
     requestedByUserId: device.input.requestedByUserId,
+    requestedByMembershipId: device.input.requestedByMembershipId!,
   });
-  assert.ok(challenge);
+  assert.equal(challenge.ok, true);
   const result = await completeDeviceLink({
+    deviceId: String(device.deviceId),
+    vehicleId: device.input.vehicleId,
     challengeId: challenge.challengeId,
     challenge: challenge.challenge,
-    signature: signChallenge(device.key.privateKey, challenge.challenge),
+    signature: signCanonicalChallenge(device.key.privateKey, challenge.data),
     actorUserId: device.input.requestedByUserId,
+    actorMembershipId: device.input.requestedByMembershipId!,
   });
   assert.equal(result.linked, true);
   return device;
@@ -325,9 +348,6 @@ test('a programming error during registration rolls back the device', async (con
 });
 
 test('HTTP registration keeps the contract and maps 201, 409, 400, 503 and 500', async (context) => {
-  context.mock.method(globalThis, 'fetch', async () =>
-    Response.json({ verified: true }, { status: 200 }),
-  );
   const app = createApp(setupDeviceTestAuth());
   context.after(async () => app.close());
   const path = '/internal/devices/register';
@@ -346,13 +366,15 @@ test('HTTP registration keeps the contract and maps 201, 409, 400, 503 and 500',
     publicKey: key.pem,
     vehicleId: String(new Types.ObjectId()),
     userId: String(new Types.ObjectId()),
+    membershipId: String(new Types.ObjectId()),
   };
   const created = await send(body);
   assert.equal(created.statusCode, 201);
-  assert.deepEqual(Object.keys(created.json()).sort(), ['deviceId', 'status']);
+  assert.deepEqual(Object.keys(created.json()).sort(), ['data', 'deviceId', 'status']);
   assert.equal(created.json().status, 'PENDING');
   const stored = await DeviceModel.findById(created.json().deviceId);
   assert.equal(String(stored?.requestedByUserId), body.userId);
+  assert.equal(String(stored?.requestedByMembershipId), body.membershipId);
 
   const duplicate = await send(body);
   assert.equal(duplicate.statusCode, 409);
@@ -383,20 +405,33 @@ test('HTTP registration keeps the contract and maps 201, 409, 400, 503 and 500',
   assert.deepEqual(await counts(), before);
 });
 
-test('challenges are bound to requester, vehicle, device and usable credential; only hashes are stored', async () => {
+test('challenges are bound to requester, membership, vehicle, device and usable credential; only hashes are stored', async () => {
   const device = await register();
-  assert.equal(
+  assert.deepEqual(
     await createDeviceChallenge({
       deviceId: device.deviceId,
+      vehicleId: device.input.vehicleId,
       requestedByUserId: String(new Types.ObjectId()),
+      requestedByMembershipId: device.input.requestedByMembershipId!,
     }),
-    null,
+    { ok: false, reason: 'ACTOR_MISMATCH' },
+  );
+  assert.deepEqual(
+    await createDeviceChallenge({
+      deviceId: device.deviceId,
+      vehicleId: device.input.vehicleId,
+      requestedByUserId: device.input.requestedByUserId,
+      requestedByMembershipId: String(new Types.ObjectId()),
+    }),
+    { ok: false, reason: 'ACTOR_MISMATCH' },
   );
   const issued = await createDeviceChallenge({
     deviceId: String(device.deviceId),
+    vehicleId: device.input.vehicleId,
     requestedByUserId: device.input.requestedByUserId,
+    requestedByMembershipId: device.input.requestedByMembershipId!,
   });
-  assert.ok(issued);
+  assert.equal(issued.ok, true);
   const raw = await db()
     .collection(DeviceLinkChallengeModel.collection.name)
     .findOne({ _id: new Types.ObjectId(issued.challengeId) });
@@ -405,18 +440,21 @@ test('challenges are bound to requester, vehicle, device and usable credential; 
   assert.equal(String(raw.credentialId), String(device.credentialId));
   assert.equal(String(raw.vehicleId), device.input.vehicleId);
   assert.equal(String(raw.requestedByUserId), device.input.requestedByUserId);
+  assert.equal(String(raw.requestedByMembershipId), device.input.requestedByMembershipId);
   assert.equal(JSON.stringify(raw).includes(issued.challenge), false);
   assert.match(raw.challengeHash, /^[0-9a-f]{64}$/);
 
   await db()
     .collection('device_credentials')
     .updateOne({ _id: device.credentialId }, { $set: { expiresAt: new Date(Date.now() - 1) } });
-  assert.equal(
+  assert.deepEqual(
     await createDeviceChallenge({
       deviceId: device.deviceId,
+      vehicleId: device.input.vehicleId,
       requestedByUserId: device.input.requestedByUserId,
+      requestedByMembershipId: device.input.requestedByMembershipId!,
     }),
-    null,
+    { ok: false, reason: 'CREDENTIAL_UNAVAILABLE' },
     'expired credential',
   );
   const revokedCredential = await register();
@@ -427,26 +465,30 @@ test('challenges are bound to requester, vehicle, device and usable credential; 
     actor: userActor(),
     requestId: 'req-c',
   });
-  assert.equal(
+  assert.deepEqual(
     await createDeviceChallenge({
       deviceId: revokedCredential.deviceId,
+      vehicleId: revokedCredential.input.vehicleId,
       requestedByUserId: revokedCredential.input.requestedByUserId,
+      requestedByMembershipId: revokedCredential.input.requestedByMembershipId!,
     }),
-    null,
+    { ok: false, reason: 'CREDENTIAL_UNAVAILABLE' },
     'revoked credential',
   );
   const linked = await linkedDevice();
-  assert.equal(
+  assert.deepEqual(
     await createDeviceChallenge({
       deviceId: linked.deviceId,
+      vehicleId: linked.input.vehicleId,
       requestedByUserId: linked.input.requestedByUserId,
+      requestedByMembershipId: linked.input.requestedByMembershipId!,
     }),
-    null,
+    { ok: false, reason: 'DEVICE_NOT_LINKABLE' },
     'ACTIVE devices are not re-linkable',
   );
 });
 
-test('link completion verifies with DeviceCredential only and records the completing actor', async () => {
+test('link completion verifies canonical domain-separated proof with DeviceCredential only and records the completing actor', async () => {
   const device = await register();
   const legacyKey = keyPair();
   await db()
@@ -457,31 +499,54 @@ test('link completion verifies with DeviceCredential only and records the comple
     );
   const issued = await createDeviceChallenge({
     deviceId: device.deviceId,
+    vehicleId: device.input.vehicleId,
     requestedByUserId: device.input.requestedByUserId,
+    requestedByMembershipId: device.input.requestedByMembershipId!,
   });
-  assert.ok(issued);
-  const attempt = (signature: string, actorUserId = device.input.requestedByUserId) =>
+  assert.equal(issued.ok, true);
+  const attempt = (
+    signature: string,
+    actorUserId = device.input.requestedByUserId,
+    actorMembershipId = device.input.requestedByMembershipId!,
+  ) =>
     completeDeviceLink({
+      deviceId: String(device.deviceId),
+      vehicleId: device.input.vehicleId,
       challengeId: issued.challengeId,
       challenge: issued.challenge,
       signature,
       actorUserId,
+      actorMembershipId,
     });
 
-  assert.deepEqual(await attempt(signChallenge(legacyKey.privateKey, issued.challenge)), {
+  // Legacy bare-nonce signature MUST fail
+  assert.deepEqual(await attempt(signBareChallenge(device.key.privateKey, issued.challenge)), {
+    linked: false,
+    reason: 'INVALID_PROOF',
+  });
+  // Legacy device key MUST fail
+  assert.deepEqual(await attempt(signCanonicalChallenge(legacyKey.privateKey, issued.data)), {
     linked: false,
     reason: 'INVALID_PROOF',
   });
   assert.deepEqual(
     await attempt(
-      signChallenge(device.key.privateKey, issued.challenge),
+      signCanonicalChallenge(device.key.privateKey, issued.data),
+      String(new Types.ObjectId()),
+    ),
+    { linked: false, reason: 'ACTOR_MISMATCH' },
+  );
+  assert.deepEqual(
+    await attempt(
+      signCanonicalChallenge(device.key.privateKey, issued.data),
+      device.input.requestedByUserId,
       String(new Types.ObjectId()),
     ),
     { linked: false, reason: 'ACTOR_MISMATCH' },
   );
   assert.equal(await findEffectiveDeviceBinding(String(device.deviceId)), null, 'PENDING');
 
-  const linked = await attempt(signChallenge(device.key.privateKey, issued.challenge));
+  const linked = await attempt(signCanonicalChallenge(device.key.privateKey, issued.data));
   assert.equal(linked.linked, true);
   const stored = await DeviceModel.findById(device.deviceId);
   assert.equal(stored?.status, 'ACTIVE');
@@ -490,9 +555,9 @@ test('link completion verifies with DeviceCredential only and records the comple
   assert.ok(stored?.linkedAt instanceof Date);
   const challenge = await DeviceLinkChallengeModel.findById(issued.challengeId);
   assert.ok(challenge?.usedAt instanceof Date);
-  assert.deepEqual(await attempt(signChallenge(device.key.privateKey, issued.challenge)), {
+  assert.deepEqual(await attempt(signCanonicalChallenge(device.key.privateKey, issued.data)), {
     linked: false,
-    reason: 'INVALID_CHALLENGE',
+    reason: 'DEVICE_NOT_LINKABLE',
   });
 
   const binding = await findEffectiveDeviceBinding(String(device.deviceId));
@@ -542,7 +607,7 @@ test('expired challenges and expired, revoked or cascaded credentials never comp
       },
     ],
     [
-      'CREDENTIAL_UNAVAILABLE',
+      'DEVICE_NOT_LINKABLE',
       async (device) => {
         await revokeDevice({
           deviceId: String(device.deviceId),
@@ -557,15 +622,20 @@ test('expired challenges and expired, revoked or cascaded credentials never comp
     const device = await register();
     const issued = await createDeviceChallenge({
       deviceId: device.deviceId,
+      vehicleId: device.input.vehicleId,
       requestedByUserId: device.input.requestedByUserId,
+      requestedByMembershipId: device.input.requestedByMembershipId!,
     });
-    assert.ok(issued);
+    assert.equal(issued.ok, true);
     await mutate(device);
     const result = await completeDeviceLink({
+      deviceId: String(device.deviceId),
+      vehicleId: device.input.vehicleId,
       challengeId: issued.challengeId,
       challenge: issued.challenge,
-      signature: signChallenge(device.key.privateKey, issued.challenge),
+      signature: signCanonicalChallenge(device.key.privateKey, issued.data),
       actorUserId: device.input.requestedByUserId,
+      actorMembershipId: device.input.requestedByMembershipId!,
     });
     assert.deepEqual(result, { linked: false, reason });
     assert.notEqual((await DeviceModel.findById(device.deviceId))?.status, 'ACTIVE');
@@ -574,15 +644,20 @@ test('expired challenges and expired, revoked or cascaded credentials never comp
   const device = await register();
   const issued = await createDeviceChallenge({
     deviceId: device.deviceId,
+    vehicleId: device.input.vehicleId,
     requestedByUserId: device.input.requestedByUserId,
+    requestedByMembershipId: device.input.requestedByMembershipId!,
   });
-  assert.ok(issued);
+  assert.equal(issued.ok, true);
   const late = await completeDeviceLink(
     {
+      deviceId: String(device.deviceId),
+      vehicleId: device.input.vehicleId,
       challengeId: issued.challengeId,
       challenge: issued.challenge,
-      signature: signChallenge(device.key.privateKey, issued.challenge),
+      signature: signCanonicalChallenge(device.key.privateKey, issued.data),
       actorUserId: device.input.requestedByUserId,
+      actorMembershipId: device.input.requestedByMembershipId!,
     },
     { now: new Date(issued.expiresAt.getTime() + 1) },
   );
@@ -593,17 +668,22 @@ test('concurrent completion consumes the challenge exactly once', async () => {
   const device = await register();
   const issued = await createDeviceChallenge({
     deviceId: device.deviceId,
+    vehicleId: device.input.vehicleId,
     requestedByUserId: device.input.requestedByUserId,
+    requestedByMembershipId: device.input.requestedByMembershipId!,
   });
-  assert.ok(issued);
-  const signature = signChallenge(device.key.privateKey, issued.challenge);
+  assert.equal(issued.ok, true);
+  const signature = signCanonicalChallenge(device.key.privateKey, issued.data);
   const results = await Promise.all(
     Array.from({ length: 6 }, () =>
       completeDeviceLink({
+        deviceId: String(device.deviceId),
+        vehicleId: device.input.vehicleId,
         challengeId: issued.challengeId,
         challenge: issued.challenge,
         signature,
         actorUserId: device.input.requestedByUserId,
+        actorMembershipId: device.input.requestedByMembershipId!,
       }),
     ),
   );
@@ -611,7 +691,11 @@ test('concurrent completion consumes the challenge exactly once', async () => {
   assert.ok(
     results
       .filter((result) => !result.linked)
-      .every((result) => !result.linked && result.reason === 'INVALID_CHALLENGE'),
+      .every(
+        (result) =>
+          !result.linked &&
+          (result.reason === 'INVALID_CHALLENGE' || result.reason === 'DEVICE_NOT_LINKABLE'),
+      ),
   );
 });
 
@@ -710,12 +794,14 @@ test('device revocation is atomic, terminal, idempotent and preserves the origin
   assert.equal(repeat.revocation.reason, 'SECURITY_COMPROMISE');
   assert.equal(repeat.revocation.requestId, 'req-original');
   assert.equal((await counts()).revocations, 1);
-  assert.equal(
+  assert.deepEqual(
     await createDeviceChallenge({
       deviceId: device.deviceId,
+      vehicleId: device.input.vehicleId,
       requestedByUserId: device.input.requestedByUserId,
+      requestedByMembershipId: device.input.requestedByMembershipId!,
     }),
-    null,
+    { ok: false, reason: 'DEVICE_NOT_LINKABLE' },
     'no reactivation path',
   );
 });
@@ -860,14 +946,20 @@ function assertNoKeyMaterial(serialized: string, pems: readonly string[]) {
 async function issueSignedChallenge(device: Awaited<ReturnType<typeof register>>) {
   const issued = await createDeviceChallenge({
     deviceId: device.deviceId,
+    vehicleId: device.input.vehicleId,
     requestedByUserId: device.input.requestedByUserId,
+    requestedByMembershipId: device.input.requestedByMembershipId!,
   });
-  assert.ok(issued);
+  assert.equal(issued.ok, true);
   return {
+    deviceId: String(device.deviceId),
+    vehicleId: device.input.vehicleId,
     challengeId: issued.challengeId,
     challenge: issued.challenge,
-    signature: signChallenge(device.key.privateKey, issued.challenge),
+    data: issued.data,
+    signature: signCanonicalChallenge(device.key.privateKey, issued.data),
     actorUserId: device.input.requestedByUserId,
+    actorMembershipId: device.input.requestedByMembershipId!,
   };
 }
 
@@ -900,12 +992,16 @@ test('concurrent link completion and full device revocation always end REVOKED a
       assert.ok(stored?.linkedAt instanceof Date);
     } else {
       outcomes.rejected += 1;
-      assert.ok(['CREDENTIAL_UNAVAILABLE', 'DEVICE_NOT_LINKABLE'].includes(link.reason));
+      assert.ok(
+        ['CREDENTIAL_UNAVAILABLE', 'DEVICE_NOT_LINKABLE', 'INVALID_CHALLENGE'].includes(
+          link.reason,
+        ),
+      );
       assert.equal(stored?.linkedAt ?? null, null);
     }
     assert.deepEqual(await completeDeviceLink(proof), {
       linked: false,
-      reason: link.linked ? 'INVALID_CHALLENGE' : 'CREDENTIAL_UNAVAILABLE',
+      reason: 'DEVICE_NOT_LINKABLE',
     });
   }
   assert.equal(outcomes.linkedBeforeRevocation + outcomes.rejected, 8);
@@ -978,7 +1074,7 @@ test('a challenge bound to a credential other than the current one never complet
   assert.deepEqual(
     await completeDeviceLink({
       ...proof,
-      signature: signChallenge(replacement.privateKey, proof.challenge),
+      signature: signCanonicalChallenge(replacement.privateKey, proof.data),
     }),
     { linked: false, reason: 'CREDENTIAL_UNAVAILABLE' },
     'the current credential cannot satisfy a challenge bound to the revoked one',
@@ -987,19 +1083,24 @@ test('a challenge bound to a credential other than the current one never complet
 
   const current = await createDeviceChallenge({
     deviceId: device.deviceId,
+    vehicleId: device.input.vehicleId,
     requestedByUserId: device.input.requestedByUserId,
+    requestedByMembershipId: device.input.requestedByMembershipId!,
   });
-  assert.ok(current);
+  assert.equal(current.ok, true);
   const rawChallenge = await db()
     .collection(DeviceLinkChallengeModel.collection.name)
     .findOne({ _id: new Types.ObjectId(current.challengeId) });
   assert.equal(String(rawChallenge?.credentialId), String(replacementId));
   assert.deepEqual(
     await completeDeviceLink({
+      deviceId: String(device.deviceId),
+      vehicleId: device.input.vehicleId,
       challengeId: current.challengeId,
       challenge: current.challenge,
-      signature: signChallenge(device.key.privateKey, current.challenge),
+      signature: signCanonicalChallenge(device.key.privateKey, current.data),
       actorUserId: device.input.requestedByUserId,
+      actorMembershipId: device.input.requestedByMembershipId!,
     }),
     { linked: false, reason: 'INVALID_PROOF' },
     'the revoked key cannot satisfy a challenge bound to the current credential',
@@ -1081,12 +1182,14 @@ test('REVOKED devices and credentials are terminal through every Mongoose write 
     .collection('device_credentials')
     .findOne({ _id: device.credentialId });
   assert.equal(rawCredential?.status, 'REVOKED');
-  assert.equal(
+  assert.deepEqual(
     await createDeviceChallenge({
       deviceId: device.deviceId,
+      vehicleId: device.input.vehicleId,
       requestedByUserId: device.input.requestedByUserId,
+      requestedByMembershipId: device.input.requestedByMembershipId!,
     }),
-    null,
+    { ok: false, reason: 'DEVICE_NOT_LINKABLE' },
   );
 });
 
@@ -1351,10 +1454,16 @@ test('migration is explicit, idempotent, never invents history and leaves legacy
     'REVOKED',
     'revoked credentials are not resurrected',
   );
-  assert.equal(
-    await createDeviceChallenge({ deviceId: pendingId, requestedByUserId: new Types.ObjectId() }),
-    null,
-    'legacy PENDING devices without a requester cannot request a challenge',
+  const pendingRaw = await db().collection('devices').findOne({ _id: pendingId });
+  assert.deepEqual(
+    await createDeviceChallenge({
+      deviceId: pendingId,
+      vehicleId: String(pendingRaw?.vehicleId),
+      requestedByUserId: new Types.ObjectId(),
+      requestedByMembershipId: new Types.ObjectId(),
+    }),
+    { ok: false, reason: 'UNVERIFIABLE_ENROLLMENT_CONTEXT' },
+    'legacy PENDING devices without requester/membership context cannot request a challenge',
   );
 });
 
@@ -1538,10 +1647,16 @@ test('legacy Device key fields never participate in challenges, proofs or bindin
     linkedByUserId: new Types.ObjectId(),
     linkedAt: new Date('2026-01-02T00:00:00.000Z'),
   });
-  assert.equal(
-    await createDeviceChallenge({ deviceId: pendingId, requestedByUserId: requester }),
-    null,
-    'a legacy key without DeviceCredential cannot obtain a challenge',
+  const pendingLegacyRaw = await db().collection('devices').findOne({ _id: pendingId });
+  assert.deepEqual(
+    await createDeviceChallenge({
+      deviceId: pendingId,
+      vehicleId: String(pendingLegacyRaw?.vehicleId),
+      requestedByUserId: requester,
+      requestedByMembershipId: new Types.ObjectId(),
+    }),
+    { ok: false, reason: 'UNVERIFIABLE_ENROLLMENT_CONTEXT' },
+    'a legacy key without verifiable enrollment context cannot obtain a challenge',
   );
   assert.equal(
     await findEffectiveDeviceBinding(String(activeId)),
@@ -1621,4 +1736,616 @@ test('a new empty database is initialized by the documented explicit procedure',
   const device = await register();
   assert.equal(device.status, 'PENDING');
   await assertDeviceDatabaseReady();
+});
+
+test('concurrent challenge issuances serialize on Device write barrier and leave at most one unused challenge', async () => {
+  await ensureDevelopmentDatabaseSchema(() => undefined);
+  for (let round = 0; round < 5; round += 1) {
+    const device = await register();
+    const outcomes = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        createDeviceChallenge({
+          deviceId: device.deviceId,
+          vehicleId: device.input.vehicleId,
+          requestedByUserId: device.input.requestedByUserId,
+          requestedByMembershipId: device.input.requestedByMembershipId!,
+        }),
+      ),
+    );
+    assert.ok(outcomes.every((outcome) => outcome.ok));
+    const unused = await db()
+      .collection(DeviceLinkChallengeModel.collection.name)
+      .find({ deviceId: device.deviceId, usedAt: null })
+      .toArray();
+    assert.equal(
+      unused.length,
+      1,
+      'write barrier guarantees at most one active pending challenge per device',
+    );
+    const total = await db()
+      .collection(DeviceLinkChallengeModel.collection.name)
+      .countDocuments({ deviceId: device.deviceId });
+    assert.equal(total, 6);
+
+    // Only the single remaining unused challenge can complete linking; invalidated ones fail
+    const winningId = String(unused[0]!._id);
+    const losingOutcome = outcomes.find((o) => o.ok && o.challengeId !== winningId);
+    assert.ok(losingOutcome && losingOutcome.ok);
+    assert.deepEqual(
+      await completeDeviceLink({
+        deviceId: String(device.deviceId),
+        vehicleId: device.input.vehicleId,
+        challengeId: losingOutcome.challengeId,
+        challenge: losingOutcome.challenge,
+        signature: signCanonicalChallenge(device.key.privateKey, losingOutcome.data),
+        actorUserId: device.input.requestedByUserId,
+        actorMembershipId: device.input.requestedByMembershipId!,
+      }),
+      { linked: false, reason: 'INVALID_CHALLENGE' },
+    );
+
+    const winningOutcome = outcomes.find((o) => o.ok && o.challengeId === winningId);
+    assert.ok(winningOutcome && winningOutcome.ok);
+    const linked = await completeDeviceLink({
+      deviceId: String(device.deviceId),
+      vehicleId: device.input.vehicleId,
+      challengeId: winningOutcome.challengeId,
+      challenge: winningOutcome.challenge,
+      signature: signCanonicalChallenge(device.key.privateKey, winningOutcome.data),
+      actorUserId: device.input.requestedByUserId,
+      actorMembershipId: device.input.requestedByMembershipId!,
+    });
+    assert.equal(linked.linked, true);
+  }
+});
+
+test('wrong-context signatures, mismatched deviceId/vehicleId and historical PENDING records without membership fail closed', async () => {
+  await ensureDevelopmentDatabaseSchema(() => undefined);
+  const device = await register();
+  const otherDevice = await register({
+    vehicleId: device.input.vehicleId,
+    requestedByUserId: device.input.requestedByUserId,
+    requestedByMembershipId: device.input.requestedByMembershipId,
+  });
+  const issued = await createDeviceChallenge({
+    deviceId: device.deviceId,
+    vehicleId: device.input.vehicleId,
+    requestedByUserId: device.input.requestedByUserId,
+    requestedByMembershipId: device.input.requestedByMembershipId!,
+  });
+  assert.equal(issued.ok, true);
+
+  // Valid signature over wrong context fields must be rejected without consuming the challenge
+  for (const badFields of [
+    { ...issued.data, vehicleId: String(new Types.ObjectId()) },
+    { ...issued.data, deviceId: String(otherDevice.deviceId) },
+    { ...issued.data, credentialId: String(new Types.ObjectId()) },
+    { ...issued.data, requestedByUserId: String(new Types.ObjectId()) },
+  ]) {
+    const result = await completeDeviceLink({
+      deviceId: String(device.deviceId),
+      vehicleId: device.input.vehicleId,
+      challengeId: issued.challengeId,
+      challenge: issued.challenge,
+      signature: signCanonicalChallenge(device.key.privateKey, badFields),
+      actorUserId: device.input.requestedByUserId,
+      actorMembershipId: device.input.requestedByMembershipId!,
+    });
+    assert.deepEqual(result, { linked: false, reason: 'INVALID_PROOF' });
+  }
+
+  // Supplying expectedDeviceId / expectedVehicleId that disagrees with challenge fails closed
+  assert.deepEqual(
+    await completeDeviceLink({
+      deviceId: String(otherDevice.deviceId),
+      vehicleId: device.input.vehicleId,
+      challengeId: issued.challengeId,
+      challenge: issued.challenge,
+      signature: signCanonicalChallenge(device.key.privateKey, issued.data),
+      actorUserId: device.input.requestedByUserId,
+      actorMembershipId: device.input.requestedByMembershipId!,
+    }),
+    { linked: false, reason: 'INVALID_CHALLENGE' },
+  );
+  assert.deepEqual(
+    await completeDeviceLink({
+      deviceId: String(device.deviceId),
+      vehicleId: String(new Types.ObjectId()),
+      challengeId: issued.challengeId,
+      challenge: issued.challenge,
+      signature: signCanonicalChallenge(device.key.privateKey, issued.data),
+      actorUserId: device.input.requestedByUserId,
+      actorMembershipId: device.input.requestedByMembershipId!,
+    }),
+    { linked: false, reason: 'DEVICE_NOT_FOUND' },
+  );
+
+  // Historical pre-TKT-015 PENDING device lacking requestedByMembershipId fails closed for link,
+  // yet remains administratively revocable without inventing enrollment context.
+  const preTkt015 = await registerDevice({
+    identifier: 'pre-tkt015-pending',
+    publicKey: keyPair().pem,
+    vehicleId: String(new Types.ObjectId()),
+    requestedByUserId: String(new Types.ObjectId()),
+    requestedByMembershipId: null,
+  });
+  assert.deepEqual(
+    await createDeviceChallenge({
+      deviceId: preTkt015.deviceId,
+      vehicleId: preTkt015.record.vehicleId,
+      requestedByUserId: preTkt015.record.requestedByUserId!,
+      requestedByMembershipId: String(new Types.ObjectId()),
+    }),
+    { ok: false, reason: 'UNVERIFIABLE_ENROLLMENT_CONTEXT' },
+  );
+  const adminRevoked = await revokeDevice({
+    deviceId: String(preTkt015.deviceId),
+    expectedVehicleId: preTkt015.record.vehicleId,
+    reason: 'ADMINISTRATIVE',
+    actor: userActor(),
+    requestId: 'req-pre015-admin',
+  });
+  assert.equal(adminRevoked.created, true);
+  assert.equal(adminRevoked.record?.status, 'REVOKED');
+});
+
+test('REGISTRATION_CANCELLED is rejected on ACTIVE devices, allowed on PENDING, and metadata PATCH races safely with revocation', async () => {
+  await ensureDevelopmentDatabaseSchema(() => undefined);
+  const active = await linkedDevice();
+  await rejectsWithCode(
+    revokeDevice({
+      deviceId: String(active.deviceId),
+      expectedVehicleId: active.input.vehicleId,
+      reason: 'REGISTRATION_CANCELLED',
+      actor: userActor(active.input.requestedByUserId),
+      requestId: 'req-bad-cancel',
+    }),
+    'INVALID_REVOCATION_STATE',
+  );
+  assert.equal((await DeviceModel.findById(active.deviceId))?.status, 'ACTIVE');
+
+  // Partial metadata update: trims, preserves omitted fields, clears null fields
+  const patched = await updateDeviceMetadata({
+    deviceId: String(active.deviceId),
+    vehicleId: active.input.vehicleId,
+    metadata: {
+      name: '  Mazda Sunroof  ',
+      manufacturer: 'Espressif',
+      firmwareVersion: '1.0.0',
+    },
+  });
+  assert.equal(patched.metadata.name, 'Mazda Sunroof');
+  assert.equal(patched.metadata.manufacturer, 'Espressif');
+  assert.equal(patched.metadata.hardwareModel, null);
+
+  const cleared = await updateDeviceMetadata({
+    deviceId: String(active.deviceId),
+    vehicleId: active.input.vehicleId,
+    metadata: { manufacturer: null, serialNumber: 'SN-2026' },
+  });
+  assert.equal(cleared.metadata.name, 'Mazda Sunroof');
+  assert.equal(cleared.metadata.manufacturer, null);
+  assert.equal(cleared.metadata.serialNumber, 'SN-2026');
+
+  // Concurrent PATCH and revokeDevice: always ends REVOKED and rejects any subsequent PATCH
+  for (let round = 0; round < 6; round += 1) {
+    const target = await linkedDevice();
+    const [patchOutcome, revokeOutcome] = await Promise.allSettled([
+      updateDeviceMetadata({
+        deviceId: String(target.deviceId),
+        vehicleId: target.input.vehicleId,
+        metadata: { name: `Race-${round}` },
+      }),
+      revokeDevice({
+        deviceId: String(target.deviceId),
+        expectedVehicleId: target.input.vehicleId,
+        reason: 'LOST',
+        actor: userActor(),
+        requestId: `req-patch-race-${round}`,
+      }),
+    ]);
+    assert.equal(revokeOutcome.status, 'fulfilled');
+    if (patchOutcome.status === 'rejected') {
+      assert.ok(
+        patchOutcome.reason instanceof DeviceServiceError &&
+          patchOutcome.reason.code === 'DEVICE_REVOKED',
+      );
+    }
+    const finalDetail = await getInternalDeviceById(String(target.deviceId));
+    assert.equal(finalDetail?.status, 'REVOKED');
+    assert.equal(finalDetail?.operational, false);
+    await rejectsWithCode(
+      updateDeviceMetadata({
+        deviceId: String(target.deviceId),
+        vehicleId: target.input.vehicleId,
+        metadata: { name: 'After-Revoke' },
+      }),
+      'DEVICE_REVOKED',
+    );
+  }
+});
+
+test('listInternalVehicleDevices orders stably by (createdAt ASC, _id ASC) and handles legacy documents without metadata', async () => {
+  await ensureDevelopmentDatabaseSchema(() => undefined);
+  const vehicleId = String(new Types.ObjectId());
+  const sameTime = new Date('2026-11-10T12:00:00.000Z');
+  const laterTime = new Date('2026-11-10T12:01:00.000Z');
+
+  const d1 = await register({ vehicleId, metadata: { name: 'Node A' } });
+  const d2 = await register({ vehicleId, metadata: { name: 'Node B' } });
+  const d3 = await register({ vehicleId });
+
+  // Force identical createdAt on d1 and d2 plus strip metadata from d3 to simulate historical doc
+  await db()
+    .collection('devices')
+    .updateMany({ _id: { $in: [d1.deviceId, d2.deviceId] } }, { $set: { createdAt: sameTime } });
+  await db()
+    .collection('devices')
+    .updateOne({ _id: d3.deviceId }, { $set: { createdAt: laterTime }, $unset: { metadata: '' } });
+
+  const expectedTieOrder = [String(d1.deviceId), String(d2.deviceId)].sort();
+  const page1 = await listInternalVehicleDevices({ vehicleId, limit: 2 });
+  assert.equal(page1.hasMore, true);
+  assert.deepEqual(
+    page1.devices.map((d) => d.deviceId),
+    expectedTieOrder,
+  );
+
+  const cursor = page1.devices[1]!;
+  const page2 = await listInternalVehicleDevices({
+    vehicleId,
+    limit: 2,
+    afterCreatedAt: cursor.createdAt,
+    afterId: cursor.deviceId,
+  });
+  assert.equal(page2.hasMore, false);
+  assert.equal(page2.devices.length, 1);
+  assert.equal(page2.devices[0]!.deviceId, String(d3.deviceId));
+  assert.equal(page2.devices[0]!.metadata.name, null);
+});
+
+test('upgrades a valid TKT-014 database non-destructively to TKT-015 indexes while preserving historical records, credentials, and revocations', async () => {
+  assert.ok(mongoCluster);
+  const currentDb = db();
+
+  // Recreate exact TKT-014 index set (all TKT-014 critical indexes EXCEPT TKT-015's device_vehicle_created_id_idx)
+  await currentDb
+    .collection('devices')
+    .dropIndex('device_vehicle_created_id_idx')
+    .catch(() => undefined);
+
+  await currentDb
+    .collection('devices')
+    .createIndex({ identifier: 1 }, { name: 'identifier_1', unique: true });
+  await currentDb
+    .collection('devices')
+    .createIndex({ vehicleId: 1, status: 1 }, { name: 'device_vehicle_status_idx' });
+  await currentDb
+    .collection('device_credentials')
+    .createIndex(
+      { fingerprint: 1 },
+      { name: 'device_credential_fingerprint_unique', unique: true },
+    );
+  await currentDb
+    .collection('device_credentials')
+    .createIndex({ keyId: 1 }, { name: 'device_credential_key_id_unique', unique: true });
+  await currentDb.collection('device_credentials').createIndex(
+    { deviceId: 1 },
+    {
+      name: 'device_credential_active_device_unique',
+      unique: true,
+      partialFilterExpression: { status: 'ACTIVE' },
+    },
+  );
+  await currentDb
+    .collection('device_credentials')
+    .createIndex({ deviceId: 1, status: 1 }, { name: 'device_credential_device_status_idx' });
+  await currentDb.collection('device_revocations').createIndex(
+    { deviceId: 1 },
+    {
+      name: 'device_revocation_device_target_unique',
+      unique: true,
+      partialFilterExpression: { targetType: 'DEVICE' },
+    },
+  );
+  await currentDb.collection('device_revocations').createIndex(
+    { credentialId: 1 },
+    {
+      name: 'device_revocation_credential_target_unique',
+      unique: true,
+      partialFilterExpression: { targetType: 'CREDENTIAL' },
+    },
+  );
+  await currentDb
+    .collection('device_revocations')
+    .createIndex({ deviceId: 1, revokedAt: -1 }, { name: 'device_revocation_device_history_idx' });
+  await currentDb
+    .collection('device_revocations')
+    .createIndex(
+      { vehicleId: 1, revokedAt: -1 },
+      { name: 'device_revocation_vehicle_history_idx' },
+    );
+  await currentDb
+    .collection(DeviceLinkChallengeModel.collection.name)
+    .createIndex({ challengeHash: 1 }, { name: 'challengeHash_1', unique: true });
+  await currentDb.collection(DEVICE_MIGRATION_COLLECTION).insertOne({
+    _id: DEVICE_FOUNDATION_MIGRATION_ID as never,
+    appliedAt: new Date('2026-11-20T00:00:00.000Z'),
+    mode: 'tkt-014-seed',
+  });
+
+  // Seed historical TKT-014 documents without `metadata` or `requestedByMembershipId`
+  const vehicleId = new Types.ObjectId();
+  const ownerUserId = new Types.ObjectId();
+  const requesterUserId = new Types.ObjectId();
+  const t1 = new Date('2026-11-20T10:00:00.000Z');
+  const t2 = new Date('2026-11-20T10:05:00.000Z');
+  const t3 = new Date('2026-11-20T10:10:00.000Z');
+
+  const histPendingId = new Types.ObjectId();
+  const histActiveId = new Types.ObjectId();
+  const histRevokedId = new Types.ObjectId();
+  const credPendingId = new Types.ObjectId();
+  const credActiveId = new Types.ObjectId();
+  const credRevokedId = new Types.ObjectId();
+  const revocationId = new Types.ObjectId();
+
+  const k1 = parseDevicePublicKey(keyPair().pem);
+  const k2 = parseDevicePublicKey(keyPair().pem);
+  const k3 = parseDevicePublicKey(keyPair().pem);
+
+  await currentDb.collection('devices').insertMany([
+    {
+      _id: histPendingId,
+      vehicleId,
+      identifier: 'tkt014-legacy-pending',
+      status: 'PENDING',
+      requestedByUserId: requesterUserId,
+      linkedByUserId: null,
+      linkedAt: null,
+      revokedAt: null,
+      revocationId: null,
+      lastSeenAt: null,
+      createdAt: t1,
+      updatedAt: t1,
+    },
+    {
+      _id: histActiveId,
+      vehicleId,
+      identifier: 'tkt014-legacy-active',
+      status: 'ACTIVE',
+      requestedByUserId: ownerUserId,
+      linkedByUserId: ownerUserId,
+      linkedAt: t2,
+      revokedAt: null,
+      revocationId: null,
+      lastSeenAt: t2,
+      createdAt: t2,
+      updatedAt: t2,
+    },
+    {
+      _id: histRevokedId,
+      vehicleId,
+      identifier: 'tkt014-legacy-revoked',
+      status: 'REVOKED',
+      requestedByUserId: ownerUserId,
+      linkedByUserId: ownerUserId,
+      linkedAt: t3,
+      revokedAt: new Date(t3.getTime() + 60_000),
+      revocationId,
+      lastSeenAt: null,
+      createdAt: t3,
+      updatedAt: new Date(t3.getTime() + 60_000),
+    },
+  ]);
+
+  await currentDb.collection('device_credentials').insertMany([
+    {
+      _id: credPendingId,
+      deviceId: histPendingId,
+      vehicleId,
+      keyId: `dk_${'P'.repeat(22)}`,
+      algorithm: 'Ed25519',
+      publicKey: k1.publicKeyPem,
+      fingerprint: k1.fingerprint,
+      status: 'ACTIVE',
+      activatedAt: t1,
+      expiresAt: null,
+      revokedAt: null,
+      revocationId: null,
+      createdAt: t1,
+      updatedAt: t1,
+    },
+    {
+      _id: credActiveId,
+      deviceId: histActiveId,
+      vehicleId,
+      keyId: `dk_${'A'.repeat(22)}`,
+      algorithm: 'Ed25519',
+      publicKey: k2.publicKeyPem,
+      fingerprint: k2.fingerprint,
+      status: 'ACTIVE',
+      activatedAt: t2,
+      expiresAt: null,
+      revokedAt: null,
+      revocationId: null,
+      createdAt: t2,
+      updatedAt: t2,
+    },
+    {
+      _id: credRevokedId,
+      deviceId: histRevokedId,
+      vehicleId,
+      keyId: `dk_${'R'.repeat(22)}`,
+      algorithm: 'Ed25519',
+      publicKey: k3.publicKeyPem,
+      fingerprint: k3.fingerprint,
+      status: 'REVOKED',
+      activatedAt: t3,
+      expiresAt: null,
+      revokedAt: new Date(t3.getTime() + 60_000),
+      revocationId,
+      createdAt: t3,
+      updatedAt: new Date(t3.getTime() + 60_000),
+    },
+  ]);
+
+  await currentDb.collection('device_revocations').insertOne({
+    _id: revocationId,
+    targetType: 'DEVICE',
+    deviceId: histRevokedId,
+    credentialId: null,
+    fingerprint: k3.fingerprint,
+    vehicleId,
+    reason: 'ADMINISTRATIVE',
+    actor: {
+      type: 'USER',
+      userId: ownerUserId,
+      service: null,
+    },
+    requestId: 'tkt014-legacy-revoke',
+    revokedAt: new Date(t3.getTime() + 60_000),
+    createdAt: new Date(t3.getTime() + 60_000),
+  });
+
+  const beforeIndexes = {
+    devices: (await currentDb.collection('devices').indexes()).map((i) => i.name).sort(),
+    device_credentials: (await currentDb.collection('device_credentials').indexes())
+      .map((i) => i.name)
+      .sort(),
+    device_revocations: (await currentDb.collection('device_revocations').indexes())
+      .map((i) => i.name)
+      .sort(),
+  };
+  assert.equal(beforeIndexes.devices.includes('device_vehicle_created_id_idx'), false);
+
+  const snapshotRawDocs = async () => ({
+    devices: await currentDb.collection('devices').find({}).sort({ _id: 1 }).toArray(),
+    credentials: await currentDb
+      .collection('device_credentials')
+      .find({})
+      .sort({ _id: 1 })
+      .toArray(),
+    revocations: await currentDb
+      .collection('device_revocations')
+      .find({})
+      .sort({ _id: 1 })
+      .toArray(),
+  });
+  const beforeDocs = await snapshotRawDocs();
+
+  // Readiness BEFORE upgrade must fail strictly due to missing TKT-015 index
+  const preIssues = await findCriticalDeviceIndexIssues(currentDb);
+  assert.deepEqual(preIssues, ['Missing or invalid index devices.device_vehicle_created_id_idx']);
+  await assert.rejects(() => assertDeviceDatabaseReady(), DeviceSchemaNotReadyError);
+
+  const serviceRoot = fileURLToPath(new URL('../../', import.meta.url));
+  const runCli = async (mode: '--preflight' | '--apply') => {
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      ['--import', 'tsx', 'src/scripts/device-foundation-migration.ts', mode],
+      {
+        cwd: serviceRoot,
+        timeout: 60_000,
+        env: {
+          ...process.env,
+          NODE_ENV: 'test',
+          INTERNAL_AUTH_ENVIRONMENT: 'test',
+          INTERNAL_AUTH_KEYRING_JSON: '[]',
+          DATABASE_URL: mongoCluster!.uri('device'),
+        },
+      },
+    );
+    return JSON.parse(stdout.slice(stdout.indexOf('{'))) as {
+      mode: string;
+      report: Awaited<ReturnType<typeof inspectDeviceMigrationPreflight>>;
+    };
+  };
+
+  // Preflight is strictly read-only and preserves indexes and historical docs
+  const preflight = await runCli('--preflight');
+  assert.equal(preflight.report.canMigrateSafely, true);
+  assert.equal(preflight.report.migrationRecorded, true);
+  assert.deepEqual(preflight.report.blockingReasons, []);
+  assert.deepEqual(preflight.report.missingOrInvalidIndexIssues, [
+    'Missing or invalid index devices.device_vehicle_created_id_idx',
+  ]);
+  assert.deepEqual(
+    (await currentDb.collection('devices').indexes()).map((i) => i.name).sort(),
+    beforeIndexes.devices,
+  );
+  assert.deepEqual(await snapshotRawDocs(), beforeDocs);
+
+  // Apply upgrades indexes non-destructively while preserving all prior indexes and docs
+  const applied = await runCli('--apply');
+  assert.equal(applied.report.migrationRecorded, true);
+  assert.deepEqual(applied.report.blockingReasons, []);
+  assert.deepEqual(applied.report.missingOrInvalidIndexIssues, []);
+
+  // Readiness AFTER upgrade passes
+  await assertCriticalDeviceIndexes(currentDb);
+  await assertDeviceFoundationMigrationRecorded(currentDb);
+  await assertDeviceDatabaseReady();
+
+  const afterIndexes = {
+    devices: (await currentDb.collection('devices').indexes()).map((i) => i.name).sort(),
+    device_credentials: (await currentDb.collection('device_credentials').indexes())
+      .map((i) => i.name)
+      .sort(),
+    device_revocations: (await currentDb.collection('device_revocations').indexes())
+      .map((i) => i.name)
+      .sort(),
+  };
+  for (const name of beforeIndexes.devices) {
+    assert.ok(afterIndexes.devices.includes(name), `existing index ${name} must be preserved`);
+  }
+  assert.ok(afterIndexes.devices.includes('device_vehicle_created_id_idx'));
+  assert.deepEqual(afterIndexes.device_credentials, beforeIndexes.device_credentials);
+  assert.deepEqual(afterIndexes.device_revocations, beforeIndexes.device_revocations);
+
+  // All historical documents, credentials, and revocations remain bit-identical in MongoDB
+  assert.deepEqual(await snapshotRawDocs(), beforeDocs);
+
+  // Queries & effective binding behave safely on upgraded historical records
+  const listed = await listInternalVehicleDevices({ vehicleId: String(vehicleId), limit: 10 });
+  assert.equal(listed.hasMore, false);
+  assert.deepEqual(
+    listed.devices.map((d) => String(d.deviceId)),
+    [String(histPendingId), String(histActiveId), String(histRevokedId)],
+  );
+  for (const entry of listed.devices) {
+    assert.equal(entry.requestedByMembershipId, null);
+    assert.deepEqual(entry.metadata, {
+      name: null,
+      manufacturer: null,
+      hardwareModel: null,
+      hardwareRevision: null,
+      firmwareVersion: null,
+      serialNumber: null,
+    });
+  }
+
+  const activeBinding = await findEffectiveDeviceBinding(String(histActiveId));
+  assert.ok(activeBinding, 'historical ACTIVE device retains effective runtime binding');
+  assert.equal(activeBinding.vehicleId, String(vehicleId));
+  assert.equal(activeBinding.credentialId, String(credActiveId));
+
+  const activeDetail = await getInternalDeviceById(String(histActiveId));
+  assert.ok(activeDetail);
+  assert.equal(activeDetail.operational, true);
+
+  const pendingDetail = await getInternalDeviceById(String(histPendingId));
+  assert.ok(pendingDetail);
+  assert.equal(pendingDetail.requestedByMembershipId, null);
+
+  // Historical PENDING without requestedByMembershipId fails closed on enrollment challenge
+  assert.deepEqual(
+    await createDeviceChallenge({
+      deviceId: String(histPendingId),
+      vehicleId: String(vehicleId),
+      requestedByUserId: String(requesterUserId),
+      requestedByMembershipId: String(new Types.ObjectId()),
+    }),
+    { ok: false, reason: 'UNVERIFIABLE_ENROLLMENT_CONTEXT' },
+  );
 });

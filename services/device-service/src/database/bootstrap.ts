@@ -49,6 +49,7 @@ const CRITICAL_INDEXES: ReadonlyArray<{ collection: string; indexes: readonly Ex
     indexes: [
       { name: 'identifier_1', key: { identifier: 1 }, unique: true },
       { name: 'device_vehicle_status_idx', key: { vehicleId: 1, status: 1 } },
+      { name: 'device_vehicle_created_id_idx', key: { vehicleId: 1, createdAt: 1, _id: 1 } },
     ],
   },
   {

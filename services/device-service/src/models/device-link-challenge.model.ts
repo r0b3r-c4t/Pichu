@@ -10,6 +10,8 @@ export interface DeviceLinkChallenge {
   credentialId: Types.ObjectId;
   vehicleId: Types.ObjectId;
   requestedByUserId: Types.ObjectId;
+  /** Vehicle membership ID under which enrollment was requested and challenge issued. */
+  requestedByMembershipId: Types.ObjectId;
   expiresAt: Date;
   usedAt: Date | null;
   createdAt: Date;
@@ -25,6 +27,7 @@ const challengeSchema = new Schema<DeviceLinkChallenge>(
     credentialId: { type: Schema.Types.ObjectId, required: true, immutable: true },
     vehicleId: { type: Schema.Types.ObjectId, required: true, immutable: true },
     requestedByUserId: { type: Schema.Types.ObjectId, required: true, immutable: true },
+    requestedByMembershipId: { type: Schema.Types.ObjectId, required: true, immutable: true },
     expiresAt: { type: Date, required: true, immutable: true },
     usedAt: { type: Date, default: null },
   },

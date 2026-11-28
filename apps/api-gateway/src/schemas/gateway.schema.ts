@@ -1,4 +1,9 @@
 import {
+  DEVICE_METADATA_LIMITS,
+  deviceLinkCompletionSchema,
+  deviceMetadataUpdateRequestSchema,
+  deviceReferenceParamsSchema,
+  deviceRevocationRequestSchema,
   invitationParamsSchema,
   invitationRevokeParamsSchema,
   invitationRevokeRequestSchema,
@@ -8,8 +13,12 @@ import {
   memberPermissionsUpdateRequestSchema,
   memberReactivateRequestSchema,
   memberTransitionRequestSchema,
+  publicDeviceChallengeRequestSchema,
+  publicDeviceRegistrationRequestSchema,
   publicInvitationCreateRequestSchema,
   receivedInvitationListQuerySchema,
+  vehicleDeviceListQuerySchema,
+  vehicleDeviceParamsSchema,
   vehicleInvitationListQuerySchema,
   VEHICLE_TEXT_LIMITS,
   vehicleArchiveRequestSchema,
@@ -74,12 +83,41 @@ function relaxTrimmedText(schema: unknown, limit: number): unknown {
   }
   if (relaxed.type === 'string') {
     delete relaxed.maxLength;
+    delete relaxed.pattern;
     relaxed.description =
       `1-${limit} characters after trimming surrounding whitespace; ` +
       'control characters are rejected.';
   }
   return relaxed;
 }
+
+const DEVICE_TRIMMED_LIMITS: Readonly<Record<string, number>> = {
+  identifier: 128,
+  publicKey: 4096,
+  ...DEVICE_METADATA_LIMITS,
+};
+
+export function deviceBodyJsonSchema(
+  generated: Record<string, unknown>,
+  options: { requireAtLeastOneProperty?: boolean } = {},
+): Record<string, unknown> {
+  const properties = generated.properties;
+  if (typeof properties !== 'object' || properties === null) return generated;
+  return {
+    ...generated,
+    ...(options.requireAtLeastOneProperty ? { minProperties: 1 } : {}),
+    properties: Object.fromEntries(
+      Object.entries(properties).map(([field, property]) => {
+        if (field === 'metadata' && typeof property === 'object' && property !== null) {
+          return [field, deviceBodyJsonSchema(property as Record<string, unknown>)];
+        }
+        const limit = DEVICE_TRIMMED_LIMITS[field];
+        return [field, limit === undefined ? property : relaxTrimmedText(property, limit)];
+      }),
+    ),
+  };
+}
+
 /** DELETE may be sent without a body; an optional strict `{ reason }` body is also accepted. */
 export const vehicleArchiveBodySchema = z.union([z.undefined(), vehicleArchiveRequestSchema]);
 export const vehicleListQueryInputSchema = vehicleListQuerySchema;
@@ -98,10 +136,18 @@ export const memberPermissionsUpdateBodySchema = memberPermissionsUpdateRequestS
 export const memberTransitionBodySchema = z.union([z.undefined(), memberTransitionRequestSchema]);
 export const memberReactivateBodySchema = z.union([z.undefined(), memberReactivateRequestSchema]);
 export const memberLeaveBodySchema = memberLeaveRequestSchema;
-export const deviceLinkBodySchema = z.strictObject({
-  deviceIdentifier: z.string().trim().min(1).max(128),
-  publicKey: z.string().trim().min(32).max(4096),
-});
+
+export const deviceIdParamsInputSchema = deviceReferenceParamsSchema;
+export const vehicleDeviceParamsInputSchema = vehicleDeviceParamsSchema;
+export const deviceRegistrationBodySchema = publicDeviceRegistrationRequestSchema;
+export const vehicleDeviceListQueryInputSchema = vehicleDeviceListQuerySchema;
+export const deviceMetadataUpdateBodySchema = deviceMetadataUpdateRequestSchema;
+export const deviceChallengeBodySchema = z.union([
+  z.undefined(),
+  publicDeviceChallengeRequestSchema,
+]);
+export const deviceLinkCompletionBodySchema = deviceLinkCompletionSchema;
+export const deviceRevocationBodySchema = deviceRevocationRequestSchema;
 
 export const emptyObjectSchema = z.strictObject({});
 export const loginBodySchema = loginRequestSchema;
