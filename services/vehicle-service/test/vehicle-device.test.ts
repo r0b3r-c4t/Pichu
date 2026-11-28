@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
-import test from 'node:test';
+import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
+import test, { type TestContext } from 'node:test';
 import mongoose, { Types } from 'mongoose';
 import { AccessGrantModel } from '../src/models/access-grant.model.js';
 import {
@@ -1012,4 +1012,490 @@ test('authorization matrix rules: VEHICLE grants cannot grant device:read and re
     now,
   });
   assert.equal(readViaVehicle.deviceId, String(deviceId));
+});
+
+type ProbeClient = ReturnType<typeof createDeviceServiceClient>;
+
+/**
+ * Runs DeviceServiceClient calls inside an authenticated Vehicle request against a mocked Device
+ * upstream. `responses` is consumed per Device call; the last entry is reused when exhausted.
+ */
+function createDeviceClientProbe(t: TestContext) {
+  const ids = {
+    vehicleId: String(new Types.ObjectId()),
+    deviceId: String(new Types.ObjectId()),
+    userId: String(new Types.ObjectId()),
+    membershipId: String(new Types.ObjectId()),
+  };
+  let responses: Array<{ status: number; body: unknown }> = [];
+  const calls: string[] = [];
+
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    const target = new URL(String(url instanceof Request ? url.url : url));
+    if (target.pathname.endsWith('/verified')) {
+      return new Response(JSON.stringify({ verified: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    calls.push(`${init?.method ?? 'GET'} ${target.pathname}`);
+    const next = (responses.length > 1 ? responses.shift() : responses[0]) ?? {
+      status: 500,
+      body: {},
+    };
+    return new Response(JSON.stringify(next.body), {
+      status: next.status,
+      headers: { 'content-type': 'application/json' },
+    });
+  });
+
+  const app = createVehicleTestApp();
+  t.after(async () => app.close());
+  let runner: ((client: ProbeClient) => Promise<void>) | undefined;
+  let captured: unknown;
+  app.addHook('preHandler', async (request, reply) => {
+    if (request.headers['x-unit-device-client-probe'] !== '1' || !runner) return;
+    const client = createDeviceServiceClient(
+      request,
+      {
+        environment: 'test',
+        sender: 'vehicle-service',
+        keyring: [
+          {
+            environment: 'test',
+            sender: 'vehicle-service',
+            audience: 'device-service',
+            keyId: 'veh-dev',
+            secret: Buffer.alloc(32, 9),
+            state: 'active',
+            notBefore: 0,
+            notAfter: 9_000_000_000_000_000,
+          },
+        ],
+      },
+      'http://device-unit.local',
+    );
+    try {
+      await runner(client);
+    } catch (error) {
+      captured = error;
+    }
+    return reply.code(200).send({ ok: true });
+  });
+
+  async function run(
+    upstream: Array<{ status: number; body: unknown }>,
+    fn: (client: ProbeClient) => Promise<void>,
+  ): Promise<unknown> {
+    responses = [...upstream];
+    calls.length = 0;
+    captured = undefined;
+    runner = fn;
+    const url = `/devices/${ids.deviceId}?userId=${ids.userId}`;
+    const res = await app.inject({
+      method: 'GET',
+      url,
+      headers: { ...v2Headers(Buffer.alloc(0), 'GET', url), 'x-unit-device-client-probe': '1' },
+    });
+    assert.equal(res.statusCode, 200);
+    return captured;
+  }
+
+  return { ids, calls, run };
+}
+
+function isProtocolError(error: unknown): boolean {
+  return error instanceof DeviceUpstreamUnavailableError && error.reason === 'PROTOCOL_ERROR';
+}
+
+const REVOKED_AT = '2026-11-27T01:05:00.000Z';
+
+function probeRecords(ids: ReturnType<typeof createDeviceClientProbe>['ids']) {
+  const active = makeInternalRecord({
+    deviceId: ids.deviceId,
+    vehicleId: ids.vehicleId,
+    requestedByUserId: ids.userId,
+    requestedByMembershipId: ids.membershipId,
+  });
+  const pending = { ...active, status: 'PENDING' as const, operational: false, linkedAt: null };
+  const revoked = {
+    ...active,
+    status: 'REVOKED' as const,
+    operational: false,
+    revokedAt: REVOKED_AT,
+    revocationReason: 'LOST' as const,
+    revokedByUserId: null,
+    credential: {
+      ...active.credential,
+      status: 'REVOKED' as const,
+      usable: false,
+      revokedAt: REVOKED_AT,
+    },
+  };
+  return { active, pending, revoked };
+}
+
+test('DeviceServiceClient validates every upstream record structurally before any evidence, without recomputing expiry', async (t) => {
+  const probe = createDeviceClientProbe(t);
+  const { active, pending, revoked } = probeRecords(probe.ids);
+
+  const contradictory: Array<[string, Parameters<typeof toPublicDeviceDetail>[0]]> = [
+    ['ACTIVE with usable credential but operational=false', { ...active, operational: false }],
+    ['PENDING claiming operational', { ...pending, operational: true }],
+    ['PENDING with link audit', { ...pending, linkedAt: REVOKED_AT }],
+    ['PENDING with revocation reason', { ...pending, revocationReason: 'LOST' }],
+    [
+      'ACTIVE with device revocation marker',
+      { ...active, operational: false, revokedAt: REVOKED_AT },
+    ],
+    ['ACTIVE with revoking user', { ...active, revokedByUserId: probe.ids.userId }],
+    ['REVOKED without revocationReason', { ...revoked, revocationReason: null }],
+    ['REVOKED without revokedAt', { ...revoked, revokedAt: null }],
+    [
+      'REVOKED with a non-revoked credential',
+      { ...revoked, credential: { ...active.credential, usable: false } },
+    ],
+    [
+      'REVOKED claiming operational',
+      { ...revoked, operational: true, credential: { ...revoked.credential, usable: true } },
+    ],
+    [
+      'REVOKED credential without revokedAt',
+      { ...pending, credential: { ...revoked.credential, revokedAt: null } },
+    ],
+    [
+      'ACTIVE credential carrying revokedAt',
+      { ...pending, credential: { ...active.credential, revokedAt: REVOKED_AT } },
+    ],
+    [
+      'EXPIRED credential without expiresAt',
+      {
+        ...active,
+        operational: false,
+        credential: { ...active.credential, status: 'EXPIRED', usable: false },
+      },
+    ],
+    [
+      'EXPIRED credential reported usable',
+      {
+        ...active,
+        credential: {
+          ...active.credential,
+          status: 'EXPIRED',
+          usable: true,
+          expiresAt: '2026-11-27T02:00:00.000Z',
+        },
+      },
+    ],
+    ['membership without requester', { ...pending, requestedByUserId: null }],
+    ['foreign deviceId', { ...active, deviceId: String(new Types.ObjectId()) }],
+  ];
+  for (const [label, record] of contradictory) {
+    let snapshot: VerifiedDeviceSnapshot | null = null;
+    const error = await probe.run([{ status: 200, body: { data: record } }], async (client) => {
+      snapshot = await client.getDeviceById(probe.ids.deviceId);
+    });
+    assert.ok(isProtocolError(error), label);
+    assert.equal(snapshot, null, `${label}: no snapshot or evidence escapes`);
+  }
+
+  const legitimate: Array<[string, Parameters<typeof toPublicDeviceDetail>[0], boolean]> = [
+    ['historical ACTIVE without linkedAt', { ...active, linkedAt: null }, true],
+    [
+      'ACTIVE whose expiresAt already passed on Vehicle clock but Device observed usable',
+      { ...active, credential: { ...active.credential, expiresAt: '2000-01-01T00:00:00.000Z' } },
+      true,
+    ],
+    [
+      'ACTIVE link with credential-only revocation',
+      {
+        ...active,
+        operational: false,
+        credential: {
+          ...active.credential,
+          status: 'REVOKED',
+          usable: false,
+          revokedAt: REVOKED_AT,
+        },
+      },
+      false,
+    ],
+    [
+      'ACTIVE with credential not yet activated on Device clock',
+      { ...active, operational: false, credential: { ...active.credential, usable: false } },
+      false,
+    ],
+    [
+      'PENDING with credential-only revocation',
+      {
+        ...pending,
+        credential: {
+          ...active.credential,
+          status: 'REVOKED',
+          usable: false,
+          revokedAt: REVOKED_AT,
+        },
+      },
+      false,
+    ],
+    [
+      'historical PENDING without enrollment context',
+      { ...pending, requestedByUserId: null, requestedByMembershipId: null },
+      false,
+    ],
+    ['REVOKED by SERVICE or SYSTEM (no revoking user)', revoked, false],
+    ['REVOKED by USER', { ...revoked, revokedByUserId: probe.ids.userId }, false],
+  ];
+  for (const [label, record, expectsEvidence] of legitimate) {
+    let snapshot: VerifiedDeviceSnapshot | null = null;
+    const error = await probe.run([{ status: 200, body: { data: record } }], async (client) => {
+      snapshot = await client.getDeviceById(probe.ids.deviceId);
+    });
+    assert.equal(error, undefined, label);
+    assert.ok(snapshot, label);
+    assert.equal(
+      (snapshot as VerifiedDeviceSnapshot).activeBinding !== null,
+      expectsEvidence,
+      label,
+    );
+  }
+});
+
+test('DeviceServiceClient rejects contradictory register, link, list, PATCH and revoke responses per operation', async (t) => {
+  const probe = createDeviceClientProbe(t);
+  const { active, pending, revoked } = probeRecords(probe.ids);
+  const { publicKey } = generateKeyPairSync('ed25519');
+  const publicKeyPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const fingerprint = `sha256:${createHash('sha256')
+    .update(publicKey.export({ type: 'spki', format: 'der' }))
+    .digest('hex')}`;
+  const registered = {
+    ...pending,
+    identifier: 'esp32-registered',
+    credential: { ...pending.credential, fingerprint },
+  };
+  const registerInput = {
+    identifier: 'esp32-registered',
+    publicKey: publicKeyPem,
+    vehicleId: probe.ids.vehicleId,
+    userId: probe.ids.userId,
+    membershipId: probe.ids.membershipId,
+  };
+  const register = (data: unknown, deviceId = probe.ids.deviceId) =>
+    probe.run([{ status: 201, body: { deviceId, status: 'PENDING', data } }], async (client) => {
+      const snapshot = await client.registerDevice(registerInput);
+      assert.equal(snapshot.activeBinding, null);
+    });
+
+  assert.equal(await register(registered), undefined, 'coherent registration is accepted');
+  const otherId = () => String(new Types.ObjectId());
+  for (const [label, data, deviceId] of [
+    ['envelope/inner deviceId mismatch', registered, otherId()],
+    ['ACTIVE inner status', { ...registered, status: 'ACTIVE', operational: true }],
+    ['operational PENDING', { ...registered, operational: true }],
+    ['foreign vehicle', { ...registered, vehicleId: otherId() }],
+    ['foreign requester', { ...registered, requestedByUserId: otherId() }],
+    ['foreign membership', { ...registered, requestedByMembershipId: otherId() }],
+    ['missing membership', { ...registered, requestedByMembershipId: null }],
+    ['other identifier', { ...registered, identifier: 'esp32-other' }],
+    [
+      'credential for another key',
+      {
+        ...registered,
+        credential: { ...registered.credential, fingerprint: `sha256:${'e'.repeat(64)}` },
+      },
+    ],
+    [
+      'revoked credential',
+      {
+        ...registered,
+        credential: {
+          ...registered.credential,
+          status: 'REVOKED',
+          usable: false,
+          revokedAt: REVOKED_AT,
+        },
+      },
+    ],
+    ['link audit on registration', { ...registered, linkedAt: REVOKED_AT }],
+  ] as Array<[string, unknown, string?]>) {
+    assert.ok(isProtocolError(await register(data, deviceId)), `register: ${label}`);
+  }
+
+  const linkInput = {
+    deviceId: probe.ids.deviceId,
+    vehicleId: probe.ids.vehicleId,
+    userId: probe.ids.userId,
+    membershipId: probe.ids.membershipId,
+    challengeId: otherId(),
+    challenge: 'ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8',
+    signature: 'A'.repeat(86),
+  };
+  const link = (data: unknown) =>
+    probe.run([{ status: 200, body: { data } }], async (client) => {
+      const snapshot = await client.completeLink(linkInput);
+      assert.ok(snapshot.activeBinding);
+    });
+  assert.equal(await link(active), undefined, 'coherent link completion mints evidence');
+  for (const [label, data] of [
+    ['still PENDING', pending],
+    [
+      'ACTIVE but not operational',
+      { ...active, operational: false, credential: { ...active.credential, usable: false } },
+    ],
+    ['ACTIVE without linkedAt', { ...active, linkedAt: null }],
+    ['other requester', { ...active, requestedByUserId: otherId() }],
+    ['other membership', { ...active, requestedByMembershipId: otherId() }],
+    ['foreign vehicle', { ...active, vehicleId: otherId() }],
+    ['REVOKED', revoked],
+  ] as Array<[string, unknown]>) {
+    assert.ok(isProtocolError(await link(data)), `link: ${label}`);
+  }
+
+  const second = { ...pending, deviceId: otherId(), identifier: 'esp32-second' };
+  const list = (devices: unknown[], status?: 'PENDING' | 'ACTIVE') =>
+    probe.run([{ status: 200, body: { devices, hasMore: false } }], async (client) => {
+      await client.listVehicleDevicesBatch({
+        vehicleId: probe.ids.vehicleId,
+        limit: 10,
+        ...(status ? { status } : {}),
+      });
+    });
+  assert.equal(await list([pending, second, { ...revoked, deviceId: otherId() }]), undefined);
+  assert.ok(isProtocolError(await list([pending, pending])), 'list: duplicate deviceId');
+  assert.ok(
+    isProtocolError(await list([pending, { ...second, vehicleId: otherId() }])),
+    'list: cross-vehicle record',
+  );
+  assert.ok(isProtocolError(await list([pending], 'ACTIVE')), 'list: status filter mismatch');
+  assert.ok(
+    isProtocolError(await list([second, { ...active, operational: false }])),
+    'list: one incoherent record fails the whole batch',
+  );
+
+  const patch = (data: unknown) =>
+    probe.run([{ status: 200, body: { data } }], async (client) => {
+      await client.updateDeviceMetadata({
+        deviceId: probe.ids.deviceId,
+        vehicleId: probe.ids.vehicleId,
+        userId: probe.ids.userId,
+        metadata: { name: 'Renamed', serialNumber: null },
+      });
+    });
+  const patched = {
+    ...active,
+    metadata: { ...active.metadata, name: 'Renamed', serialNumber: null },
+  };
+  assert.equal(await patch(patched), undefined);
+  assert.ok(isProtocolError(await patch(active)), 'PATCH: requested metadata not applied');
+  assert.ok(
+    isProtocolError(await patch({ ...revoked, metadata: patched.metadata })),
+    'PATCH: REVOKED result',
+  );
+  assert.ok(
+    isProtocolError(await patch({ ...patched, operational: false })),
+    'PATCH: incoherent result',
+  );
+
+  const revoke = (data: unknown) =>
+    probe.run([{ status: 200, body: { data } }], async (client) => {
+      const snapshot = await client.revokeDevice({
+        deviceId: probe.ids.deviceId,
+        vehicleId: probe.ids.vehicleId,
+        userId: probe.ids.userId,
+        reason: 'LOST',
+      });
+      assert.equal(snapshot.activeBinding, null);
+    });
+  assert.equal(await revoke(revoked), undefined, 'SERVICE/SYSTEM revocation without user');
+  assert.ok(isProtocolError(await revoke(active)), 'revoke: success cannot represent ACTIVE');
+  assert.ok(
+    isProtocolError(await revoke({ ...revoked, revocationReason: null })),
+    'revoke: missing audit',
+  );
+  assert.ok(
+    isProtocolError(
+      await revoke({ ...revoked, credential: { ...active.credential, usable: false } }),
+    ),
+    'revoke: credential still ACTIVE',
+  );
+});
+
+test('DeviceServiceClient accepts only challenges bound to the expected device, vehicle and requester', async (t) => {
+  const probe = createDeviceClientProbe(t);
+  const challenge = {
+    protocol: 'pichu-device-link-v1',
+    challengeId: String(new Types.ObjectId()),
+    deviceId: probe.ids.deviceId,
+    vehicleId: probe.ids.vehicleId,
+    credentialId: String(new Types.ObjectId()),
+    requestedByUserId: probe.ids.userId,
+    challenge: 'ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8',
+    expiresAt: '2026-11-27T01:05:00.000Z',
+  };
+  const issue = (status: number, data: unknown) =>
+    probe.run([{ status, body: { data } }], async (client) => {
+      const issued = await client.createChallenge({
+        deviceId: probe.ids.deviceId,
+        vehicleId: probe.ids.vehicleId,
+        userId: probe.ids.userId,
+        membershipId: probe.ids.membershipId,
+      });
+      assert.deepEqual(issued, challenge);
+    });
+
+  assert.equal(await issue(201, challenge), undefined);
+  assert.deepEqual(probe.calls, [`POST /internal/devices/${probe.ids.deviceId}/challenge`]);
+  for (const [label, status, data] of [
+    ['foreign device', 201, { ...challenge, deviceId: String(new Types.ObjectId()) }],
+    ['foreign vehicle', 201, { ...challenge, vehicleId: String(new Types.ObjectId()) }],
+    ['foreign requester', 201, { ...challenge, requestedByUserId: String(new Types.ObjectId()) }],
+    ['other protocol', 201, { ...challenge, protocol: 'pichu-device-link-v0' }],
+    ['missing credential', 201, { ...challenge, credentialId: undefined }],
+    ['extra field', 201, { ...challenge, membershipId: probe.ids.membershipId }],
+    ['non-201 success', 200, challenge],
+  ] as Array<[string, number, unknown]>) {
+    assert.ok(isProtocolError(await issue(status, data)), `challenge: ${label}`);
+    assert.equal(probe.calls.length, 1, `challenge: ${label} is never retried`);
+  }
+});
+
+test('a timed-out link is never retried and its outcome is recovered by an authorized query', async (t) => {
+  const probe = createDeviceClientProbe(t);
+  const { active } = probeRecords(probe.ids);
+  let linkError: unknown;
+  let recovered: VerifiedDeviceSnapshot | null = null;
+
+  const error = await probe.run(
+    [
+      { status: 504, body: { message: 'timed out' } },
+      { status: 200, body: { data: active } },
+    ],
+    async (client) => {
+      try {
+        await client.completeLink({
+          deviceId: probe.ids.deviceId,
+          vehicleId: probe.ids.vehicleId,
+          userId: probe.ids.userId,
+          membershipId: probe.ids.membershipId,
+          challengeId: String(new Types.ObjectId()),
+          challenge: 'ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8',
+          signature: 'A'.repeat(86),
+        });
+      } catch (caught) {
+        linkError = caught;
+      }
+      recovered = await client.getDeviceById(probe.ids.deviceId);
+    },
+  );
+
+  assert.equal(error, undefined);
+  assert.ok(linkError instanceof DeviceUpstreamTimeoutError);
+  assert.deepEqual(probe.calls, [
+    `POST /internal/devices/${probe.ids.deviceId}/link`,
+    `GET /internal/devices/${probe.ids.deviceId}`,
+  ]);
+  assert.ok(recovered);
+  assert.equal((recovered as VerifiedDeviceSnapshot).record.status, 'ACTIVE');
+  assert.ok((recovered as VerifiedDeviceSnapshot).activeBinding);
 });

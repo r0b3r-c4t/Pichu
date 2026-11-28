@@ -178,6 +178,14 @@ async function rejectsWithCode(promise: Promise<unknown>, code: DeviceServiceErr
   );
 }
 
+function isDeviceWriteProtectionError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'DeviceWriteProtectionError';
+}
+
+async function rawDevice(deviceId: Types.ObjectId) {
+  return db().collection('devices').findOne({ _id: deviceId });
+}
+
 async function counts() {
   return {
     devices: await db().collection('devices').countDocuments(),
@@ -1133,32 +1141,45 @@ test('REVOKED devices and credentials are terminal through every Mongoose write 
   const reactivateDevice = {
     $set: { status: 'ACTIVE' as const, revokedAt: null, revocationId: null },
   };
-  assert.equal(
-    (await DeviceModel.updateOne({ _id: device.deviceId }, reactivateDevice)).matchedCount,
-    0,
+  await assert.rejects(
+    DeviceModel.updateOne({ _id: device.deviceId }, reactivateDevice).exec(),
+    isDeviceWriteProtectionError,
   );
-  assert.equal(
-    (await DeviceModel.updateMany({ _id: device.deviceId }, reactivateDevice)).matchedCount,
-    0,
+  await assert.rejects(
+    DeviceModel.updateMany({ _id: device.deviceId }, reactivateDevice).exec(),
+    isDeviceWriteProtectionError,
   );
-  assert.equal(
-    await DeviceModel.findOneAndUpdate({ _id: device.deviceId }, reactivateDevice),
-    null,
+  await assert.rejects(
+    DeviceModel.findOneAndUpdate({ _id: device.deviceId }, reactivateDevice).exec(),
+    isDeviceWriteProtectionError,
   );
-  assert.equal(
-    (await DeviceModel.updateOne({ _id: device.deviceId }, { $unset: { revokedAt: 1 } }))
-      .matchedCount,
-    0,
+  await assert.rejects(
+    DeviceModel.updateOne({ _id: device.deviceId }, { $unset: { revokedAt: 1 } }).exec(),
+    isDeviceWriteProtectionError,
+  );
+  await assert.rejects(
+    DeviceModel.updateOne(
+      { _id: device.deviceId },
+      [{ $set: { status: 'ACTIVE', revokedAt: null, revocationId: null } }],
+      { updatePipeline: true },
+    ).exec(),
+    isDeviceWriteProtectionError,
   );
   assert.equal(
     (
       await DeviceModel.updateOne(
         { _id: device.deviceId },
-        [{ $set: { status: 'ACTIVE', revokedAt: null, revocationId: null } }],
-        { updatePipeline: true },
+        {
+          $set: {
+            status: 'ACTIVE',
+            linkedByUserId: new Types.ObjectId(device.input.requestedByUserId),
+            linkedAt: new Date(),
+          },
+        },
       )
     ).matchedCount,
     0,
+    'a link-shaped update never matches a REVOKED device',
   );
   assert.equal(
     (
@@ -1190,6 +1211,423 @@ test('REVOKED devices and credentials are terminal through every Mongoose write 
       requestedByMembershipId: device.input.requestedByMembershipId!,
     }),
     { ok: false, reason: 'DEVICE_NOT_LINKABLE' },
+  );
+});
+
+test('protected Device fields reject forbidden Mongoose mutations in PENDING, ACTIVE and REVOKED', async () => {
+  const pending = await register();
+  const active = await linkedDevice();
+  const revoked = await linkedDevice();
+  await revokeDevice({
+    deviceId: String(revoked.deviceId),
+    reason: 'LOST',
+    actor: systemRevocationActor(),
+    requestId: 'req-protected-paths',
+  });
+
+  const someId = () => new Types.ObjectId();
+  const forbiddenUpdates: Array<[string, Record<string, unknown>]> = [
+    ['reassign vehicleId', { $set: { vehicleId: someId() } }],
+    ['remove vehicleId', { $unset: { vehicleId: 1 } }],
+    ['change identifier', { $set: { identifier: 'hijacked-identifier' } }],
+    ['change requester', { $set: { requestedByUserId: someId() } }],
+    ['clear enrollment membership', { $set: { requestedByMembershipId: null } }],
+    ['overwrite link actor', { $set: { linkedByUserId: someId() } }],
+    ['remove linkedAt', { $unset: { linkedAt: 1 } }],
+    ['stamp linkedAt', { $currentDate: { linkedAt: true } }],
+    ['revert to PENDING', { $set: { status: 'PENDING' } }],
+    ['status-only link', { $set: { status: 'ACTIVE' } }],
+    ['link without actor', { $set: { status: 'ACTIVE', linkedAt: new Date() } }],
+    [
+      'link with null actor',
+      { $set: { status: 'ACTIVE', linkedByUserId: null, linkedAt: new Date() } },
+    ],
+    ['link audit without status', { $set: { linkedByUserId: someId(), linkedAt: new Date() } }],
+    [
+      'link plus metadata',
+      {
+        $set: {
+          status: 'ACTIVE',
+          linkedByUserId: someId(),
+          linkedAt: new Date(),
+          'metadata.name': 'x',
+        },
+      },
+    ],
+    [
+      'revocation clearing link audit',
+      {
+        $set: { status: 'REVOKED', revokedAt: new Date(), revocationId: someId(), linkedAt: null },
+      },
+    ],
+    ['revocation without revocationId', { $set: { status: 'REVOKED', revokedAt: new Date() } }],
+    ['alter revokedAt', { $set: { revokedAt: new Date() } }],
+    ['remove revocationId', { $unset: { revocationId: 1 } }],
+    ['other operator on status', { $max: { status: 'REVOKED' } }],
+    ['rename protected source', { $rename: { linkedAt: 'formerLinkedAt' } }],
+    ['rename onto protected destination', { $rename: { lastSeenAt: 'status' } }],
+    ['setOnInsert protected path', { $setOnInsert: { vehicleId: someId() } }],
+    ['top-level protected path', { status: 'ACTIVE' }],
+    ['nested protected path', { $set: { 'linkedAt.at': new Date() } }],
+  ];
+  const neutral = { $set: { lastSeenAt: new Date() } };
+
+  for (const device of [pending, active, revoked]) {
+    const filter = { _id: device.deviceId };
+    const before = await rawDevice(device.deviceId);
+    assert.ok(before);
+
+    for (const [label, update] of forbiddenUpdates) {
+      await assert.rejects(
+        DeviceModel.updateOne(filter, update as never).exec(),
+        isDeviceWriteProtectionError,
+        `updateOne: ${label}`,
+      );
+      await assert.rejects(
+        DeviceModel.updateMany(filter, update as never).exec(),
+        isDeviceWriteProtectionError,
+        `updateMany: ${label}`,
+      );
+      await assert.rejects(
+        DeviceModel.findOneAndUpdate(filter, update as never).exec(),
+        isDeviceWriteProtectionError,
+        `findOneAndUpdate: ${label}`,
+      );
+    }
+    await assert.rejects(
+      DeviceModel.findByIdAndUpdate(device.deviceId, { $set: { vehicleId: someId() } }).exec(),
+      isDeviceWriteProtectionError,
+    );
+    await assert.rejects(
+      DeviceModel.updateOne(filter, [{ $set: { lastSeenAt: '$$NOW' } }], {
+        updatePipeline: true,
+      }).exec(),
+      isDeviceWriteProtectionError,
+      'pipelines are rejected even on unprotected paths',
+    );
+    await assert.rejects(
+      DeviceModel.updateOne(filter, neutral, { upsert: true }).exec(),
+      isDeviceWriteProtectionError,
+    );
+    await assert.rejects(
+      DeviceModel.findOneAndUpdate(filter, neutral, { upsert: true }).exec(),
+      isDeviceWriteProtectionError,
+    );
+    await assert.rejects(
+      DeviceModel.updateOne(filter, neutral, { overwriteImmutable: true }).exec(),
+      isDeviceWriteProtectionError,
+    );
+    await assert.rejects(
+      DeviceModel.replaceOne(filter, { ...before } as never).exec(),
+      isDeviceWriteProtectionError,
+    );
+    await assert.rejects(
+      DeviceModel.findOneAndReplace(filter, { ...before } as never).exec(),
+      isDeviceWriteProtectionError,
+    );
+    await assert.rejects(
+      DeviceModel.bulkWrite([{ updateOne: { filter, update: neutral } }]),
+      isDeviceWriteProtectionError,
+    );
+    await assert.rejects(
+      DeviceModel.bulkWrite([{ updateOne: { filter, update: { $set: { status: 'ACTIVE' } } } }]),
+      isDeviceWriteProtectionError,
+    );
+    const loaded = await DeviceModel.findById(device.deviceId);
+    assert.ok(loaded);
+    await assert.rejects(
+      loaded.updateOne({ $set: { status: 'PENDING' } }).exec(),
+      isDeviceWriteProtectionError,
+    );
+    loaded.set('lastSeenAt', new Date());
+    await assert.rejects(DeviceModel.bulkSave([loaded]), isDeviceWriteProtectionError);
+
+    const saveMutations: Array<[string, (doc: NonNullable<typeof loaded>) => void]> = [
+      ['status', (doc) => doc.set('status', doc.status === 'ACTIVE' ? 'PENDING' : 'ACTIVE')],
+      ['linkedByUserId', (doc) => doc.set('linkedByUserId', someId())],
+      ['linkedAt', (doc) => doc.set('linkedAt', doc.linkedAt ? null : new Date())],
+      ['revokedAt', (doc) => doc.set('revokedAt', new Date())],
+      ['revocationId', (doc) => doc.set('revocationId', doc.revocationId ? null : someId())],
+      [
+        'full link through save',
+        (doc) => {
+          doc.set('status', 'ACTIVE');
+          doc.set('linkedByUserId', doc.requestedByUserId);
+          doc.set('linkedAt', new Date());
+        },
+      ],
+    ];
+    for (const [label, mutate] of saveMutations) {
+      const doc = await DeviceModel.findById(device.deviceId);
+      assert.ok(doc);
+      mutate(doc);
+      await assert.rejects(
+        doc.save(),
+        (error: unknown) => error instanceof Error,
+        `save: ${label}`,
+      );
+      const unvalidated = await DeviceModel.findById(device.deviceId);
+      assert.ok(unvalidated);
+      mutate(unvalidated);
+      await assert.rejects(
+        unvalidated.save({ validateBeforeSave: false }),
+        isDeviceWriteProtectionError,
+        `save without validation: ${label}`,
+      );
+    }
+
+    const immutable = await DeviceModel.findById(device.deviceId);
+    assert.ok(immutable);
+    immutable.set('vehicleId', someId());
+    immutable.set('identifier', 'hijacked-identifier');
+    immutable.set('requestedByUserId', someId());
+    immutable.set('requestedByMembershipId', someId());
+    assert.ok(immutable.vehicleId?.equals(before.vehicleId));
+    await immutable.save();
+
+    assert.deepEqual(await rawDevice(device.deviceId), before, 'raw document is unchanged');
+  }
+
+  const revokedDoc = await DeviceModel.findById(revoked.deviceId);
+  assert.ok(revokedDoc);
+  revokedDoc.set('metadata.name', 'after revocation');
+  await assert.rejects(revokedDoc.save(), /REVOKED devices are terminal/);
+  const revokedMetadata = await DeviceModel.updateOne(
+    { _id: revoked.deviceId },
+    { $set: { 'metadata.name': 'after revocation' } },
+  );
+  assert.equal(revokedMetadata.matchedCount, 0, 'metadata never matches a REVOKED device');
+  assert.equal((await rawDevice(revoked.deviceId))?.metadata?.name ?? null, null);
+
+  for (const device of [pending, active]) {
+    const doc = await DeviceModel.findById(device.deviceId);
+    assert.ok(doc);
+    doc.set('metadata.name', 'saved name');
+    await doc.save();
+    assert.equal((await rawDevice(device.deviceId))?.metadata?.name, 'saved name');
+  }
+
+  const forged = new DeviceModel({
+    identifier: 'forged-active-device',
+    vehicleId: someId(),
+    requestedByUserId: someId(),
+    status: 'ACTIVE',
+    linkedByUserId: someId(),
+    linkedAt: new Date(),
+  });
+  await assert.rejects(forged.save({ validateBeforeSave: false }), isDeviceWriteProtectionError);
+  await assert.rejects(
+    DeviceModel.insertMany([
+      { identifier: 'bulk-inserted-device', vehicleId: someId(), requestedByUserId: someId() },
+    ]),
+    isDeviceWriteProtectionError,
+  );
+  assert.equal(
+    await db()
+      .collection('devices')
+      .countDocuments({ identifier: { $in: ['forged-active-device', 'bulk-inserted-device'] } }),
+    0,
+  );
+});
+
+test('Mongoose never deletes devices, so their identity, credentials and revocation audit survive', async () => {
+  const pending = await register();
+  const active = await linkedDevice();
+  const revoked = await linkedDevice();
+  await revokeDevice({
+    deviceId: String(revoked.deviceId),
+    reason: 'REPLACED',
+    actor: systemRevocationActor(),
+    requestId: 'req-no-delete',
+  });
+  const snapshotAll = async () => ({
+    devices: await db().collection('devices').find({}).sort({ _id: 1 }).toArray(),
+    credentials: await db().collection('device_credentials').find({}).sort({ _id: 1 }).toArray(),
+    revocations: await db().collection('device_revocations').find({}).sort({ _id: 1 }).toArray(),
+  });
+  const before = await snapshotAll();
+  assert.equal(before.devices.length, 3);
+
+  await assert.rejects(DeviceModel.deleteMany({}).exec(), isDeviceWriteProtectionError);
+  for (const device of [pending, active, revoked]) {
+    const filter = { _id: device.deviceId };
+    await assert.rejects(DeviceModel.deleteOne(filter).exec(), isDeviceWriteProtectionError);
+    await assert.rejects(DeviceModel.deleteMany(filter).exec(), isDeviceWriteProtectionError);
+    await assert.rejects(DeviceModel.findOneAndDelete(filter).exec(), isDeviceWriteProtectionError);
+    await assert.rejects(
+      DeviceModel.findByIdAndDelete(device.deviceId).exec(),
+      isDeviceWriteProtectionError,
+    );
+    await assert.rejects(
+      DeviceModel.bulkWrite([{ deleteOne: { filter } }]),
+      isDeviceWriteProtectionError,
+    );
+    const loaded = await DeviceModel.findById(device.deviceId);
+    assert.ok(loaded);
+    await assert.rejects(loaded.deleteOne(), isDeviceWriteProtectionError);
+  }
+  assert.deepEqual(await snapshotAll(), before);
+
+  for (const device of [pending, active, revoked]) {
+    await rejectsWithCode(
+      registerDevice({
+        identifier: device.input.identifier,
+        publicKey: keyPair().pem,
+        vehicleId: String(new Types.ObjectId()),
+        requestedByUserId: String(new Types.ObjectId()),
+        requestedByMembershipId: String(new Types.ObjectId()),
+      }),
+      'DEVICE_ALREADY_REGISTERED',
+    );
+  }
+  assert.deepEqual(await snapshotAll(), before, 'identifiers stay globally reserved');
+});
+
+test('link and revocation transitions are atomic on persisted state and preserve audit', async () => {
+  const pending = await register();
+  const linkShape = (actor: string | Types.ObjectId) => ({
+    $set: {
+      status: 'ACTIVE' as const,
+      linkedByUserId: new Types.ObjectId(String(actor)),
+      linkedAt: new Date(),
+    },
+  });
+
+  const otherActor = await DeviceModel.updateOne(
+    { _id: pending.deviceId },
+    linkShape(new Types.ObjectId()),
+  );
+  assert.equal(otherActor.matchedCount, 0, 'only the original requester can be the link actor');
+  await assert.rejects(
+    DeviceModel.updateMany(
+      { _id: pending.deviceId },
+      linkShape(pending.input.requestedByUserId),
+    ).exec(),
+    isDeviceWriteProtectionError,
+    'transitions apply to a single document',
+  );
+  const pendingRaw = await rawDevice(pending.deviceId);
+  assert.equal(pendingRaw?.status, 'PENDING');
+  assert.equal(pendingRaw?.linkedByUserId, null);
+  assert.equal(pendingRaw?.linkedAt, null);
+
+  const active = await linkedDevice();
+  const activeBefore = await rawDevice(active.deviceId);
+  assert.ok(activeBefore);
+  assert.ok(activeBefore.linkedAt instanceof Date);
+  const relink = await DeviceModel.updateOne(
+    { _id: active.deviceId },
+    linkShape(active.input.requestedByUserId),
+  );
+  assert.equal(relink.matchedCount, 0, 'established link audit is never overwritten');
+  assert.deepEqual(await rawDevice(active.deviceId), activeBefore);
+
+  await revokeDevice({
+    deviceId: String(active.deviceId),
+    reason: 'SECURITY_COMPROMISE',
+    actor: systemRevocationActor(),
+    requestId: 'req-preserve-link',
+  });
+  const revokedRaw = await rawDevice(active.deviceId);
+  assert.equal(revokedRaw?.status, 'REVOKED');
+  assert.ok(revokedRaw?.linkedByUserId.equals(activeBefore.linkedByUserId));
+  assert.equal(revokedRaw?.linkedAt.getTime(), activeBefore.linkedAt.getTime());
+  assert.ok(revokedRaw?.vehicleId.equals(activeBefore.vehicleId));
+
+  const secondRevocation = await DeviceModel.updateOne(
+    { _id: active.deviceId },
+    { $set: { status: 'REVOKED', revokedAt: new Date(), revocationId: new Types.ObjectId() } },
+  );
+  assert.equal(secondRevocation.matchedCount, 0, 'revocation audit is never rewritten');
+  assert.deepEqual(await rawDevice(active.deviceId), revokedRaw);
+});
+
+test('a document loaded before a concurrent revocation cannot persist stale or protected changes', async () => {
+  const device = await linkedDevice();
+  const staleMetadata = await DeviceModel.findById(device.deviceId);
+  const staleStatus = await DeviceModel.findById(device.deviceId);
+  const staleLink = await DeviceModel.findById(device.deviceId);
+  assert.ok(staleMetadata && staleStatus && staleLink);
+  assert.equal(staleMetadata.status, 'ACTIVE');
+
+  await revokeDevice({
+    deviceId: String(device.deviceId),
+    reason: 'LOST',
+    actor: userActor(device.input.requestedByUserId),
+    requestId: 'req-concurrent-save',
+  });
+  const revokedRaw = await rawDevice(device.deviceId);
+  assert.equal(revokedRaw?.status, 'REVOKED');
+
+  staleMetadata.set('metadata.name', 'stale write');
+  await assert.rejects(
+    staleMetadata.save(),
+    (error: unknown) => error instanceof mongoose.Error.DocumentNotFoundError,
+  );
+  staleStatus.set('status', 'PENDING');
+  await assert.rejects(
+    staleStatus.save({ validateBeforeSave: false }),
+    isDeviceWriteProtectionError,
+  );
+  staleLink.set('linkedAt', null);
+  staleLink.set('linkedByUserId', null);
+  await assert.rejects(staleLink.save({ validateBeforeSave: false }), isDeviceWriteProtectionError);
+
+  assert.deepEqual(await rawDevice(device.deviceId), revokedRaw);
+});
+
+test('after a lost link response the persisted state is recovered by query, never by reusing challenges', async () => {
+  const device = await register();
+  const challengeInput = {
+    deviceId: device.deviceId,
+    vehicleId: device.input.vehicleId,
+    requestedByUserId: device.input.requestedByUserId,
+    requestedByMembershipId: device.input.requestedByMembershipId!,
+  };
+
+  const abandoned = await createDeviceChallenge(challengeInput);
+  assert.equal(abandoned.ok, true);
+  assert.equal((await getInternalDeviceById(String(device.deviceId)))?.status, 'PENDING');
+  const fresh = await createDeviceChallenge(challengeInput);
+  assert.equal(fresh.ok, true);
+  const linkInput = (issued: typeof fresh) => {
+    assert.equal(issued.ok, true);
+    return {
+      deviceId: String(device.deviceId),
+      vehicleId: device.input.vehicleId,
+      challengeId: issued.challengeId,
+      challenge: issued.challenge,
+      signature: signCanonicalChallenge(device.key.privateKey, issued.data),
+      actorUserId: device.input.requestedByUserId,
+      actorMembershipId: device.input.requestedByMembershipId!,
+    };
+  };
+  assert.deepEqual(await completeDeviceLink(linkInput(abandoned)), {
+    linked: false,
+    reason: 'INVALID_CHALLENGE',
+  });
+
+  const delivered = await completeDeviceLink(linkInput(fresh));
+  assert.equal(delivered.linked, true);
+  const linkedRaw = await rawDevice(device.deviceId);
+
+  const observed = await getInternalDeviceById(String(device.deviceId));
+  assert.equal(observed?.status, 'ACTIVE');
+  assert.equal(observed?.operational, true);
+  assert.equal(observed?.linkedAt, linkedRaw?.linkedAt.toISOString());
+
+  const replay = await completeDeviceLink(linkInput(fresh));
+  assert.equal(replay.linked, false, 'a consumed challenge never links again');
+  assert.deepEqual(await createDeviceChallenge(challengeInput), {
+    ok: false,
+    reason: 'DEVICE_NOT_LINKABLE',
+  });
+  assert.deepEqual(await rawDevice(device.deviceId), linkedRaw);
+  assert.equal(
+    await db()
+      .collection(DeviceLinkChallengeModel.collection.name)
+      .countDocuments({ deviceId: device.deviceId, usedAt: null }),
+    0,
   );
 });
 
@@ -2348,4 +2786,44 @@ test('upgrades a valid TKT-014 database non-destructively to TKT-015 indexes whi
     }),
     { ok: false, reason: 'UNVERIFIABLE_ENROLLMENT_CONTEXT' },
   );
+
+  // Historical records keep their legitimate writes under the protected-path guard
+  const pendingMetadata = await updateDeviceMetadata({
+    deviceId: String(histPendingId),
+    vehicleId: String(vehicleId),
+    metadata: { name: 'Historical pending' },
+  });
+  assert.equal(pendingMetadata.metadata.name, 'Historical pending');
+  await rejectsWithCode(
+    updateDeviceMetadata({
+      deviceId: String(histRevokedId),
+      vehicleId: String(vehicleId),
+      metadata: { name: 'Historical revoked' },
+    }),
+    'DEVICE_REVOKED',
+  );
+
+  const systemRevocation = await revokeDevice({
+    deviceId: String(histActiveId),
+    expectedVehicleId: String(vehicleId),
+    reason: 'ADMINISTRATIVE',
+    actor: systemRevocationActor(),
+    requestId: 'tkt016-hist-active',
+  });
+  assert.equal(systemRevocation.record?.status, 'REVOKED');
+  assert.equal(systemRevocation.record?.revokedByUserId, null);
+  const histActiveRaw = await currentDb.collection('devices').findOne({ _id: histActiveId });
+  assert.ok(histActiveRaw?.linkedByUserId.equals(ownerUserId), 'historical link actor is kept');
+  assert.equal(histActiveRaw?.linkedAt.getTime(), t2.getTime());
+
+  const serviceRevocation = await revokeDevice({
+    deviceId: String(histPendingId),
+    expectedVehicleId: String(vehicleId),
+    reason: 'ADMINISTRATIVE',
+    actor: revocationActorFromInternalPrincipal(principal()),
+    requestId: 'tkt016-hist-pending',
+  });
+  assert.equal(serviceRevocation.record?.status, 'REVOKED');
+  assert.equal(serviceRevocation.record?.revokedByUserId, null);
+  assert.equal(serviceRevocation.record?.requestedByMembershipId, null);
 });
