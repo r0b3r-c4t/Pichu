@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
 import { Types } from 'mongoose';
 import { z } from 'zod';
@@ -9,6 +10,7 @@ import {
   internalDeviceDetailResponseSchema,
   type DeviceDetail,
   type DeviceLinkChallenge,
+  type DeviceMetadata,
   type DeviceMetadataInput,
   type DeviceMetadataUpdateRequest,
   type DeviceRevocationReason,
@@ -129,40 +131,98 @@ export function toPublicDeviceDetail(record: InternalDeviceRecord): DeviceDetail
   return parsed.data;
 }
 
+function protocolError(message: string): DeviceUpstreamUnavailableError {
+  return new DeviceUpstreamUnavailableError(message, 'PROTOCOL_ERROR');
+}
+
+/**
+ * Structural coherence of an upstream record. Credential expiry and usability are Device's
+ * observation at its own clock and are never recomputed with Vehicle's clock; only combinations
+ * that no consistent Device state can produce are rejected. Historical records stay valid:
+ * ACTIVE without `linkedAt`, requester-less records, and USER-less (SERVICE/SYSTEM) revocations.
+ */
+function assertCoherentDeviceRecord(record: InternalDeviceRecord): void {
+  const { credential } = record;
+  if ((credential.status === 'REVOKED') !== (credential.revokedAt !== null)) {
+    throw protocolError('Inconsistent credential revocation from upstream Device');
+  }
+  if (credential.status === 'EXPIRED' && credential.expiresAt === null) {
+    throw protocolError('Expired upstream credential lacks expiresAt');
+  }
+  if (credential.usable && credential.status !== 'ACTIVE') {
+    throw protocolError('Unusable credential state reported as usable by upstream Device');
+  }
+  if (record.operational !== (record.status === 'ACTIVE' && credential.usable)) {
+    throw protocolError('Inconsistent operational flag from upstream Device');
+  }
+  if (record.requestedByMembershipId !== null && record.requestedByUserId === null) {
+    throw protocolError('Upstream enrollment membership lacks its requester');
+  }
+  if (
+    record.status !== 'REVOKED' &&
+    (record.revokedAt !== null ||
+      record.revocationReason !== null ||
+      record.revokedByUserId !== null)
+  ) {
+    throw protocolError('Revocation audit on a non-revoked upstream device');
+  }
+  if (record.status === 'PENDING' && record.linkedAt !== null) {
+    throw protocolError('Link audit on a PENDING upstream device');
+  }
+  if (
+    record.status === 'REVOKED' &&
+    (record.revokedAt === null ||
+      record.revocationReason === null ||
+      credential.status !== 'REVOKED')
+  ) {
+    throw protocolError('Incomplete revocation state from upstream Device');
+  }
+}
+
+interface RecordExpectations {
+  expectedDeviceId?: string;
+  expectedVehicleId?: string;
+  expectedStatuses?: readonly DeviceStatus[];
+  expectedRequester?: { userId: string; membershipId: string };
+}
+
+/**
+ * Sole issuer of VerifiedExternalResourceBinding for devices. Every upstream record is validated
+ * for identity, operation context and structural coherence before any evidence is minted, so a
+ * contradictory response fails closed even when it would not produce evidence.
+ */
 function buildVerifiedSnapshot(
   record: InternalDeviceRecord,
-  expectations: { expectedDeviceId?: string; expectedVehicleId?: string },
+  expectations: RecordExpectations,
 ): VerifiedDeviceSnapshot {
   if (
     expectations.expectedDeviceId !== undefined &&
     record.deviceId !== expectations.expectedDeviceId
   ) {
-    throw new DeviceUpstreamUnavailableError('Upstream deviceId mismatch', 'PROTOCOL_ERROR');
+    throw protocolError('Upstream deviceId mismatch');
   }
   if (
     expectations.expectedVehicleId !== undefined &&
     record.vehicleId !== expectations.expectedVehicleId
   ) {
-    throw new DeviceUpstreamUnavailableError('Upstream vehicleId mismatch', 'PROTOCOL_ERROR');
+    throw protocolError('Upstream vehicleId mismatch');
   }
-
-  // Structural coherence guard before minting any VerifiedExternalResourceBinding:
-  const eligibleForActiveEvidence =
-    record.status === 'ACTIVE' &&
-    record.operational === true &&
-    record.revokedAt === null &&
-    record.revocationReason === null &&
-    record.credential.status === 'ACTIVE' &&
-    record.credential.usable === true &&
-    record.credential.revokedAt === null;
-
-  if (record.operational && !eligibleForActiveEvidence) {
-    throw new DeviceUpstreamUnavailableError(
-      'Inconsistent operational flag from upstream Device',
-      'PROTOCOL_ERROR',
-    );
+  if (
+    expectations.expectedStatuses !== undefined &&
+    !expectations.expectedStatuses.includes(record.status)
+  ) {
+    throw protocolError('Unexpected upstream device status for the operation');
   }
+  if (
+    expectations.expectedRequester !== undefined &&
+    (record.requestedByUserId !== expectations.expectedRequester.userId ||
+      record.requestedByMembershipId !== expectations.expectedRequester.membershipId)
+  ) {
+    throw protocolError('Upstream enrollment context mismatch');
+  }
+  assertCoherentDeviceRecord(record);
 
+  const eligibleForActiveEvidence = record.status === 'ACTIVE' && record.operational;
   const activeBinding = eligibleForActiveEvidence
     ? createVerifiedExternalResourceBinding({
         scopeType: 'DEVICE',
@@ -177,6 +237,17 @@ function buildVerifiedSnapshot(
     publicDetail: toPublicDeviceDetail(record),
     activeBinding,
   });
+}
+
+const SPKI_PEM_ARMOR =
+  /^-----BEGIN PUBLIC KEY-----\s+([A-Za-z0-9+/=\s]+?)\s+-----END PUBLIC KEY-----$/;
+
+/** Device fingerprints are `sha256:` over the SPKI DER carried by the submitted PEM. */
+function submittedKeyFingerprint(publicKey: string): string | null {
+  const body = SPKI_PEM_ARMOR.exec(publicKey.trim())?.[1];
+  if (body === undefined) return null;
+  const der = Buffer.from(body.replace(/\s+/g, ''), 'base64');
+  return `sha256:${createHash('sha256').update(der).digest('hex')}`;
 }
 
 function throwForNon2xx(response: HttpsJsonResponse): never {
@@ -292,7 +363,13 @@ export function createDeviceServiceClient(
       const response = await callDevice('POST', '/internal/devices/register', input);
       if (response.status !== 201) throwForNon2xx(response);
       const parsed = deviceRegistrationResponseSchema.safeParse(response.body);
-      if (!parsed.success || parsed.data.deviceId !== parsed.data.data.deviceId) {
+      if (
+        !parsed.success ||
+        parsed.data.deviceId !== parsed.data.data.deviceId ||
+        parsed.data.data.identifier !== input.identifier.trim() ||
+        parsed.data.data.credential.status !== 'ACTIVE' ||
+        parsed.data.data.credential.fingerprint !== submittedKeyFingerprint(input.publicKey)
+      ) {
         throw new DeviceUpstreamUnavailableError(
           'Invalid registration response from Device',
           'PROTOCOL_ERROR',
@@ -301,6 +378,8 @@ export function createDeviceServiceClient(
       return buildVerifiedSnapshot(parsed.data.data, {
         expectedDeviceId: parsed.data.deviceId,
         expectedVehicleId: input.vehicleId,
+        expectedStatuses: ['PENDING'],
+        expectedRequester: { userId: input.userId, membershipId: input.membershipId },
       });
     },
 
@@ -334,7 +413,9 @@ export function createDeviceServiceClient(
       if (
         !parsed.success ||
         parsed.data.devices.length > input.limit ||
-        (parsed.data.devices.length === 0 && parsed.data.hasMore)
+        (parsed.data.devices.length === 0 && parsed.data.hasMore) ||
+        new Set(parsed.data.devices.map((record) => record.deviceId)).size !==
+          parsed.data.devices.length
       ) {
         throw new DeviceUpstreamUnavailableError(
           'Invalid device list response from Device',
@@ -342,7 +423,10 @@ export function createDeviceServiceClient(
         );
       }
       const items = parsed.data.devices.map((record) =>
-        buildVerifiedSnapshot(record, { expectedVehicleId: input.vehicleId }),
+        buildVerifiedSnapshot(record, {
+          expectedVehicleId: input.vehicleId,
+          ...(input.status !== undefined ? { expectedStatuses: [input.status] } : {}),
+        }),
       );
       return { items, hasMore: parsed.data.hasMore };
     },
@@ -355,7 +439,15 @@ export function createDeviceServiceClient(
       });
       if (response.status !== 200) throwForNon2xx(response);
       const parsed = internalDeviceDetailResponseSchema.safeParse(response.body);
-      if (!parsed.success) {
+      if (
+        !parsed.success ||
+        Object.entries(input.metadata).some(
+          ([field, value]) =>
+            value !== undefined &&
+            parsed.data.data.metadata[field as keyof DeviceMetadata] !==
+              (typeof value === 'string' ? value.trim() : value),
+        )
+      ) {
         throw new DeviceUpstreamUnavailableError(
           'Invalid metadata update response from Device',
           'PROTOCOL_ERROR',
@@ -364,6 +456,7 @@ export function createDeviceServiceClient(
       return buildVerifiedSnapshot(parsed.data.data, {
         expectedDeviceId: input.deviceId,
         expectedVehicleId: input.vehicleId,
+        expectedStatuses: ['PENDING', 'ACTIVE'],
       });
     },
 
@@ -400,7 +493,12 @@ export function createDeviceServiceClient(
       });
       if (response.status !== 200) throwForNon2xx(response);
       const parsed = internalDeviceDetailResponseSchema.safeParse(response.body);
-      if (!parsed.success || parsed.data.data.status !== 'ACTIVE') {
+      if (
+        !parsed.success ||
+        parsed.data.data.status !== 'ACTIVE' ||
+        !parsed.data.data.operational ||
+        parsed.data.data.linkedAt === null
+      ) {
         throw new DeviceUpstreamUnavailableError(
           'Invalid link completion response from Device',
           'PROTOCOL_ERROR',
@@ -409,6 +507,8 @@ export function createDeviceServiceClient(
       return buildVerifiedSnapshot(parsed.data.data, {
         expectedDeviceId: input.deviceId,
         expectedVehicleId: input.vehicleId,
+        expectedStatuses: ['ACTIVE'],
+        expectedRequester: { userId: input.userId, membershipId: input.membershipId },
       });
     },
 
@@ -429,6 +529,7 @@ export function createDeviceServiceClient(
       return buildVerifiedSnapshot(parsed.data.data, {
         expectedDeviceId: input.deviceId,
         expectedVehicleId: input.vehicleId,
+        expectedStatuses: ['REVOKED'],
       });
     },
   };

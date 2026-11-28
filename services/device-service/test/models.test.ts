@@ -178,6 +178,106 @@ test('lifecycle update detection covers operators, plain paths and pipelines', (
   assert.equal(updateTouchesLifecyclePaths(null), false);
 });
 
+test('device write guard rejects unsafe Mongoose modalities before reaching MongoDB', async () => {
+  const isGuardError = (error: unknown) =>
+    error instanceof Error && error.name === 'DeviceWriteProtectionError';
+  for (const path of ['identifier', 'vehicleId', 'requestedByUserId', 'requestedByMembershipId']) {
+    assert.equal(DeviceModel.schema.path(path).options.immutable, true, path);
+  }
+
+  const filter = { _id: new Types.ObjectId() };
+  const rejected: Array<[string, () => Promise<unknown>]> = [
+    [
+      'pipeline',
+      () =>
+        DeviceModel.updateOne(filter, [{ $set: { lastSeenAt: '$$NOW' } }], {
+          updatePipeline: true,
+        }).exec(),
+    ],
+    [
+      'upsert',
+      () =>
+        DeviceModel.updateOne(
+          filter,
+          { $set: { lastSeenAt: new Date() } },
+          { upsert: true },
+        ).exec(),
+    ],
+    [
+      'overwriteImmutable',
+      () =>
+        DeviceModel.updateOne(
+          filter,
+          { $set: { lastSeenAt: new Date() } },
+          { overwriteImmutable: true },
+        ).exec(),
+    ],
+    ['partial link', () => DeviceModel.updateOne(filter, { $set: { status: 'ACTIVE' } }).exec()],
+    [
+      'rename destination',
+      () => DeviceModel.updateOne(filter, { $rename: { lastSeenAt: 'linkedAt' } }).exec(),
+    ],
+    [
+      'multi-document revocation',
+      () =>
+        DeviceModel.updateMany(filter, {
+          $set: { status: 'REVOKED', revokedAt: new Date(), revocationId: new Types.ObjectId() },
+        }).exec(),
+    ],
+    ['replacement', () => DeviceModel.replaceOne(filter, {}).exec()],
+    ['bulkWrite', () => DeviceModel.bulkWrite([{ deleteOne: { filter } }])],
+    [
+      'insertMany',
+      () =>
+        DeviceModel.insertMany([
+          {
+            identifier: 'esp32-bulk',
+            vehicleId: new Types.ObjectId(),
+            requestedByUserId: new Types.ObjectId(),
+          },
+        ]),
+    ],
+    ['deleteOne', () => DeviceModel.deleteOne(filter).exec()],
+    ['deleteMany', () => DeviceModel.deleteMany({}).exec()],
+    ['findOneAndDelete', () => DeviceModel.findOneAndDelete(filter).exec()],
+    ['findByIdAndDelete', () => DeviceModel.findByIdAndDelete(filter._id).exec()],
+    [
+      'document deleteOne',
+      () =>
+        DeviceModel.hydrate({
+          _id: filter._id,
+          identifier: 'esp32-hydrated',
+          vehicleId: new Types.ObjectId(),
+          requestedByUserId: new Types.ObjectId(),
+          status: 'PENDING',
+        }).deleteOne(),
+    ],
+  ];
+  const registration = {
+    identifier: 'esp32-forged',
+    vehicleId: new Types.ObjectId(),
+    requestedByUserId: new Types.ObjectId(),
+  };
+  for (const [label, fields] of [
+    ['ACTIVE', { status: 'ACTIVE' }],
+    ['REVOKED', { status: 'REVOKED', revokedAt: new Date(), revocationId: new Types.ObjectId() }],
+    ['without vehicleId', { vehicleId: null }],
+    ['without requester', { requestedByUserId: null }],
+    ['PENDING with link actor', { linkedByUserId: new Types.ObjectId() }],
+    ['PENDING with linkedAt', { linkedAt: new Date() }],
+    ['PENDING with revokedAt', { revokedAt: new Date() }],
+    ['PENDING with revocationId', { revocationId: new Types.ObjectId() }],
+  ] as Array<[string, Record<string, unknown>]>) {
+    rejected.push([
+      `unvalidated insert: ${label}`,
+      () => new DeviceModel({ ...registration, ...fields }).save({ validateBeforeSave: false }),
+    ]);
+  }
+  for (const [label, run] of rejected) {
+    await assert.rejects(run, isGuardError, label);
+  }
+});
+
 test('a usable credential is ACTIVE, consistent, already activated and unexpired', () => {
   const now = new Date('2026-06-01T00:00:00.000Z');
   const usable = {
