@@ -1,7 +1,8 @@
+import { createHash } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
-import { z } from 'zod';
 import mongoose, { Types } from 'mongoose';
 import {
+  deviceReferenceParamsSchema,
   internalInvitationCreateRequestSchema,
   internalInvitationRevokeRequestSchema,
   internalMemberLeaveRequestSchema,
@@ -12,6 +13,12 @@ import {
   internalReceivedInvitationListQuerySchema,
   internalVehicleArchiveRequestSchema,
   internalVehicleCreateRequestSchema,
+  internalVehicleDeviceChallengeRequestSchema,
+  internalVehicleDeviceLinkCompletionRequestSchema,
+  internalVehicleDeviceListQuerySchema,
+  internalVehicleDeviceMetadataUpdateRequestSchema,
+  internalVehicleDeviceRegistrationRequestSchema,
+  internalVehicleDeviceRevokeRequestSchema,
   internalVehicleGetQuerySchema,
   internalVehicleInvitationListQuerySchema,
   internalVehicleListQuerySchema,
@@ -20,12 +27,12 @@ import {
   invitationParamsSchema,
   invitationRevokeParamsSchema,
   memberParamsSchema,
+  vehicleDeviceParamsSchema,
   vehicleParamsSchema,
 } from '@pichu/contracts';
 import {
   acceptInvitation,
   archiveVehicle,
-  canLinkDeviceToVehicle,
   createVehicle,
   getAccessibleVehicle,
   inviteMember,
@@ -43,6 +50,19 @@ import {
   VehicleServiceError,
   type VehicleAuditLogger,
 } from './services/vehicle.service.js';
+import { createDeviceServiceClient } from './services/device-client.service.js';
+import {
+  completeVehicleDeviceLink,
+  DeviceUpstreamTimeoutError,
+  DeviceUpstreamUnavailableError,
+  getDirectDeviceDetail,
+  getVehicleScopedDeviceDetail,
+  issueVehicleDeviceChallenge,
+  listVehicleDevices,
+  registerVehicleDevice,
+  revokeVehicleDevice,
+  updateVehicleDeviceMetadata,
+} from './services/vehicle-device.service.js';
 import { loadEnv, parseInternalKeyring } from './config/env.js';
 import {
   executeSignedInternalRequest,
@@ -160,11 +180,42 @@ class InviteeLookupError extends Error {
   }
 }
 
-const deviceLinkInputSchema = z.strictObject({
-  userId: z.string().regex(/^[a-f0-9]{24}$/),
-  deviceIdentifier: z.string().trim().min(1).max(128),
-  publicKey: z.string().trim().min(32).max(4096),
-});
+function handleDeviceOperationError(
+  reply: FastifyReply,
+  request: FastifyRequest,
+  actorUserId: string,
+  error: unknown,
+  vehicleId?: string,
+) {
+  if (error instanceof VehicleServiceError) {
+    return sendDomainError(reply, request, error);
+  }
+  const requestId = responseRequestId(request);
+  if (error instanceof DeviceUpstreamTimeoutError) {
+    return reply.code(504).send({
+      error: 'GATEWAY_TIMEOUT',
+      message: 'Device service timed out',
+      requestId,
+    });
+  }
+  if (error instanceof DeviceUpstreamUnavailableError) {
+    if (error.reason === 'PROTOCOL_ERROR') {
+      createRequestAuditLogger(request)({
+        action: 'device.upstream_protocol_error',
+        actorUserId,
+        ...(vehicleId ? { vehicleId } : {}),
+        outcome: 'denied',
+        reason: 'upstream_contract_or_identity_mismatch',
+      });
+    }
+    return reply.code(503).send({
+      error: 'SERVICE_UNAVAILABLE',
+      message: 'Device service unavailable',
+      requestId,
+    });
+  }
+  throw error;
+}
 
 export function createApp(dependencies?: VehicleAppDependencies): FastifyInstance {
   const app = Fastify({
@@ -207,6 +258,27 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
     deviceServiceUrl: runtime.deviceServiceUrl,
     tlsCaPath: runtime.tlsCaPath,
   });
+
+  const deriveDeviceCursorSecrets = (keyring: Keyring): Buffer[] => {
+    const ordered = [
+      ...keyring.filter((entry) => entry.state === 'active'),
+      ...keyring.filter((entry) => entry.state === 'previous'),
+    ];
+    const seen = new Set<string>();
+    const secrets: Buffer[] = [];
+    for (const entry of ordered) {
+      const derived = createHash('sha256')
+        .update('pichu:vehicle-device-cursor-key:v1:')
+        .update(entry.secret)
+        .digest();
+      const hex = derived.toString('hex');
+      if (!seen.has(hex)) {
+        seen.add(hex);
+        secrets.push(derived);
+      }
+    }
+    return secrets;
+  };
 
   const readinessCheck = dependencies?.readinessCheck ?? (() => assertVehicleDatabaseReady());
 
@@ -863,129 +935,347 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
     );
 
     scope.post<{ Params: { vehicleId: string } }>(
-      '/vehicles/:vehicleId/devices/link',
-      { config: { internalOperation: 'deviceLink' } },
+      '/vehicles/:vehicleId/devices',
+      { config: { internalOperation: 'deviceRegister' } },
       async (request, reply) => {
-        const parsed = deviceLinkInputSchema.safeParse(request.body);
-        if (!parsed.success || !Types.ObjectId.isValid(request.params.vehicleId)) {
-          return reply.code(400).send({ message: 'Invalid linking data' });
+        const params = vehicleParamsSchema.safeParse(request.params);
+        const parsed = internalVehicleDeviceRegistrationRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid device registration data');
         }
-        const runtime = resolveRuntimeConfig();
-        const clientConfig = buildOutboundClientConfig(runtime);
-        if (!(await requireVerifiedEmail(request, reply, parsed.data.userId, clientConfig))) {
+        const actor = await authenticateActor(request, reply, parsed.data.userId);
+        if (!actor) {
           return;
         }
-
-        const vehicleId = request.params.vehicleId;
-        const identityPath = `/internal/users/${parsed.data.userId}/exists`;
-        let identityResponse;
+        const deviceClient = createDeviceServiceClient(
+          request,
+          actor.clientConfig,
+          actor.runtime.deviceServiceUrl,
+        );
         try {
-          identityResponse = await executeSignedInternalRequest(request, clientConfig, {
-            audience: 'identity-service',
-            baseUrl: runtime.identityServiceUrl,
-            method: 'GET',
-            path: identityPath,
-          });
-        } catch (error) {
-          if (error instanceof OutboundDeadlineExceededError) {
-            return reply.code(504).send({ message: 'Identity service timed out' });
-          }
-          return reply.code(503).send({ message: 'Identity service unavailable' });
-        }
-
-        if (identityResponse.status === 504) {
-          return reply.code(504).send({ message: 'Identity service timed out' });
-        }
-        if (identityResponse.status < 200 || identityResponse.status >= 300) {
-          return reply.code(503).send({ message: 'Identity service unavailable' });
-        }
-        const identity = identityResponse.body as { exists?: boolean };
-        if (!identity.exists) {
-          return reply.code(404).send({ message: 'User or vehicle not found' });
-        }
-
-        let allowed: boolean;
-        try {
-          allowed = await canLinkDeviceToVehicle(
-            new Types.ObjectId(vehicleId),
+          const detail = await registerVehicleDevice(
+            new Types.ObjectId(params.data.vehicleId),
             new Types.ObjectId(parsed.data.userId),
+            {
+              identifier: parsed.data.identifier,
+              publicKey: parsed.data.publicKey,
+              metadata: parsed.data.metadata,
+            },
+            { deviceClient, audit: createRequestAuditLogger(request) },
           );
-        } catch (error) {
-          if (error instanceof VehicleServiceError && error.code === 'DATABASE_UNAVAILABLE') {
-            return sendDomainError(reply, request, error);
-          }
-          throw error;
-        }
-        if (!allowed) {
-          createRequestAuditLogger(request)({
-            action: 'device.link_authorize',
-            actorUserId: parsed.data.userId,
-            vehicleId,
-            outcome: 'denied',
-            reason: 'insufficient_vehicle_authorization',
+          return reply.code(201).send({
+            deviceId: detail.deviceId,
+            status: 'PENDING',
+            message: 'Device registration accepted',
+            data: detail,
+            requestId: responseRequestId(request),
           });
-          return reply.code(404).send({ message: 'User or vehicle not found' });
+        } catch (error) {
+          return handleDeviceOperationError(
+            reply,
+            request,
+            parsed.data.userId,
+            error,
+            params.data.vehicleId,
+          );
         }
+      },
+    );
 
-        const body = {
-          identifier: parsed.data.deviceIdentifier,
-          publicKey: parsed.data.publicKey,
-          vehicleId,
-          userId: parsed.data.userId,
-        };
-        const payloadBytes = Buffer.from(JSON.stringify(body));
-
-        let deviceResponse;
+    scope.get<{ Params: { vehicleId: string } }>(
+      '/vehicles/:vehicleId/devices',
+      { config: { internalOperation: 'deviceList' } },
+      async (request, reply) => {
+        const params = vehicleParamsSchema.safeParse(request.params);
+        const query = internalVehicleDeviceListQuerySchema.safeParse(request.query);
+        if (!params.success || !query.success) {
+          return sendValidationError(reply, request, 'Invalid device list query');
+        }
+        const actor = await authenticateActor(request, reply, query.data.userId);
+        if (!actor) {
+          return;
+        }
+        const deviceClient = createDeviceServiceClient(
+          request,
+          actor.clientConfig,
+          actor.runtime.deviceServiceUrl,
+        );
         try {
-          deviceResponse = await executeSignedInternalRequest(request, clientConfig, {
-            audience: 'device-service',
-            baseUrl: runtime.deviceServiceUrl,
-            method: 'POST',
-            path: '/internal/devices/register',
-            body: payloadBytes,
+          const page = await listVehicleDevices(
+            new Types.ObjectId(params.data.vehicleId),
+            new Types.ObjectId(query.data.userId),
+            {
+              limit: query.data.limit,
+              cursor: query.data.cursor,
+              status: query.data.status,
+            },
+            {
+              deviceClient,
+              audit: createRequestAuditLogger(request),
+              cursorSecrets: deriveDeviceCursorSecrets(actor.clientConfig.keyring),
+            },
+          );
+          return {
+            devices: page.devices,
+            page: { nextCursor: page.nextCursor },
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          return handleDeviceOperationError(
+            reply,
+            request,
+            query.data.userId,
+            error,
+            params.data.vehicleId,
+          );
+        }
+      },
+    );
+
+    scope.get<{ Params: { vehicleId: string; deviceId: string } }>(
+      '/vehicles/:vehicleId/devices/:deviceId',
+      { config: { internalOperation: 'vehicleDeviceGet' } },
+      async (request, reply) => {
+        const params = vehicleDeviceParamsSchema.safeParse(request.params);
+        const query = internalVehicleGetQuerySchema.safeParse(request.query);
+        if (!params.success || !query.success) {
+          return sendValidationError(reply, request, 'Invalid device request');
+        }
+        const actor = await authenticateActor(request, reply, query.data.userId);
+        if (!actor) {
+          return;
+        }
+        const deviceClient = createDeviceServiceClient(
+          request,
+          actor.clientConfig,
+          actor.runtime.deviceServiceUrl,
+        );
+        try {
+          const detail = await getVehicleScopedDeviceDetail(
+            new Types.ObjectId(params.data.vehicleId),
+            new Types.ObjectId(params.data.deviceId),
+            new Types.ObjectId(query.data.userId),
+            { deviceClient, audit: createRequestAuditLogger(request) },
+          );
+          return { ...detail, requestId: responseRequestId(request) };
+        } catch (error) {
+          return handleDeviceOperationError(
+            reply,
+            request,
+            query.data.userId,
+            error,
+            params.data.vehicleId,
+          );
+        }
+      },
+    );
+
+    scope.get<{ Params: { deviceId: string } }>(
+      '/devices/:deviceId',
+      { config: { internalOperation: 'deviceGet' } },
+      async (request, reply) => {
+        const params = deviceReferenceParamsSchema.safeParse(request.params);
+        const query = internalVehicleGetQuerySchema.safeParse(request.query);
+        if (!params.success || !query.success) {
+          return sendValidationError(reply, request, 'Invalid device request');
+        }
+        const actor = await authenticateActor(request, reply, query.data.userId);
+        if (!actor) {
+          return;
+        }
+        const deviceClient = createDeviceServiceClient(
+          request,
+          actor.clientConfig,
+          actor.runtime.deviceServiceUrl,
+        );
+        try {
+          const detail = await getDirectDeviceDetail(
+            new Types.ObjectId(params.data.deviceId),
+            new Types.ObjectId(query.data.userId),
+            { deviceClient, audit: createRequestAuditLogger(request) },
+          );
+          return { ...detail, requestId: responseRequestId(request) };
+        } catch (error) {
+          return handleDeviceOperationError(reply, request, query.data.userId, error);
+        }
+      },
+    );
+
+    scope.patch<{ Params: { vehicleId: string; deviceId: string } }>(
+      '/vehicles/:vehicleId/devices/:deviceId',
+      { config: { internalOperation: 'deviceMetadataUpdate' } },
+      async (request, reply) => {
+        const params = vehicleDeviceParamsSchema.safeParse(request.params);
+        const parsed = internalVehicleDeviceMetadataUpdateRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid device metadata update');
+        }
+        const actor = await authenticateActor(request, reply, parsed.data.userId);
+        if (!actor) {
+          return;
+        }
+        const { userId, ...metadata } = parsed.data;
+        const deviceClient = createDeviceServiceClient(
+          request,
+          actor.clientConfig,
+          actor.runtime.deviceServiceUrl,
+        );
+        try {
+          const detail = await updateVehicleDeviceMetadata(
+            new Types.ObjectId(params.data.vehicleId),
+            new Types.ObjectId(params.data.deviceId),
+            new Types.ObjectId(userId),
+            metadata,
+            { deviceClient, audit: createRequestAuditLogger(request) },
+          );
+          return {
+            deviceId: detail.deviceId,
+            status: detail.status,
+            message: 'Device metadata updated',
+            data: detail,
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          return handleDeviceOperationError(reply, request, userId, error, params.data.vehicleId);
+        }
+      },
+    );
+
+    scope.post<{ Params: { vehicleId: string; deviceId: string } }>(
+      '/vehicles/:vehicleId/devices/:deviceId/challenge',
+      { config: { internalOperation: 'deviceChallenge' } },
+      async (request, reply) => {
+        const params = vehicleDeviceParamsSchema.safeParse(request.params);
+        const parsed = internalVehicleDeviceChallengeRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid challenge request');
+        }
+        const actor = await authenticateActor(request, reply, parsed.data.userId);
+        if (!actor) {
+          return;
+        }
+        const deviceClient = createDeviceServiceClient(
+          request,
+          actor.clientConfig,
+          actor.runtime.deviceServiceUrl,
+        );
+        try {
+          const challenge = await issueVehicleDeviceChallenge(
+            new Types.ObjectId(params.data.vehicleId),
+            new Types.ObjectId(params.data.deviceId),
+            new Types.ObjectId(parsed.data.userId),
+            { deviceClient, audit: createRequestAuditLogger(request) },
+          );
+          return reply.code(201).send({
+            challengeId: challenge.challengeId,
+            status: 'PENDING',
+            message: 'Device enrollment challenge issued',
+            data: challenge,
+            requestId: responseRequestId(request),
           });
         } catch (error) {
-          if (error instanceof OutboundDeadlineExceededError) {
-            return reply.code(504).send({ message: 'Device service timed out' });
-          }
-          return reply.code(503).send({ message: 'Device service unavailable' });
+          return handleDeviceOperationError(
+            reply,
+            request,
+            parsed.data.userId,
+            error,
+            params.data.vehicleId,
+          );
         }
+      },
+    );
 
-        if (deviceResponse.status === 504) {
-          return reply.code(504).send({ message: 'Device service timed out' });
+    scope.post<{ Params: { vehicleId: string; deviceId: string } }>(
+      '/vehicles/:vehicleId/devices/:deviceId/link',
+      { config: { internalOperation: 'deviceLink' } },
+      async (request, reply) => {
+        const params = vehicleDeviceParamsSchema.safeParse(request.params);
+        const parsed = internalVehicleDeviceLinkCompletionRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid device link request');
         }
-        if (deviceResponse.status < 200 || deviceResponse.status >= 300) {
-          return reply.code(503).send({ message: 'Device service unavailable' });
+        const actor = await authenticateActor(request, reply, parsed.data.userId);
+        if (!actor) {
+          return;
         }
-
-        const deviceResult: unknown = deviceResponse.body;
-        if (
-          typeof deviceResult !== 'object' ||
-          deviceResult === null ||
-          !('deviceId' in deviceResult) ||
-          typeof deviceResult.deviceId !== 'string' ||
-          !Types.ObjectId.isValid(deviceResult.deviceId) ||
-          !('status' in deviceResult) ||
-          deviceResult.status !== 'PENDING'
-        ) {
-          return reply.code(503).send({ message: 'Device service unavailable' });
+        const deviceClient = createDeviceServiceClient(
+          request,
+          actor.clientConfig,
+          actor.runtime.deviceServiceUrl,
+        );
+        try {
+          const detail = await completeVehicleDeviceLink(
+            new Types.ObjectId(params.data.vehicleId),
+            new Types.ObjectId(params.data.deviceId),
+            new Types.ObjectId(parsed.data.userId),
+            {
+              challengeId: parsed.data.challengeId,
+              challenge: parsed.data.challenge,
+              signature: parsed.data.signature,
+            },
+            { deviceClient, audit: createRequestAuditLogger(request) },
+          );
+          return {
+            deviceId: detail.deviceId,
+            status: 'ACTIVE',
+            message: 'Device linked',
+            data: detail,
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          return handleDeviceOperationError(
+            reply,
+            request,
+            parsed.data.userId,
+            error,
+            params.data.vehicleId,
+          );
         }
+      },
+    );
 
-        createRequestAuditLogger(request)({
-          action: 'device.link_authorize',
-          actorUserId: parsed.data.userId,
-          vehicleId,
-          targetId: deviceResult.deviceId,
-          outcome: 'success',
-        });
-
-        return reply.code(201).send({
-          deviceId: deviceResult.deviceId,
-          status: deviceResult.status,
-          message: 'Device registration accepted',
-          data: { deviceId: deviceResult.deviceId, vehicleId, status: deviceResult.status },
-          requestId: responseRequestId(request),
-        });
+    scope.post<{ Params: { vehicleId: string; deviceId: string } }>(
+      '/vehicles/:vehicleId/devices/:deviceId/revoke',
+      { config: { internalOperation: 'deviceRevoke' } },
+      async (request, reply) => {
+        const params = vehicleDeviceParamsSchema.safeParse(request.params);
+        const parsed = internalVehicleDeviceRevokeRequestSchema.safeParse(request.body);
+        if (!params.success || !parsed.success) {
+          return sendValidationError(reply, request, 'Invalid device revocation request');
+        }
+        const actor = await authenticateActor(request, reply, parsed.data.userId);
+        if (!actor) {
+          return;
+        }
+        const deviceClient = createDeviceServiceClient(
+          request,
+          actor.clientConfig,
+          actor.runtime.deviceServiceUrl,
+        );
+        try {
+          const detail = await revokeVehicleDevice(
+            new Types.ObjectId(params.data.vehicleId),
+            new Types.ObjectId(params.data.deviceId),
+            new Types.ObjectId(parsed.data.userId),
+            parsed.data.reason,
+            { deviceClient, audit: createRequestAuditLogger(request) },
+          );
+          return {
+            deviceId: detail.deviceId,
+            status: 'REVOKED',
+            message: 'Device revoked',
+            data: detail,
+            requestId: responseRequestId(request),
+          };
+        } catch (error) {
+          return handleDeviceOperationError(
+            reply,
+            request,
+            parsed.data.userId,
+            error,
+            params.data.vehicleId,
+          );
+        }
       },
     );
   };
@@ -1066,9 +1356,44 @@ export function createApp(dependencies?: VehicleAppDependencies): FastifyInstanc
           route: '/vehicles/:vehicleId/members/leave',
           senders: ['api-gateway'],
         },
+        deviceRegister: {
+          method: 'POST',
+          route: '/vehicles/:vehicleId/devices',
+          senders: ['api-gateway'],
+        },
+        deviceList: {
+          method: 'GET',
+          route: '/vehicles/:vehicleId/devices',
+          senders: ['api-gateway'],
+        },
+        vehicleDeviceGet: {
+          method: 'GET',
+          route: '/vehicles/:vehicleId/devices/:deviceId',
+          senders: ['api-gateway'],
+        },
+        deviceGet: {
+          method: 'GET',
+          route: '/devices/:deviceId',
+          senders: ['api-gateway'],
+        },
+        deviceMetadataUpdate: {
+          method: 'PATCH',
+          route: '/vehicles/:vehicleId/devices/:deviceId',
+          senders: ['api-gateway'],
+        },
+        deviceChallenge: {
+          method: 'POST',
+          route: '/vehicles/:vehicleId/devices/:deviceId/challenge',
+          senders: ['api-gateway'],
+        },
         deviceLink: {
           method: 'POST',
-          route: '/vehicles/:vehicleId/devices/link',
+          route: '/vehicles/:vehicleId/devices/:deviceId/link',
+          senders: ['api-gateway'],
+        },
+        deviceRevoke: {
+          method: 'POST',
+          route: '/vehicles/:vehicleId/devices/:deviceId/revoke',
           senders: ['api-gateway'],
         },
       },

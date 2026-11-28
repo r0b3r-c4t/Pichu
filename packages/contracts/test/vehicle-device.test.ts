@@ -1,11 +1,18 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  DEVICE_LINK_PROTOCOL_VERSION,
+  DEVICE_METADATA_FIELDS,
+  DEVICE_REVOCATION_REASONS,
+  deviceDetailResponseSchema,
+  deviceDetailSchema,
   deviceIdentityResponseSchema,
   deviceIdentifierSchema,
   deviceLinkChallengeSchema,
   deviceLinkCompletionSchema,
-  deviceLinkResponseSchema,
+  deviceMetadataInputSchema,
+  deviceMetadataSchema,
+  deviceMetadataUpdateRequestSchema,
   deviceReferenceParamsSchema,
   deviceRegistrationRequestSchema,
   deviceRegistrationResponseSchema,
@@ -13,6 +20,18 @@ import {
   deviceRevocationResponseSchema,
   deviceRevocationSchema,
   deviceSummarySchema,
+  internalDeviceCollectionQuerySchema,
+  internalDeviceRecordSchema,
+  internalVehicleDeviceMetadataUpdateRequestSchema,
+  publicDeviceChallengeRequestSchema,
+  publicDeviceRegistrationRequestSchema,
+  vehicleDeviceChallengeResponseSchema,
+  vehicleDeviceLinkResponseSchema,
+  vehicleDeviceListQuerySchema,
+  vehicleDeviceListResponseSchema,
+  vehicleDeviceMetadataUpdateResponseSchema,
+  vehicleDeviceParamsSchema,
+  vehicleDeviceRevokeResponseSchema,
   invitationAcceptRequestSchema,
   invitationAcceptResponseSchema,
   internalInvitationCreateRequestSchema,
@@ -75,7 +94,43 @@ import {
 const vehicleId = '507f1f77bcf86cd799439011';
 const userId = '507f1f77bcf86cd799439012';
 const deviceId = '507f1f77bcf86cd799439013';
+const credentialId = '507f1f77bcf86cd799439014';
+const membershipId = '507f1f77bcf86cd799439015';
+const challengeId = '507f1f77bcf86cd799439016';
 const publicKey = '-----BEGIN PUBLIC KEY-----\n' + 'A'.repeat(80) + '\n-----END PUBLIC KEY-----';
+
+const sampleDeviceDetail = {
+  deviceId,
+  vehicleId,
+  identifier: 'esp32-mazda-3',
+  status: 'PENDING' as const,
+  operational: false,
+  credential: {
+    credentialId,
+    keyId: `dk_${'A'.repeat(22)}`,
+    algorithm: 'Ed25519' as const,
+    fingerprint: `sha256:${'a'.repeat(64)}`,
+    status: 'ACTIVE' as const,
+    usable: true,
+    activatedAt: '2026-11-26T12:00:00.000Z',
+    expiresAt: null,
+    revokedAt: null,
+  },
+  connectivity: { lastSeenAt: null },
+  metadata: {
+    name: null,
+    manufacturer: null,
+    hardwareModel: null,
+    hardwareRevision: null,
+    firmwareVersion: null,
+    serialNumber: null,
+  },
+  createdAt: '2026-11-26T12:00:00.000Z',
+  updatedAt: '2026-11-26T12:00:00.000Z',
+  linkedAt: null,
+  revokedAt: null,
+  revocationReason: null,
+};
 
 const summary = {
   id: vehicleId,
@@ -174,7 +229,7 @@ test('enriched vehicle responses expose ten intrinsic fields plus a contextual r
       deviceId,
       status: 'PENDING',
       message: 'Device registration accepted',
-      data: { deviceId, vehicleId, status: 'PENDING' },
+      data: sampleDeviceDetail,
       requestId: 'request-42',
     }).success,
     true,
@@ -644,18 +699,25 @@ test('device identity is composed consistently around deviceId', () => {
 });
 
 test('device registration and revocation DTOs separate identity from textual identifiers', () => {
+  const internalRecord = {
+    ...sampleDeviceDetail,
+    requestedByUserId: userId,
+    requestedByMembershipId: membershipId,
+    revokedByUserId: null,
+  };
   assert.equal(
-    deviceRegistrationRequestSchema.safeParse({
-      identifier: 'esp32-01',
+    publicDeviceRegistrationRequestSchema.safeParse({
+      identifier: ' esp32-01 ',
       publicKey,
-      vehicleId,
-      userId,
     }).success,
     true,
   );
   assert.equal(
-    deviceRegistrationRequestSchema.safeParse({ identifier: 'esp32-01', vehicleId, userId })
-      .success,
+    publicDeviceRegistrationRequestSchema.safeParse({
+      identifier: 'esp32-01',
+      publicKey,
+      userId,
+    }).success,
     false,
   );
   assert.equal(
@@ -664,49 +726,319 @@ test('device registration and revocation DTOs separate identity from textual ide
       publicKey,
       vehicleId,
       userId,
+      membershipId,
+    }).success,
+    true,
+  );
+  assert.equal(
+    deviceRegistrationRequestSchema.safeParse({
+      identifier: 'esp32-01',
+      publicKey,
+      vehicleId,
+      userId,
+    }).success,
+    false,
+  );
+  assert.equal(
+    deviceRegistrationRequestSchema.safeParse({
+      identifier: 'esp32-01',
+      publicKey,
+      vehicleId,
+      userId,
+      membershipId,
       extra: true,
     }).success,
     false,
   );
+  assert.equal(deviceIdentifierSchema.safeParse('esp32\t01').success, false);
+  assert.equal(deviceIdentifierSchema.safeParse('   ').success, false);
   assert.equal(
-    deviceRegistrationResponseSchema.safeParse({ deviceId, status: 'PENDING' }).success,
+    deviceRegistrationResponseSchema.safeParse({
+      deviceId,
+      status: 'PENDING',
+      data: internalRecord,
+    }).success,
     true,
   );
+  for (const reason of DEVICE_REVOCATION_REASONS) {
+    assert.equal(deviceRevocationRequestSchema.safeParse({ reason }).success, true, reason);
+  }
   assert.equal(
     deviceRevocationRequestSchema.safeParse({ reason: 'device-replaced' }).success,
-    true,
+    false,
   );
   assert.equal(deviceRevocationRequestSchema.safeParse({ reason: '' }).success, false);
+  assert.equal(deviceRevocationRequestSchema.safeParse({}).success, false);
   assert.equal(deviceRevocationResponseSchema.safeParse({ revoked: true }).success, true);
   assert.equal(
     deviceRevocationSchema.safeParse({
       deviceId,
       revokedAt: '2026-11-03T12:00:00.000Z',
+      reason: 'SECURITY_COMPROMISE',
     }).success,
     true,
   );
 });
 
-test('challenge and completion remain provisional and strictly shaped', () => {
+test('device metadata, detail, pagination and canonical enrollment contracts enforce strict bounds', () => {
+  assert.deepEqual(DEVICE_METADATA_FIELDS, [
+    'name',
+    'manufacturer',
+    'hardwareModel',
+    'hardwareRevision',
+    'firmwareVersion',
+    'serialNumber',
+  ]);
+  assert.deepEqual(
+    deviceMetadataInputSchema.parse({
+      name: '  Sunroof Node  ',
+      manufacturer: ' Espressif ',
+      hardwareModel: ' ESP32-S3-WROOM-1 ',
+      hardwareRevision: ' rev_1.2+a/b - 01 ',
+      firmwareVersion: ' 1.4.0-rc.1+build7 ',
+      serialNumber: ' SN:2026_001-A.9 ',
+    }),
+    {
+      name: 'Sunroof Node',
+      manufacturer: 'Espressif',
+      hardwareModel: 'ESP32-S3-WROOM-1',
+      hardwareRevision: 'rev_1.2+a/b - 01',
+      firmwareVersion: '1.4.0-rc.1+build7',
+      serialNumber: 'SN:2026_001-A.9',
+    },
+  );
+  const metadataLimits: Array<[string, number, string]> = [
+    ['name', 80, 'a'],
+    ['manufacturer', 64, 'a'],
+    ['hardwareModel', 64, 'a'],
+    ['hardwareRevision', 32, 'a'],
+    ['firmwareVersion', 64, 'a'],
+    ['serialNumber', 64, 'a'],
+  ];
+  for (const [field, max, ch] of metadataLimits) {
+    assert.equal(
+      deviceMetadataInputSchema.safeParse({ [field]: ch.repeat(max) }).success,
+      true,
+      `${field} max ${max}`,
+    );
+    assert.equal(
+      deviceMetadataInputSchema.safeParse({ [field]: ch.repeat(max + 1) }).success,
+      false,
+      `${field} over max ${max + 1}`,
+    );
+    assert.equal(
+      deviceMetadataInputSchema.safeParse({ [field]: null }).success,
+      true,
+      `${field} nullable`,
+    );
+    assert.equal(
+      deviceMetadataInputSchema.safeParse({ [field]: '   ' }).success,
+      false,
+      `${field} rejects whitespace only`,
+    );
+    assert.equal(
+      deviceMetadataInputSchema.safeParse({ [field]: `\t${ch}` }).success,
+      false,
+      `${field} rejects control chars before trim`,
+    );
+    assert.equal(
+      deviceMetadataInputSchema.safeParse({ [field]: `${ch}\n` }).success,
+      false,
+      `${field} rejects trailing newline before trim`,
+    );
+  }
   assert.equal(
-    deviceLinkChallengeSchema.safeParse({
-      challengeId: deviceId,
-      challenge: 'A'.repeat(32),
-      expiresAt: '2026-11-03T12:00:00.000Z',
-    }).success,
-    true,
+    deviceMetadataInputSchema.safeParse({ firmwareVersion: '1.0.0 beta' }).success,
+    false,
+  );
+  assert.equal(deviceMetadataInputSchema.safeParse({ serialNumber: 'SN/001' }).success, false);
+  assert.equal(deviceMetadataInputSchema.safeParse({ hardwareRevision: 'rev:1' }).success, false);
+  assert.equal(deviceMetadataInputSchema.safeParse({ trusted: true }).success, false);
+
+  // PATCH metadata: non-empty, null clears, omitted preserves, userId does not count as field
+  assert.equal(deviceMetadataUpdateRequestSchema.safeParse({}).success, false);
+  assert.deepEqual(deviceMetadataUpdateRequestSchema.parse({ serialNumber: null }), {
+    serialNumber: null,
+  });
+  assert.equal(
+    internalVehicleDeviceMetadataUpdateRequestSchema.safeParse({ userId }).success,
+    false,
   );
   assert.equal(
-    deviceLinkCompletionSchema.safeParse({ challengeId: deviceId, proof: 'signed-proof' }).success,
+    internalVehicleDeviceMetadataUpdateRequestSchema.safeParse({ userId, name: 'Cabin' }).success,
     true,
   );
+  assert.equal(deviceMetadataSchema.safeParse(sampleDeviceDetail.metadata).success, true);
+
+  // Detail schema separates status, credential, operational, connectivity, metadata and strips secrets
+  assert.equal(deviceDetailSchema.safeParse(sampleDeviceDetail).success, true);
   assert.equal(
-    deviceLinkCompletionSchema.safeParse({
-      challengeId: deviceId,
-      proof: 'signed-proof',
-      algorithm: 'Ed25519',
+    deviceDetailResponseSchema.safeParse({ ...sampleDeviceDetail, requestId: 'req-1' }).success,
+    true,
+  );
+  for (const forbidden of [
+    { publicKey },
+    { challengeHash: 'a'.repeat(64) },
+    { requestedByUserId: userId },
+    { requestedByMembershipId: membershipId },
+    { linkedByUserId: userId },
+  ]) {
+    assert.equal(
+      deviceDetailSchema.safeParse({ ...sampleDeviceDetail, ...forbidden }).success,
+      false,
+    );
+  }
+  assert.equal(
+    deviceDetailSchema.safeParse({
+      ...sampleDeviceDetail,
+      credential: { ...sampleDeviceDetail.credential, publicKey },
     }).success,
     false,
   );
-  assert.equal(deviceLinkResponseSchema.safeParse({ linked: true }).success, true);
+  assert.equal(
+    internalDeviceRecordSchema.safeParse({
+      ...sampleDeviceDetail,
+      requestedByUserId: userId,
+      requestedByMembershipId: membershipId,
+      revokedByUserId: null,
+    }).success,
+    true,
+  );
+
+  // Canonical enrollment challenge and completion contracts
+  const canonicalChallenge = `${'A'.repeat(42)}A`;
+  const canonicalSignature = `${'A'.repeat(85)}A`;
+  const challengePayload = {
+    protocol: DEVICE_LINK_PROTOCOL_VERSION,
+    challengeId,
+    deviceId,
+    vehicleId,
+    credentialId,
+    requestedByUserId: userId,
+    challenge: canonicalChallenge,
+    expiresAt: '2026-11-26T12:05:00.000Z',
+  };
+  assert.equal(deviceLinkChallengeSchema.safeParse(challengePayload).success, true);
+  assert.equal(
+    deviceLinkChallengeSchema.safeParse({ ...challengePayload, challenge: `${'A'.repeat(42)}B` })
+      .success,
+    false,
+  );
+  assert.equal(publicDeviceChallengeRequestSchema.safeParse({}).success, true);
+  assert.equal(publicDeviceChallengeRequestSchema.safeParse({ extra: 1 }).success, false);
+  assert.equal(
+    deviceLinkCompletionSchema.safeParse({
+      challengeId,
+      challenge: canonicalChallenge,
+      signature: canonicalSignature,
+    }).success,
+    true,
+  );
+  // Non-zero tail bits in 64-byte base64url signature must be rejected
+  assert.equal(
+    deviceLinkCompletionSchema.safeParse({
+      challengeId,
+      challenge: canonicalChallenge,
+      signature: `${'A'.repeat(85)}B`,
+    }).success,
+    false,
+  );
+  assert.equal(
+    deviceLinkCompletionSchema.safeParse({
+      challengeId,
+      challenge: canonicalChallenge,
+      signature: canonicalSignature,
+      message: 'forged',
+    }).success,
+    false,
+  );
+
+  // Response envelopes and cursor pagination queries
+  assert.equal(
+    vehicleDeviceChallengeResponseSchema.safeParse({
+      challengeId,
+      status: 'PENDING',
+      message: 'Challenge issued',
+      data: challengePayload,
+      requestId: 'req-1',
+    }).success,
+    true,
+  );
+  assert.equal(
+    vehicleDeviceLinkResponseSchema.safeParse({
+      deviceId,
+      status: 'ACTIVE',
+      message: 'Device linked',
+      data: {
+        ...sampleDeviceDetail,
+        status: 'ACTIVE',
+        operational: true,
+        linkedAt: '2026-11-26T12:01:00.000Z',
+      },
+      requestId: 'req-1',
+    }).success,
+    true,
+  );
+  assert.equal(
+    vehicleDeviceMetadataUpdateResponseSchema.safeParse({
+      deviceId,
+      status: 'PENDING',
+      message: 'Device metadata updated',
+      data: sampleDeviceDetail,
+      requestId: 'req-1',
+    }).success,
+    true,
+  );
+  assert.equal(
+    vehicleDeviceRevokeResponseSchema.safeParse({
+      deviceId,
+      status: 'REVOKED',
+      message: 'Device revoked',
+      data: {
+        ...sampleDeviceDetail,
+        status: 'REVOKED',
+        credential: {
+          ...sampleDeviceDetail.credential,
+          status: 'REVOKED',
+          usable: false,
+          revokedAt: '2026-11-26T12:02:00.000Z',
+        },
+        revokedAt: '2026-11-26T12:02:00.000Z',
+        revocationReason: 'ADMINISTRATIVE',
+      },
+      requestId: 'req-1',
+    }).success,
+    true,
+  );
+  assert.equal(vehicleDeviceParamsSchema.safeParse({ vehicleId, deviceId }).success, true);
+  assert.deepEqual(vehicleDeviceListQuerySchema.parse({}), { limit: 20 });
+  assert.equal(
+    vehicleDeviceListQuerySchema.safeParse({ limit: 100, status: 'ACTIVE' }).success,
+    true,
+  );
+  assert.equal(vehicleDeviceListQuerySchema.safeParse({ limit: 101 }).success, false);
+  assert.equal(vehicleDeviceListQuerySchema.safeParse({ userId }).success, false);
+  assert.equal(
+    vehicleDeviceListResponseSchema.safeParse({
+      devices: [sampleDeviceDetail],
+      page: { nextCursor: null },
+      requestId: 'req-1',
+    }).success,
+    true,
+  );
+  assert.equal(
+    internalDeviceCollectionQuerySchema.safeParse({
+      limit: 50,
+      afterCreatedAt: '2026-11-26T12:00:00.000Z',
+    }).success,
+    false,
+  );
+  assert.equal(
+    internalDeviceCollectionQuerySchema.safeParse({
+      limit: 50,
+      afterCreatedAt: '2026-11-26T12:00:00.000Z',
+      afterId: deviceId,
+    }).success,
+    true,
+  );
 });

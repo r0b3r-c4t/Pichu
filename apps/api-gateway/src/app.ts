@@ -13,7 +13,13 @@ import {
 } from './config/env.js';
 import {
   bearerAuthorizationSchema,
-  deviceLinkBodySchema,
+  deviceBodyJsonSchema,
+  deviceChallengeBodySchema,
+  deviceIdParamsInputSchema,
+  deviceLinkCompletionBodySchema,
+  deviceMetadataUpdateBodySchema,
+  deviceRegistrationBodySchema,
+  deviceRevocationBodySchema,
   invitationAcceptBodySchema,
   invitationCreateBodySchema,
   invitationIdParamsInputSchema,
@@ -27,6 +33,8 @@ import {
   memberReactivateBodySchema,
   memberTransitionBodySchema,
   receivedInvitationListQueryInputSchema,
+  vehicleDeviceListQueryInputSchema,
+  vehicleDeviceParamsInputSchema,
   vehicleInvitationListQueryInputSchema,
   passwordResetConfirmBodySchema,
   passwordResetRequestBodySchema,
@@ -61,14 +69,17 @@ import {
   vehicleArchiveResponseSchema,
   vehicleCreateResponseSchema,
   vehicleDetailResponseSchema,
+  vehicleDeviceChallengeResponseSchema,
+  vehicleDeviceLinkResponseSchema,
+  vehicleDeviceListResponseSchema,
+  vehicleDeviceMetadataUpdateResponseSchema,
   vehicleDeviceRegistrationResponseSchema,
+  vehicleDeviceRevokeResponseSchema,
   vehicleListResponseSchema,
   vehicleUpdateResponseSchema,
   authenticatedUserResponseSchema,
   acceptedResponseSchema,
-  deviceSummarySchema,
-  deviceReferenceParamsSchema,
-  requestIdSchema,
+  deviceDetailResponseSchema,
   gatewayErrorResponseSchema,
   healthResponseSchema,
 } from '@pichu/contracts';
@@ -1710,29 +1721,87 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
       },
     );
 
+    const deviceDetailExample = {
+      deviceId: '507f1f77bcf86cd799439015',
+      vehicleId: vehicleResponseExample.id,
+      identifier: 'esp32-sunroof-01',
+      status: 'PENDING' as const,
+      operational: false,
+      credential: {
+        credentialId: '507f1f77bcf86cd799439017',
+        keyId: 'dk_AAAAAAAAAAAAAAAAAAAAAA',
+        algorithm: 'Ed25519' as const,
+        fingerprint: `sha256:${'a'.repeat(64)}`,
+        status: 'ACTIVE' as const,
+        usable: true,
+        activatedAt: '2026-11-26T12:00:00.000Z',
+        expiresAt: null,
+        revokedAt: null,
+      },
+      connectivity: { lastSeenAt: null },
+      metadata: {
+        name: 'Sunroof Node',
+        manufacturer: 'Espressif',
+        hardwareModel: 'ESP32-S3',
+        hardwareRevision: 'rev-1.0',
+        firmwareVersion: '1.0.0',
+        serialNumber: 'SN-001',
+      },
+      createdAt: '2026-11-26T12:00:00.000Z',
+      updatedAt: '2026-11-26T12:00:00.000Z',
+      linkedAt: null,
+      revokedAt: null,
+      revocationReason: null,
+    };
+    const deviceChallengeExample = {
+      protocol: 'pichu-device-link-v1' as const,
+      challengeId: '507f1f77bcf86cd799439018',
+      deviceId: deviceDetailExample.deviceId,
+      vehicleId: vehicleResponseExample.id,
+      credentialId: deviceDetailExample.credential.credentialId,
+      requestedByUserId: vehicleResponseExample.ownerUserId,
+      challenge: 'ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8',
+      expiresAt: '2026-11-26T12:05:00.000Z',
+    };
+    const deviceAuthorityErrorResponse = {
+      ...vehicleErrorResponseWithExample('FORBIDDEN', 'Insufficient permissions for this device'),
+      description:
+        'Email not verified (EMAIL_NOT_VERIFIED) or caller can legitimately see the resource ' +
+        'but lacks the required authority (FORBIDDEN)',
+    };
+    const deviceConflictErrorResponse = {
+      ...vehicleErrorResponseWithExample(
+        'CONFLICT',
+        'Device cannot complete the requested transition',
+      ),
+    };
+    type VehicleDeviceRoute = { Params: { vehicleId: string; deviceId: string } };
+
     app.post<{ Params: { vehicleId: string } }>(
-      '/api/vehicles/:vehicleId/devices/link',
+      '/api/vehicles/:vehicleId/devices',
       {
         schema: {
-          tags: ['Vehicles'],
-          summary: 'Link device to vehicle (verified email required)',
+          tags: ['Devices'],
+          summary: 'Register a PENDING device for a vehicle (verified email required)',
+          description:
+            'Requires canonical OWNER or an active MEMBER authorized via vehicle:manage or ' +
+            'device:link. Creates a PENDING device and ACTIVE Ed25519 credential atomically; ' +
+            'registration does not prove possession or activate the link.',
           security: [{ bearerAuth: [] }],
           params: jsonSchema(vehicleIdParamsInputSchema),
-          body: jsonSchema(deviceLinkBodySchema),
+          body: deviceBodyJsonSchema(jsonSchema(deviceRegistrationBodySchema)),
           response: {
             ...vehicleCommonErrors,
+            403: deviceAuthorityErrorResponse,
             404: vehicleNotFoundErrorResponse,
+            409: deviceConflictErrorResponse,
             201: {
               ...jsonSchema(vehicleDeviceRegistrationResponseSchema),
               example: {
-                deviceId: '507f1f77bcf86cd799439015',
+                deviceId: deviceDetailExample.deviceId,
                 status: 'PENDING',
                 message: 'Device registration accepted',
-                data: {
-                  deviceId: '507f1f77bcf86cd799439015',
-                  vehicleId: vehicleResponseExample.id,
-                  status: 'PENDING',
-                },
+                data: deviceDetailExample,
                 requestId: 'request-1',
               },
             },
@@ -1741,37 +1810,130 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
       },
       async (request, reply) => {
         const params = vehicleIdParamsInputSchema.safeParse(request.params);
-        const body = deviceLinkBodySchema.safeParse(request.body);
-        if (!params.success || !body.success)
+        const body = deviceRegistrationBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
           return sendProxyResult(reply, getRequestId(request), 400, {
-            message: 'Invalid linking data',
+            message: 'Invalid device registration data',
           });
         return proxyVehicle(
           request,
           reply,
           'POST',
-          `/vehicles/${params.data.vehicleId}/devices/link`,
+          `/vehicles/${params.data.vehicleId}/devices`,
           body.data,
         );
       },
     );
+
+    app.get<{ Params: { vehicleId: string } }>(
+      '/api/vehicles/:vehicleId/devices',
+      {
+        schema: {
+          tags: ['Devices'],
+          summary: 'List authorized devices for a vehicle (verified email required)',
+          description:
+            'Keyset pagination (createdAt ASC, _id ASC) bound to actor, vehicle and status ' +
+            'filter. Re-authorizes every page and filters visibility before applying page limits.',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(vehicleIdParamsInputSchema),
+          querystring: jsonSchema(vehicleDeviceListQueryInputSchema),
+          response: {
+            ...vehicleCommonErrors,
+            403: deviceAuthorityErrorResponse,
+            404: vehicleNotFoundErrorResponse,
+            200: {
+              ...jsonSchema(vehicleDeviceListResponseSchema),
+              example: {
+                devices: [{ ...deviceDetailExample, status: 'ACTIVE', operational: true }],
+                page: { nextCursor: null },
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = vehicleIdParamsInputSchema.safeParse(request.params);
+        const query = vehicleDeviceListQueryInputSchema.safeParse(request.query);
+        if (!params.success || !query.success)
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid device list query',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'GET',
+          `/vehicles/${params.data.vehicleId}/devices?${actorListQuery(request, query.data)}`,
+        );
+      },
+    );
+
+    app.get<VehicleDeviceRoute>(
+      '/api/vehicles/:vehicleId/devices/:deviceId',
+      {
+        schema: {
+          tags: ['Devices'],
+          summary: 'Get vehicle-scoped device detail (verified email required)',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(vehicleDeviceParamsInputSchema),
+          response: {
+            ...vehicleCommonErrors,
+            404: vehicleNotFoundErrorResponse,
+            200: {
+              ...jsonSchema(deviceDetailResponseSchema),
+              example: {
+                ...deviceDetailExample,
+                status: 'ACTIVE',
+                operational: true,
+                linkedAt: '2026-11-26T12:02:00.000Z',
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = vehicleDeviceParamsInputSchema.safeParse(request.params);
+        if (!params.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid device request',
+          });
+        const userId = extractUserId(request.headers.authorization, env.JWT_SECRET, env);
+        return proxyVehicle(
+          request,
+          reply,
+          'GET',
+          `/vehicles/${params.data.vehicleId}/devices/${params.data.deviceId}?userId=${userId ?? ''}`,
+        );
+      },
+    );
+
     app.get<{ Params: { deviceId: string } }>(
       '/api/devices/:deviceId',
       {
         schema: {
           tags: ['Devices'],
-          summary: 'Get an active device linked by the authenticated user',
+          summary: 'Get device detail authorized through Vehicle (verified email required)',
           security: [{ bearerAuth: [] }],
-          params: jsonSchema(deviceReferenceParamsSchema),
+          params: jsonSchema(deviceIdParamsInputSchema),
           response: {
             ...vehicleCommonErrors,
             404: vehicleNotFoundErrorResponse,
-            200: jsonSchema(deviceSummarySchema.extend({ requestId: requestIdSchema })),
+            200: {
+              ...jsonSchema(deviceDetailResponseSchema),
+              example: {
+                ...deviceDetailExample,
+                status: 'ACTIVE',
+                operational: true,
+                linkedAt: '2026-11-26T12:02:00.000Z',
+                requestId: 'request-1',
+              },
+            },
           },
         },
       },
       async (request, reply) => {
-        const params = deviceReferenceParamsSchema.safeParse(request.params);
+        const params = deviceIdParamsInputSchema.safeParse(request.params);
         if (!params.success || !zodEmptyQuery(request.query))
           return sendProxyResult(reply, getRequestId(request), 400, {
             message: 'Invalid device request',
@@ -1782,8 +1944,219 @@ export function createApp(options: GatewayAppOptions = {}): FastifyInstance {
           reply,
           'GET',
           `/devices/${params.data.deviceId}?userId=${userId ?? ''}`,
-          {},
-          env.DEVICE_SERVICE_URL,
+        );
+      },
+    );
+
+    app.patch<VehicleDeviceRoute>(
+      '/api/vehicles/:vehicleId/devices/:deviceId',
+      {
+        schema: {
+          tags: ['Devices'],
+          summary: 'Partially update descriptive device metadata (verified email required)',
+          description:
+            'Restricted to canonical OWNER or active MEMBER with base vehicle:manage. ' +
+            'null clears a field; omitted preserves its value; empty PATCH and REVOKED devices ' +
+            'are rejected.',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(vehicleDeviceParamsInputSchema),
+          body: deviceBodyJsonSchema(jsonSchema(deviceMetadataUpdateBodySchema), {
+            requireAtLeastOneProperty: true,
+          }),
+          response: {
+            ...vehicleCommonErrors,
+            403: deviceAuthorityErrorResponse,
+            404: vehicleNotFoundErrorResponse,
+            409: deviceConflictErrorResponse,
+            200: {
+              ...jsonSchema(vehicleDeviceMetadataUpdateResponseSchema),
+              example: {
+                deviceId: deviceDetailExample.deviceId,
+                status: 'ACTIVE',
+                message: 'Device metadata updated',
+                data: {
+                  ...deviceDetailExample,
+                  status: 'ACTIVE',
+                  operational: true,
+                  metadata: {
+                    ...deviceDetailExample.metadata,
+                    firmwareVersion: '1.1.0',
+                    serialNumber: null,
+                  },
+                },
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = vehicleDeviceParamsInputSchema.safeParse(request.params);
+        const body = deviceMetadataUpdateBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid device metadata update',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'PATCH',
+          `/vehicles/${params.data.vehicleId}/devices/${params.data.deviceId}`,
+          body.data,
+        );
+      },
+    );
+
+    app.post<VehicleDeviceRoute>(
+      '/api/vehicles/:vehicleId/devices/:deviceId/challenge',
+      {
+        schema: {
+          tags: ['Devices'],
+          summary:
+            'Issue a single-use cryptographic enrollment challenge (verified email required)',
+          description:
+            'Restricted to the original requester under their original active membership while ' +
+            'holding vehicle:manage or device:link. Invalidates prior unused challenges.',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(vehicleDeviceParamsInputSchema),
+          response: {
+            ...vehicleCommonErrors,
+            403: deviceAuthorityErrorResponse,
+            404: vehicleNotFoundErrorResponse,
+            409: deviceConflictErrorResponse,
+            201: {
+              ...jsonSchema(vehicleDeviceChallengeResponseSchema),
+              example: {
+                challengeId: deviceChallengeExample.challengeId,
+                status: 'PENDING',
+                message: 'Device enrollment challenge issued',
+                data: deviceChallengeExample,
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = vehicleDeviceParamsInputSchema.safeParse(request.params);
+        const body = deviceChallengeBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid device challenge request',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'POST',
+          `/vehicles/${params.data.vehicleId}/devices/${params.data.deviceId}/challenge`,
+          body.data ?? {},
+        );
+      },
+    );
+
+    app.post<VehicleDeviceRoute>(
+      '/api/vehicles/:vehicleId/devices/:deviceId/link',
+      {
+        schema: {
+          tags: ['Devices'],
+          summary:
+            'Complete device linking via Ed25519 proof of possession (verified email required)',
+          description:
+            'Verifies the Ed25519 signature over the canonical 7-line UTF-8 pichu-device-link-v1 ' +
+            'message reconstructed from authoritative challenge context.',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(vehicleDeviceParamsInputSchema),
+          body: jsonSchema(deviceLinkCompletionBodySchema),
+          response: {
+            ...vehicleCommonErrors,
+            403: deviceAuthorityErrorResponse,
+            404: vehicleNotFoundErrorResponse,
+            409: deviceConflictErrorResponse,
+            200: {
+              ...jsonSchema(vehicleDeviceLinkResponseSchema),
+              example: {
+                deviceId: deviceDetailExample.deviceId,
+                status: 'ACTIVE',
+                message: 'Device linked',
+                data: {
+                  ...deviceDetailExample,
+                  status: 'ACTIVE',
+                  operational: true,
+                  linkedAt: '2026-11-26T12:02:00.000Z',
+                },
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = vehicleDeviceParamsInputSchema.safeParse(request.params);
+        const body = deviceLinkCompletionBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid device link request',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'POST',
+          `/vehicles/${params.data.vehicleId}/devices/${params.data.deviceId}/link`,
+          body.data,
+        );
+      },
+    );
+
+    app.post<VehicleDeviceRoute>(
+      '/api/vehicles/:vehicleId/devices/:deviceId/revoke',
+      {
+        schema: {
+          tags: ['Devices'],
+          summary: 'Irreversibly revoke a vehicle device (verified email required)',
+          description:
+            'Canonical OWNER exclusively for administrative revocation of PENDING or ACTIVE ' +
+            'devices. The original requester under their original active membership may cancel ' +
+            'their own PENDING device with REGISTRATION_CANCELLED.',
+          security: [{ bearerAuth: [] }],
+          params: jsonSchema(vehicleDeviceParamsInputSchema),
+          body: jsonSchema(deviceRevocationBodySchema),
+          response: {
+            ...vehicleCommonErrors,
+            403: deviceAuthorityErrorResponse,
+            404: vehicleNotFoundErrorResponse,
+            409: deviceConflictErrorResponse,
+            200: {
+              ...jsonSchema(vehicleDeviceRevokeResponseSchema),
+              example: {
+                deviceId: deviceDetailExample.deviceId,
+                status: 'REVOKED',
+                message: 'Device revoked',
+                data: {
+                  ...deviceDetailExample,
+                  status: 'REVOKED',
+                  operational: false,
+                  revokedAt: '2026-11-26T12:10:00.000Z',
+                  revocationReason: 'ADMINISTRATIVE',
+                },
+                requestId: 'request-1',
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const params = vehicleDeviceParamsInputSchema.safeParse(request.params);
+        const body = deviceRevocationBodySchema.safeParse(request.body);
+        if (!params.success || !body.success || !zodEmptyQuery(request.query))
+          return sendProxyResult(reply, getRequestId(request), 400, {
+            message: 'Invalid device revocation request',
+          });
+        return proxyVehicle(
+          request,
+          reply,
+          'POST',
+          `/vehicles/${params.data.vehicleId}/devices/${params.data.deviceId}/revoke`,
+          body.data,
         );
       },
     );

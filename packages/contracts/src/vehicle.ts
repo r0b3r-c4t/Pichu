@@ -5,6 +5,7 @@ import {
   paginationQuerySchema,
   requestIdSchema,
 } from './common.js';
+import { deviceDetailSchema, deviceLinkChallengeSchema } from './device.js';
 
 function containsControlCharacter(value: string): boolean {
   return [...value].some((character) => {
@@ -496,13 +497,51 @@ export const vehicleDeviceRegistrationResponseSchema = z.strictObject({
   deviceId: objectIdSchema,
   status: z.literal('PENDING'),
   message: z.string(),
-  data: z.strictObject({
-    deviceId: objectIdSchema,
-    vehicleId: objectIdSchema,
-    status: z.literal('PENDING'),
-  }),
+  data: deviceDetailSchema,
   requestId: requestIdSchema,
 });
 export type VehicleDeviceRegistrationResponse = z.infer<
   typeof vehicleDeviceRegistrationResponseSchema
 >;
+
+/** Vehicle's public response after issuing a single-use enrollment challenge. */
+export const vehicleDeviceChallengeResponseSchema = z.strictObject({
+  challengeId: objectIdSchema,
+  status: z.literal('PENDING'),
+  message: z.string(),
+  data: deviceLinkChallengeSchema,
+  requestId: requestIdSchema,
+});
+export type VehicleDeviceChallengeResponse = z.infer<typeof vehicleDeviceChallengeResponseSchema>;
+
+/** Vehicle's public response after proof-of-possession completes device linking. */
+export const vehicleDeviceLinkResponseSchema = z.strictObject({
+  deviceId: objectIdSchema,
+  status: z.literal('ACTIVE'),
+  message: z.string(),
+  data: deviceDetailSchema,
+  requestId: requestIdSchema,
+});
+export type VehicleDeviceLinkResponse = z.infer<typeof vehicleDeviceLinkResponseSchema>;
+
+/** Vehicle's public response after updating descriptive device metadata. */
+export const vehicleDeviceMetadataUpdateResponseSchema = z.strictObject({
+  deviceId: objectIdSchema,
+  status: z.enum(['PENDING', 'ACTIVE']),
+  message: z.string(),
+  data: deviceDetailSchema,
+  requestId: requestIdSchema,
+});
+export type VehicleDeviceMetadataUpdateResponse = z.infer<
+  typeof vehicleDeviceMetadataUpdateResponseSchema
+>;
+
+/** Vehicle's public response after irreversible device revocation (or idempotent repeat). */
+export const vehicleDeviceRevokeResponseSchema = z.strictObject({
+  deviceId: objectIdSchema,
+  status: z.literal('REVOKED'),
+  message: z.string(),
+  data: deviceDetailSchema,
+  requestId: requestIdSchema,
+});
+export type VehicleDeviceRevokeResponse = z.infer<typeof vehicleDeviceRevokeResponseSchema>;

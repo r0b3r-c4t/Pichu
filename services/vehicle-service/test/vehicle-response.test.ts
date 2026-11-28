@@ -194,7 +194,19 @@ test('Vehicle Swagger exposes the public result schemas and examples', async (co
   assert.ok(create?.example);
   assert.ok(document.paths['/health/ready'].get.responses['200']);
   assert.ok(document.paths['/vehicles/{vehicleId}/invitations'].post.responses['201']);
-  assert.ok(document.paths['/vehicles/{vehicleId}/devices/link'].post.responses['201']);
+  assert.equal(document.paths['/vehicles/{vehicleId}/devices/link'], undefined);
+  assert.ok(document.paths['/vehicles/{vehicleId}/devices'].post.responses['201']);
+  assert.ok(document.paths['/vehicles/{vehicleId}/devices'].get.responses['200']);
+  assert.ok(document.paths['/vehicles/{vehicleId}/devices/{deviceId}'].get.responses['200']);
+  assert.ok(document.paths['/vehicles/{vehicleId}/devices/{deviceId}'].patch.responses['200']);
+  assert.ok(document.paths['/devices/{deviceId}'].get.responses['200']);
+  assert.ok(
+    document.paths['/vehicles/{vehicleId}/devices/{deviceId}/challenge'].post.responses['201'],
+  );
+  assert.ok(document.paths['/vehicles/{vehicleId}/devices/{deviceId}/link'].post.responses['200']);
+  assert.ok(
+    document.paths['/vehicles/{vehicleId}/devices/{deviceId}/revoke'].post.responses['200'],
+  );
 
   const list = document.paths['/vehicles'].get.responses['200'].content?.['application/json'];
   assert.ok(list?.schema.properties?.page);

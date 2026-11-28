@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHmac } from 'node:crypto';
 import { createApp } from '../src/app.js';
+import { gatewayEnvSchema, type GatewayEnv } from '../src/config/env.js';
 import { testInternalAuthEnv } from './test-env.js';
 
 const userId = '507f1f77bcf86cd799439011';
@@ -24,11 +25,11 @@ function token(): string {
   return `${header}.${payload}.${signature}`;
 }
 
-function environment() {
-  return {
+function environment(): GatewayEnv {
+  return gatewayEnvSchema.parse({
     HOST: '127.0.0.1',
     PORT: 3000,
-    NODE_ENV: 'test' as const,
+    NODE_ENV: 'test',
     ...testInternalAuthEnv,
     JWT_SECRET: secret,
     JWT_ISSUER: 'issuer',
@@ -37,7 +38,7 @@ function environment() {
     DEVICE_SERVICE_URL: 'http://device.test',
     IDENTITY_SERVICE_URL: 'http://identity.test',
     PROXY_TIMEOUT_MS: 100,
-  };
+  });
 }
 
 test('unverified accounts are blocked across Vehicle, invitation and Device routes; verification unlocks the same token', async (context) => {
@@ -64,10 +65,35 @@ test('unverified accounts are blocked across Vehicle, invitation and Device rout
         return new Response(
           JSON.stringify({
             deviceId: '507f1f77bcf86cd799439015',
-            identifier: 'esp32-test',
             vehicleId,
+            identifier: 'esp32-test',
             status: 'ACTIVE',
-            lastSeenAt: null,
+            operational: true,
+            credential: {
+              credentialId: '507f1f77bcf86cd799439017',
+              keyId: 'dk_AAAAAAAAAAAAAAAAAAAAAA',
+              algorithm: 'Ed25519',
+              fingerprint: `sha256:${'a'.repeat(64)}`,
+              status: 'ACTIVE',
+              usable: true,
+              activatedAt: '2026-11-26T12:00:00.000Z',
+              expiresAt: null,
+              revokedAt: null,
+            },
+            connectivity: { lastSeenAt: null },
+            metadata: {
+              name: null,
+              manufacturer: null,
+              hardwareModel: null,
+              hardwareRevision: null,
+              firmwareVersion: null,
+              serialNumber: null,
+            },
+            createdAt: '2026-11-26T12:00:00.000Z',
+            updatedAt: '2026-11-26T12:00:00.000Z',
+            linkedAt: '2026-11-26T12:01:00.000Z',
+            revokedAt: null,
+            revocationReason: null,
             requestId: 'verification-request',
           }),
           { status: 200, headers: { 'content-type': 'application/json' } },
@@ -134,9 +160,9 @@ test('unverified accounts are blocked across Vehicle, invitation and Device rout
     { method: 'GET' as const, url: '/api/devices/507f1f77bcf86cd799439015' },
     {
       method: 'POST' as const,
-      url: `/api/vehicles/${vehicleId}/devices/link`,
+      url: `/api/vehicles/${vehicleId}/devices`,
       payload: {
-        deviceIdentifier: 'esp32-test',
+        identifier: 'esp32-test',
         publicKey: 'A'.repeat(64),
       },
     },

@@ -1249,7 +1249,7 @@ test('availability: unavailable dependencies never ALLOW; programming errors are
   );
 });
 
-test('deviceLink answers 503 without contacting Device when the authorization store is unavailable', async (t) => {
+test('deviceRegister answers 503 without contacting Device when the authorization store is unavailable', async (t) => {
   const deviceCalls = { count: 0 };
   t.mock.method(globalThis, 'fetch', async (url: string | URL | Request) => {
     const target = String(url instanceof Request ? url.url : url);
@@ -1265,11 +1265,11 @@ test('deviceLink answers 503 without contacting Device when the authorization st
   const app = createVehicleTestApp();
   t.after(async () => app.close());
   const vehicleId = String(new Types.ObjectId());
-  const target = `/vehicles/${vehicleId}/devices/link`;
+  const target = `/vehicles/${vehicleId}/devices`;
   const payload = Buffer.from(
     JSON.stringify({
       userId: String(new Types.ObjectId()),
-      deviceIdentifier: 'esp32-unit',
+      identifier: 'esp32-unit',
       publicKey: 'k'.repeat(44),
     }),
   );
@@ -1463,7 +1463,7 @@ test('POST /vehicles maps a transactional outage to 503 and a programming error 
   assert.equal(control.attempts, 2);
 });
 
-test('no production module fabricates external resource bindings (no authoritative source exists yet)', async () => {
+test('only the authorized Device adapter may mint external resource bindings in production', async () => {
   const sourceRoot = path.resolve(import.meta.dirname, '../src');
   const files: string[] = [];
   const walk = async (directory: string): Promise<void> => {
@@ -1477,7 +1477,7 @@ test('no production module fabricates external resource bindings (no authoritati
     }
   };
   await walk(sourceRoot);
-  // Any mention (call, alias import, re-export) outside the two known places is a new consumer.
+  // Any mention (call, alias import, re-export) outside these exact three files is forbidden.
   const mentions = new Map<string, number>();
   for (const file of files) {
     const source = await readFile(file, 'utf8');
@@ -1487,6 +1487,7 @@ test('no production module fabricates external resource bindings (no authoritati
     }
   }
   assert.deepEqual([...mentions.keys()].sort(), [
+    'services/device-client.service.ts',
     'services/resource-authorization.service.ts',
     'services/vehicle.service.ts',
   ]);
@@ -1500,11 +1501,24 @@ test('no production module fabricates external resource bindings (no authoritati
     'only the definition itself',
   );
   // vehicle.service.ts only re-exports the factory for test fixtures; it never calls it.
-  const adapter = await readFile(path.join(sourceRoot, 'services/vehicle.service.ts'), 'utf8');
+  const reexport = await readFile(path.join(sourceRoot, 'services/vehicle.service.ts'), 'utf8');
   assert.equal(mentions.get('services/vehicle.service.ts'), 1);
   assert.match(
-    adapter,
+    reexport,
     /export \{\s*createVerifiedExternalResourceBinding,[^}]*\} from '\.\/resource-authorization\.service\.js';/,
   );
-  assert.doesNotMatch(adapter, /createVerifiedExternalResourceBinding\s*\(/);
+  assert.doesNotMatch(reexport, /createVerifiedExternalResourceBinding\s*\(/);
+
+  // device-client.service.ts is the sole authorized production caller, with 1 import and 1 call.
+  const adapter = await readFile(
+    path.join(sourceRoot, 'services/device-client.service.ts'),
+    'utf8',
+  );
+  assert.equal(mentions.get('services/device-client.service.ts'), 2);
+  assert.equal(
+    adapter.match(/createVerifiedExternalResourceBinding\s*\(/g)?.length,
+    1,
+    'sole production call site inside buildVerifiedSnapshot',
+  );
+  assert.doesNotMatch(adapter, /export\s*\{[^}]*createVerifiedExternalResourceBinding/);
 });

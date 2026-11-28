@@ -66,6 +66,12 @@ test('device indexes keep identifier globally unique and allow many devices per 
       unique: false,
       partial: undefined,
     },
+    {
+      key: { vehicleId: 1, createdAt: 1, _id: 1 },
+      name: 'device_vehicle_created_id_idx',
+      unique: false,
+      partial: undefined,
+    },
   ]);
 });
 
@@ -140,17 +146,21 @@ test('revocation records validate target and trusted actor combinations without 
   }
 });
 
-test('challenges bind device, credential, vehicle and requester and expire by TTL only', async () => {
+test('challenges bind device, credential, vehicle, requester and membership and expire by TTL only', async () => {
   const fields = {
     challengeHash: 'h'.repeat(64),
     deviceId: new Types.ObjectId(),
     credentialId: new Types.ObjectId(),
     vehicleId: new Types.ObjectId(),
     requestedByUserId: new Types.ObjectId(),
+    requestedByMembershipId: new Types.ObjectId(),
     expiresAt: new Date(),
   };
   await assertValid(new DeviceLinkChallengeModel(fields));
   await assertInvalid(new DeviceLinkChallengeModel({ ...fields, credentialId: undefined }));
+  await assertInvalid(
+    new DeviceLinkChallengeModel({ ...fields, requestedByMembershipId: undefined }),
+  );
   const ttl = DeviceLinkChallengeModel.schema
     .indexes()
     .find(([, options]) => options.expireAfterSeconds !== undefined);

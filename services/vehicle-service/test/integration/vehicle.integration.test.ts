@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { createHmac, generateKeyPairSync, randomUUID } from 'node:crypto';
+import { createHmac, generateKeyPairSync, randomUUID, sign as signDetached } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -64,6 +64,20 @@ import {
   type AuthorizationContext,
   type VehicleAccessCandidate,
 } from '../../src/services/resource-authorization.service.js';
+import {
+  DeviceUpstreamDomainError,
+  toPublicDeviceDetail,
+  type DeviceServiceClient,
+  type VerifiedDeviceSnapshot,
+} from '../../src/services/device-client.service.js';
+import {
+  getDirectDeviceDetail,
+  getVehicleScopedDeviceDetail,
+  listVehicleDevices,
+  revokeVehicleDevice,
+  updateVehicleDeviceMetadata,
+} from '../../src/services/vehicle-device.service.js';
+import type { InternalDeviceRecord } from '@pichu/contracts';
 import { setupVehicleTestAuth } from '../v2-fixture.js';
 
 const execFileAsync = promisify(execFile);
@@ -2897,6 +2911,10 @@ test('11. End-to-end Gateway -> Vehicle -> Identity/Device over real HTTPS, HMAC
       DEVICE_SERVICE_URL: `https://localhost:${ports.device}`,
       TLS_CA_PATH: caCert,
       PROXY_TIMEOUT_MS: '5000',
+      RATE_LIMIT_MAX: '500',
+      SENSITIVE_RATE_LIMIT_MAX: '200',
+      INVITATION_RATE_LIMIT_MAX: '100',
+      INVITATION_IP_RATE_LIMIT_MAX: '100',
     });
     children.push(gatewayChild);
 
@@ -2986,39 +3004,55 @@ test('11. End-to-end Gateway -> Vehicle -> Identity/Device over real HTTPS, HMAC
     });
     assert.equal(memberRead.status, 200);
 
+    // Alias retirado en TKT-015: POST /api/vehicles/:vehicleId/devices/link -> 404
+    const retiredLinkAlias = await fetch(`${gatewayUrl}/api/vehicles/${vehicleId}/devices/link`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${inviteeJwt}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        identifier: `esp32-retired-${randomUUID().slice(0, 8)}`,
+        publicKey: generateKeyPairSync('ed25519')
+          .publicKey.export({ type: 'spki', format: 'pem' })
+          .toString(),
+      }),
+    });
+    assert.equal(retiredLinkAlias.status, 404);
+
     for (const espSuffix of ['cabin-esp32', 'trunk-esp32']) {
-      const linkRes = await fetch(`${gatewayUrl}/api/vehicles/${vehicleId}/devices/link`, {
+      const registerRes = await fetch(`${gatewayUrl}/api/vehicles/${vehicleId}/devices`, {
         method: 'POST',
         headers: {
           authorization: `Bearer ${inviteeJwt}`,
           'content-type': 'application/json',
         },
         body: JSON.stringify({
-          deviceIdentifier: `esp32-${espSuffix}-${randomUUID().slice(0, 8)}`,
+          identifier: `esp32-${espSuffix}-${randomUUID().slice(0, 8)}`,
           publicKey: generateKeyPairSync('ed25519')
             .publicKey.export({ type: 'spki', format: 'pem' })
             .toString(),
         }),
       });
-      assert.equal(linkRes.status, 201);
+      assert.equal(registerRes.status, 201);
     }
 
-    // TKT-013: the canonical OWNER links through OWNER_ROLE; without authorization the
+    // TKT-013: the canonical OWNER registers through OWNER_ROLE; without authorization the
     // response is a uniform 404 and Device is never reached.
-    const linkAs = (jwt: string, targetVehicleId: string) =>
-      fetch(`${gatewayUrl}/api/vehicles/${targetVehicleId}/devices/link`, {
+    const registerAs = (jwt: string, targetVehicleId: string) =>
+      fetch(`${gatewayUrl}/api/vehicles/${targetVehicleId}/devices`, {
         method: 'POST',
         headers: { authorization: `Bearer ${jwt}`, 'content-type': 'application/json' },
         body: JSON.stringify({
-          deviceIdentifier: `esp32-tkt013-${randomUUID().slice(0, 8)}`,
+          identifier: `esp32-tkt013-${randomUUID().slice(0, 8)}`,
           publicKey: generateKeyPairSync('ed25519')
             .publicKey.export({ type: 'spki', format: 'pem' })
             .toString(),
         }),
       });
-    assert.equal((await linkAs(ownerJwt, vehicleId)).status, 201);
-    const deniedLink = await linkAs(inviteeJwt, String(new Types.ObjectId()));
-    assert.equal(deniedLink.status, 404);
+    assert.equal((await registerAs(ownerJwt, vehicleId)).status, 201);
+    const deniedRegister = await registerAs(inviteeJwt, String(new Types.ObjectId()));
+    assert.equal(deniedRegister.status, 404);
 
     // HMAC v2 replay rejection directly against Vehicle HTTPS endpoint
     const gwVehKey = keys.find(
@@ -3739,6 +3773,1121 @@ test('11. End-to-end Gateway -> Vehicle -> Identity/Device over real HTTPS, HMAC
     assert.equal(memberArchivedDelete.status, 404);
     const listAfterArchive = await gw('GET', '/api/vehicles', ownerJwt);
     assert.deepEqual(listAfterArchive.body.vehicles, []);
+
+    // =========================================================================
+    // TKT-015: Gateway -> Vehicle -> Device end-to-end real integration suite
+    // =========================================================================
+    const deviceDb = rootClient.db('device_db');
+    const grantReaderId = String(new Types.ObjectId());
+    const grantReaderSessionId = String(new Types.ObjectId());
+    await identityDb.collection('users').insertOne({
+      _id: new Types.ObjectId(grantReaderId),
+      name: 'Grant Reader Verified',
+      username: 'grant_reader_verified',
+      normalizedUsername: 'grant_reader_verified',
+      email: 'grantreader@example.com',
+      normalizedEmail: 'grantreader@example.com',
+      passwordHash: 'unused',
+      emailVerifiedAt: new Date(),
+      passwordRecoverySequence: 0,
+      passwordRecoveryGeneration: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await identityDb.collection('sessions').insertOne({
+      _id: new Types.ObjectId(grantReaderSessionId),
+      userId: new Types.ObjectId(grantReaderId),
+      familyId: randomUUID(),
+      createdAt: new Date(),
+      lastActivityAt: new Date(),
+      expiresAt: new Date(Date.now() + 600_000),
+      revokedAt: null,
+      revokeReason: null,
+      userAgent: 'tkt015-e2e',
+    });
+    const grantReaderJwt = signUserJwt(grantReaderId, grantReaderSessionId, jwtSecret);
+
+    const tkt015VehicleCreate = await gw('POST', '/api/vehicles', ownerJwt, {
+      name: 'TKT-015 Mazda 3 Sedan',
+      make: 'Mazda',
+      model: '3',
+      year: 2011,
+    });
+    assert.equal(tkt015VehicleCreate.status, 201);
+    const tkt015VehicleId = String(tkt015VehicleCreate.body.vehicleId);
+
+    const assertNoDeviceSecretsOrAudit = (payload: unknown) => {
+      const serialized = JSON.stringify(payload);
+      for (const forbidden of [
+        '"publicKey"',
+        '"challengeHash"',
+        '"requestedByUserId"',
+        '"requestedByMembershipId"',
+        '"revokedByUserId"',
+      ]) {
+        assert.equal(serialized.includes(forbidden), false, `Forbidden field leaked: ${forbidden}`);
+      }
+    };
+
+    const registerAndEnrollDevice = async (
+      jwt: string,
+      label: string,
+      metadata?: Record<string, unknown>,
+    ) => {
+      const keyPair = generateKeyPairSync('ed25519');
+      const publicKey = keyPair.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+      const reg = await gw('POST', `/api/vehicles/${tkt015VehicleId}/devices`, jwt, {
+        identifier: `tkt015-${label}-${randomUUID().slice(0, 8)}`,
+        publicKey,
+        ...(metadata ? { metadata } : {}),
+      });
+      assert.equal(reg.status, 201);
+      assertNoDeviceSecretsOrAudit(reg.body);
+      const devId = String(reg.body.deviceId);
+      const chal = await gw(
+        'POST',
+        `/api/vehicles/${tkt015VehicleId}/devices/${devId}/challenge`,
+        jwt,
+        {},
+      );
+      assert.equal(chal.status, 201);
+      const c = chal.body.data as Record<string, string>;
+      const message = [
+        c.protocol,
+        c.deviceId,
+        c.vehicleId,
+        c.credentialId,
+        c.requestedByUserId,
+        c.challengeId,
+        c.challenge,
+      ].join('\n');
+      const signature = signDetached(
+        null,
+        Buffer.from(message, 'utf8'),
+        keyPair.privateKey,
+      ).toString('base64url');
+      const linked = await gw(
+        'POST',
+        `/api/vehicles/${tkt015VehicleId}/devices/${devId}/link`,
+        jwt,
+        {
+          challengeId: c.challengeId,
+          challenge: c.challenge,
+          signature,
+        },
+      );
+      assert.equal(linked.status, 200);
+      assertNoDeviceSecretsOrAudit(linked.body);
+      return { deviceId: devId, keyPair, linked: linked.body };
+    };
+
+    // 1. Metadata validation: control chars before trim, unknown fields and empty PATCH rejected
+    const badMetaKeyPair = generateKeyPairSync('ed25519');
+    const badMetaPem = badMetaKeyPair.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+    for (const invalidMetadata of [
+      { name: '\u0007Sunroof' },
+      { name: 'Sunroof\nModule' },
+      { unknownField: 'x' },
+    ]) {
+      const invalidReg = await gw('POST', `/api/vehicles/${tkt015VehicleId}/devices`, ownerJwt, {
+        identifier: `tkt015-badmeta-${randomUUID().slice(0, 8)}`,
+        publicKey: badMetaPem,
+        metadata: invalidMetadata,
+      });
+      assert.equal(invalidReg.status, 400);
+    }
+
+    // 2. Concurrent challenge emissions + domain separation + wrong context + real enrollment
+    const primaryPair = generateKeyPairSync('ed25519');
+    const primaryReg = await gw('POST', `/api/vehicles/${tkt015VehicleId}/devices`, ownerJwt, {
+      identifier: `tkt015-primary-${randomUUID().slice(0, 8)}`,
+      publicKey: primaryPair.publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+      metadata: {
+        name: '  Cabin ESP32  ',
+        manufacturer: 'Espressif',
+        serialNumber: 'SN-001',
+      },
+    });
+    assert.equal(primaryReg.status, 201);
+    const primaryDeviceId = String(primaryReg.body.deviceId);
+    assert.equal(
+      ((primaryReg.body.data as Record<string, unknown>).metadata as Record<string, unknown>).name,
+      'Cabin ESP32',
+    );
+
+    // Direct GET /devices/:deviceId on Device is retired (404)
+    const retiredDeviceDirectGet = await httpsJsonRequest({
+      url: `https://localhost:${ports.device}/devices/${primaryDeviceId}`,
+      method: 'GET',
+      timeoutMs: 5_000,
+      tls: { caPath: caCert, servername: 'localhost' },
+    });
+    assert.equal(retiredDeviceDirectGet.status, 404);
+
+    // Two concurrent challenge emissions leave strictly one unused challenge
+    const [chalA, chalB] = await Promise.all([
+      gw(
+        'POST',
+        `/api/vehicles/${tkt015VehicleId}/devices/${primaryDeviceId}/challenge`,
+        ownerJwt,
+        {},
+      ),
+      gw(
+        'POST',
+        `/api/vehicles/${tkt015VehicleId}/devices/${primaryDeviceId}/challenge`,
+        ownerJwt,
+        {},
+      ),
+    ]);
+    assert.equal(chalA.status, 201);
+    assert.equal(chalB.status, 201);
+    const activeChallengesInDb = await deviceDb
+      .collection('devicelinkchallenges')
+      .find({
+        deviceId: new Types.ObjectId(primaryDeviceId),
+        usedAt: null,
+      })
+      .toArray();
+    assert.equal(activeChallengesInDb.length, 1);
+    const winnerChallengeId = String(activeChallengesInDb[0]!._id);
+    const winnerPayload = (
+      (chalA.body.data as Record<string, string>).challengeId === winnerChallengeId
+        ? chalA.body.data
+        : chalB.body.data
+    ) as Record<string, string>;
+    const supersededPayload = (
+      (chalA.body.data as Record<string, string>).challengeId === winnerChallengeId
+        ? chalB.body.data
+        : chalA.body.data
+    ) as Record<string, string>;
+
+    // Superseded challenge cannot be used (409)
+    const supersededMsg = [
+      supersededPayload.protocol,
+      supersededPayload.deviceId,
+      supersededPayload.vehicleId,
+      supersededPayload.credentialId,
+      supersededPayload.requestedByUserId,
+      supersededPayload.challengeId,
+      supersededPayload.challenge,
+    ].join('\n');
+    const supersededAttempt = await gw(
+      'POST',
+      `/api/vehicles/${tkt015VehicleId}/devices/${primaryDeviceId}/link`,
+      ownerJwt,
+      {
+        challengeId: supersededPayload.challengeId,
+        challenge: supersededPayload.challenge,
+        signature: signDetached(
+          null,
+          Buffer.from(supersededMsg, 'utf8'),
+          primaryPair.privateKey,
+        ).toString('base64url'),
+      },
+    );
+    assert.equal(supersededAttempt.status, 409);
+
+    // Bare nonce signature (legacy protocol) is rejected (400)
+    const bareNonceSig = signDetached(
+      null,
+      Buffer.from(winnerPayload.challenge!, 'utf8'),
+      primaryPair.privateKey,
+    ).toString('base64url');
+    const bareNonceAttempt = await gw(
+      'POST',
+      `/api/vehicles/${tkt015VehicleId}/devices/${primaryDeviceId}/link`,
+      ownerJwt,
+      {
+        challengeId: winnerPayload.challengeId,
+        challenge: winnerPayload.challenge,
+        signature: bareNonceSig,
+      },
+    );
+    assert.equal(bareNonceAttempt.status, 400);
+
+    // Signature over wrong context (mismatched vehicleId) is rejected (400)
+    const wrongContextMsg = [
+      winnerPayload.protocol,
+      winnerPayload.deviceId,
+      String(new Types.ObjectId()),
+      winnerPayload.credentialId,
+      winnerPayload.requestedByUserId,
+      winnerPayload.challengeId,
+      winnerPayload.challenge,
+    ].join('\n');
+    const wrongContextAttempt = await gw(
+      'POST',
+      `/api/vehicles/${tkt015VehicleId}/devices/${primaryDeviceId}/link`,
+      ownerJwt,
+      {
+        challengeId: winnerPayload.challengeId,
+        challenge: winnerPayload.challenge,
+        signature: signDetached(
+          null,
+          Buffer.from(wrongContextMsg, 'utf8'),
+          primaryPair.privateKey,
+        ).toString('base64url'),
+      },
+    );
+    assert.equal(wrongContextAttempt.status, 400);
+
+    // Valid canonical signature completes enrollment -> ACTIVE & operational
+    const validWinnerMsg = [
+      winnerPayload.protocol,
+      winnerPayload.deviceId,
+      winnerPayload.vehicleId,
+      winnerPayload.credentialId,
+      winnerPayload.requestedByUserId,
+      winnerPayload.challengeId,
+      winnerPayload.challenge,
+    ].join('\n');
+    const validWinnerLink = await gw(
+      'POST',
+      `/api/vehicles/${tkt015VehicleId}/devices/${primaryDeviceId}/link`,
+      ownerJwt,
+      {
+        challengeId: winnerPayload.challengeId,
+        challenge: winnerPayload.challenge,
+        signature: signDetached(
+          null,
+          Buffer.from(validWinnerMsg, 'utf8'),
+          primaryPair.privateKey,
+        ).toString('base64url'),
+      },
+    );
+    assert.equal(validWinnerLink.status, 200);
+    assert.equal(validWinnerLink.body.status, 'ACTIVE');
+    assert.equal((validWinnerLink.body.data as Record<string, unknown>).operational, true);
+    assertNoDeviceSecretsOrAudit(validWinnerLink.body);
+
+    // Owner revokes primaryDeviceId so it sits first as REVOKED in chronological pagination
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${primaryDeviceId}/revoke`,
+          ownerJwt,
+          { reason: 'REPLACED' },
+        )
+      ).status,
+      200,
+    );
+    // Revoked device rejects metadata PATCH (409)
+    assert.equal(
+      (
+        await gw('PATCH', `/api/vehicles/${tkt015VehicleId}/devices/${primaryDeviceId}`, ownerJwt, {
+          name: 'Cannot mutate revoked',
+        })
+      ).status,
+      409,
+    );
+
+    // 3. Loss of permission before completing enrollment + Re-entry with new membership
+    const invM1 = await gw('POST', `/api/vehicles/${tkt015VehicleId}/invitations`, ownerJwt, {
+      inviteeUserId: inviteeId,
+      permissions: ['vehicle:read', 'device:link'],
+    });
+    assert.equal(invM1.status, 201);
+    const accM1 = await gw(
+      'POST',
+      `/api/invitations/${String(invM1.body.invitationId)}/accept`,
+      inviteeJwt,
+      {},
+    );
+    assert.equal(accM1.status, 200);
+    const m1Id = String((accM1.body.data as Record<string, unknown>).membershipId);
+
+    const lostPermPair = generateKeyPairSync('ed25519');
+    const lostPermReg = await gw('POST', `/api/vehicles/${tkt015VehicleId}/devices`, inviteeJwt, {
+      identifier: `tkt015-lostperm-${randomUUID().slice(0, 8)}`,
+      publicKey: lostPermPair.publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+    });
+    assert.equal(lostPermReg.status, 201);
+    const lostPermDeviceId = String(lostPermReg.body.deviceId);
+    const lostPermChal = await gw(
+      'POST',
+      `/api/vehicles/${tkt015VehicleId}/devices/${lostPermDeviceId}/challenge`,
+      inviteeJwt,
+      {},
+    );
+    assert.equal(lostPermChal.status, 201);
+    const lostPermChalData = lostPermChal.body.data as Record<string, string>;
+
+    // Owner removes device:link before invitee completes link
+    assert.equal(
+      (
+        await gw('PATCH', `/api/vehicles/${tkt015VehicleId}/members/${m1Id}`, ownerJwt, {
+          permissions: ['vehicle:read', 'device:read'],
+        })
+      ).status,
+      200,
+    );
+    const lostPermMsg = [
+      lostPermChalData.protocol,
+      lostPermChalData.deviceId,
+      lostPermChalData.vehicleId,
+      lostPermChalData.credentialId,
+      lostPermChalData.requestedByUserId,
+      lostPermChalData.challengeId,
+      lostPermChalData.challenge,
+    ].join('\n');
+    const lostPermLink = await gw(
+      'POST',
+      `/api/vehicles/${tkt015VehicleId}/devices/${lostPermDeviceId}/link`,
+      inviteeJwt,
+      {
+        challengeId: lostPermChalData.challengeId,
+        challenge: lostPermChalData.challenge,
+        signature: signDetached(
+          null,
+          Buffer.from(lostPermMsg, 'utf8'),
+          lostPermPair.privateKey,
+        ).toString('base64url'),
+      },
+    );
+    assert.equal(lostPermLink.status, 404);
+    assert.equal(
+      (await deviceDb.collection('devices').findOne({ _id: new Types.ObjectId(lostPermDeviceId) }))
+        ?.status,
+      'PENDING',
+    );
+
+    // Owner revokes M1 and re-invites the SAME user (inviteeId) with vehicle:manage (new membership M2)
+    assert.equal(
+      (await gw('DELETE', `/api/vehicles/${tkt015VehicleId}/members/${m1Id}`, ownerJwt, {})).status,
+      200,
+    );
+    const invM2 = await gw('POST', `/api/vehicles/${tkt015VehicleId}/invitations`, ownerJwt, {
+      inviteeUserId: inviteeId,
+      permissions: ['vehicle:manage'],
+    });
+    assert.equal(invM2.status, 201);
+    const accM2 = await gw(
+      'POST',
+      `/api/invitations/${String(invM2.body.invitationId)}/accept`,
+      inviteeJwt,
+      {},
+    );
+    assert.equal(accM2.status, 200);
+    const m2Id = String((accM2.body.data as Record<string, unknown>).membershipId);
+    assert.notEqual(m2Id, m1Id);
+
+    // Even with vehicle:manage under M2, invitee CANNOT challenge, link or self-cancel M1's PENDING device (403)
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${lostPermDeviceId}/challenge`,
+          inviteeJwt,
+          {},
+        )
+      ).status,
+      403,
+    );
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${lostPermDeviceId}/link`,
+          inviteeJwt,
+          {
+            challengeId: lostPermChalData.challengeId,
+            challenge: lostPermChalData.challenge,
+            signature: signDetached(
+              null,
+              Buffer.from(lostPermMsg, 'utf8'),
+              lostPermPair.privateKey,
+            ).toString('base64url'),
+          },
+        )
+      ).status,
+      403,
+    );
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${lostPermDeviceId}/revoke`,
+          inviteeJwt,
+          { reason: 'REGISTRATION_CANCELLED' },
+        )
+      ).status,
+      403,
+    );
+
+    // Owner administratively revokes lostPermDeviceId (PENDING -> REVOKED)
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${lostPermDeviceId}/revoke`,
+          ownerJwt,
+          { reason: 'ADMINISTRATIVE' },
+        )
+      ).status,
+      200,
+    );
+
+    // 4. MEMBER with vehicle:manage: allowed metadata PATCH & own PENDING cancellation (idempotent),
+    //    denied administrative revocation on ACTIVE and foreign PENDING
+    const activeGrantA = (
+      await registerAndEnrollDevice(inviteeJwt, 'grant-a', {
+        name: 'Module A',
+        manufacturer: 'Bosch',
+        serialNumber: 'BOSCH-A',
+      })
+    ).deviceId;
+
+    assert.equal(
+      (
+        await gw(
+          'PATCH',
+          `/api/vehicles/${tkt015VehicleId}/devices/${activeGrantA}`,
+          inviteeJwt,
+          {},
+        )
+      ).status,
+      400,
+    );
+    const managerPatch = await gw(
+      'PATCH',
+      `/api/vehicles/${tkt015VehicleId}/devices/${activeGrantA}`,
+      inviteeJwt,
+      { name: 'Module A Updated', serialNumber: null },
+    );
+    assert.equal(managerPatch.status, 200);
+    assert.deepEqual(
+      (managerPatch.body.data as Record<string, unknown>).metadata as Record<string, unknown>,
+      {
+        name: 'Module A Updated',
+        manufacturer: 'Bosch',
+        hardwareModel: null,
+        hardwareRevision: null,
+        firmwareVersion: null,
+        serialNumber: null,
+      },
+    );
+
+    // MEMBER with vehicle:manage CANNOT revoke an ACTIVE device (even one they linked themselves) -> 403
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${activeGrantA}/revoke`,
+          inviteeJwt,
+          { reason: 'SECURITY_COMPROMISE' },
+        )
+      ).status,
+      403,
+    );
+    // REGISTRATION_CANCELLED on ACTIVE is rejected (409 for OWNER)
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${activeGrantA}/revoke`,
+          ownerJwt,
+          { reason: 'REGISTRATION_CANCELLED' },
+        )
+      ).status,
+      409,
+    );
+
+    // Own PENDING cancellation with REGISTRATION_CANCELLED + idempotent replay
+    const ownPendingReg = await gw('POST', `/api/vehicles/${tkt015VehicleId}/devices`, inviteeJwt, {
+      identifier: `tkt015-owncancel-${randomUUID().slice(0, 8)}`,
+      publicKey: generateKeyPairSync('ed25519')
+        .publicKey.export({ type: 'spki', format: 'pem' })
+        .toString(),
+    });
+    assert.equal(ownPendingReg.status, 201);
+    const ownPendingId = String(ownPendingReg.body.deviceId);
+    // Administrative reason on own PENDING by MEMBER is rejected (403)
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${ownPendingId}/revoke`,
+          inviteeJwt,
+          { reason: 'LOST' },
+        )
+      ).status,
+      403,
+    );
+    const cancelFirst = await gw(
+      'POST',
+      `/api/vehicles/${tkt015VehicleId}/devices/${ownPendingId}/revoke`,
+      inviteeJwt,
+      { reason: 'REGISTRATION_CANCELLED' },
+    );
+    assert.equal(cancelFirst.status, 200);
+    const cancelFirstAt = (cancelFirst.body.data as Record<string, unknown>).revokedAt;
+    const cancelReplay = await gw(
+      'POST',
+      `/api/vehicles/${tkt015VehicleId}/devices/${ownPendingId}/revoke`,
+      inviteeJwt,
+      { reason: 'REGISTRATION_CANCELLED' },
+    );
+    assert.equal(cancelReplay.status, 200);
+    assert.equal((cancelReplay.body.data as Record<string, unknown>).revokedAt, cancelFirstAt);
+    assert.equal(
+      (cancelReplay.body.data as Record<string, unknown>).revocationReason,
+      'REGISTRATION_CANCELLED',
+    );
+
+    // Foreign PENDING cancellation denied
+    const ownerPendingReg = await gw('POST', `/api/vehicles/${tkt015VehicleId}/devices`, ownerJwt, {
+      identifier: `tkt015-ownerpending-${randomUUID().slice(0, 8)}`,
+      publicKey: generateKeyPairSync('ed25519')
+        .publicKey.export({ type: 'spki', format: 'pem' })
+        .toString(),
+    });
+    assert.equal(ownerPendingReg.status, 201);
+    const ownerPendingId = String(ownerPendingReg.body.deviceId);
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${ownerPendingId}/revoke`,
+          inviteeJwt,
+          { reason: 'REGISTRATION_CANCELLED' },
+        )
+      ).status,
+      403,
+    );
+
+    // 5. Interleaved devices for cursor pagination + specific DEVICE grants + degraded ACTIVE
+    const activeNoGrantB = (await registerAndEnrollDevice(ownerJwt, 'nogrant-b')).deviceId;
+    const activeGrantC = (await registerAndEnrollDevice(ownerJwt, 'grant-c')).deviceId;
+    const activeDegradedD = (await registerAndEnrollDevice(ownerJwt, 'degraded-d')).deviceId;
+    const activeGrantE = (await registerAndEnrollDevice(ownerJwt, 'grant-e')).deviceId;
+
+    // Degrade activeDegradedD credential in device_db (EXPIRED -> operational: false)
+    await deviceDb
+      .collection('device_credentials')
+      .updateOne(
+        { deviceId: new Types.ObjectId(activeDegradedD), status: 'ACTIVE' },
+        { $set: { expiresAt: new Date(Date.now() - 60_000) } },
+      );
+
+    // Invite grantReader and narrow base permissions to [] (zero base permissions, no vehicle:read!)
+    const invGrantReader = await gw(
+      'POST',
+      `/api/vehicles/${tkt015VehicleId}/invitations`,
+      ownerJwt,
+      {
+        inviteeUserId: grantReaderId,
+        permissions: ['vehicle:read'],
+      },
+    );
+    assert.equal(invGrantReader.status, 201);
+    const accGrantReader = await gw(
+      'POST',
+      `/api/invitations/${String(invGrantReader.body.invitationId)}/accept`,
+      grantReaderJwt,
+      {},
+    );
+    assert.equal(accGrantReader.status, 200);
+    const grantReaderMembershipId = String(
+      (accGrantReader.body.data as Record<string, unknown>).membershipId,
+    );
+    assert.equal(
+      (
+        await gw(
+          'PATCH',
+          `/api/vehicles/${tkt015VehicleId}/members/${grantReaderMembershipId}`,
+          ownerJwt,
+          { permissions: [] },
+        )
+      ).status,
+      200,
+    );
+
+    // Issue specific DEVICE ONLINE device:read grants for A, C, D (before degrading D), E, and BLE_OFFLINE for B
+    const vehicleObjectId = new Types.ObjectId(tkt015VehicleId);
+    for (const targetDeviceId of [activeGrantA, activeGrantC, activeDegradedD, activeGrantE]) {
+      const devObjId = new Types.ObjectId(targetDeviceId);
+      await createAccessGrant({
+        vehicleId: vehicleObjectId,
+        membershipId: new Types.ObjectId(grantReaderMembershipId),
+        subjectUserId: new Types.ObjectId(grantReaderId),
+        actorUserId: new Types.ObjectId(ownerId),
+        scopeType: 'DEVICE',
+        scopeResourceId: devObjId,
+        verifiedResourceBinding: createVerifiedExternalResourceBinding({
+          scopeType: 'DEVICE',
+          resourceId: devObjId,
+          vehicleId: vehicleObjectId,
+          isActive: true,
+        }),
+        channel: 'ONLINE',
+        permissions: ['device:read'],
+        expiresAt: new Date(Date.now() + 600_000),
+      });
+    }
+    const noGrantBObjId = new Types.ObjectId(activeNoGrantB);
+    await createAccessGrant({
+      vehicleId: vehicleObjectId,
+      membershipId: new Types.ObjectId(grantReaderMembershipId),
+      subjectUserId: new Types.ObjectId(grantReaderId),
+      actorUserId: new Types.ObjectId(ownerId),
+      scopeType: 'DEVICE',
+      scopeResourceId: noGrantBObjId,
+      verifiedResourceBinding: createVerifiedExternalResourceBinding({
+        scopeType: 'DEVICE',
+        resourceId: noGrantBObjId,
+        vehicleId: vehicleObjectId,
+        isActive: true,
+      }),
+      channel: 'BLE_OFFLINE',
+      permissions: ['device:read'],
+      expiresAt: new Date(Date.now() + 600_000),
+    });
+
+    // grantReader has NO vehicle:read (404 on vehicle detail), CAN read A via both GET endpoints,
+    // CANNOT PATCH A (403 because visible via grant), CANNOT read B (BLE_OFFLINE -> 404),
+    // CANNOT read ownerPendingId (404), CANNOT read revoked primaryDeviceId (404),
+    // and CANNOT read degraded D via DEVICE grant because DeviceClient refuses active binding (404)!
+    assert.equal((await gw('GET', `/api/vehicles/${tkt015VehicleId}`, grantReaderJwt)).status, 404);
+    assert.equal((await gw('GET', `/api/devices/${activeGrantA}`, grantReaderJwt)).status, 200);
+    assert.equal(
+      (await gw('GET', `/api/vehicles/${tkt015VehicleId}/devices/${activeGrantA}`, grantReaderJwt))
+        .status,
+      200,
+    );
+    assert.equal(
+      (
+        await gw(
+          'PATCH',
+          `/api/vehicles/${tkt015VehicleId}/devices/${activeGrantA}`,
+          grantReaderJwt,
+          { name: 'Grant cannot patch' },
+        )
+      ).status,
+      403,
+    );
+    for (const invisibleId of [activeNoGrantB, ownerPendingId, primaryDeviceId, activeDegradedD]) {
+      assert.equal((await gw('GET', `/api/devices/${invisibleId}`, grantReaderJwt)).status, 404);
+      assert.equal(
+        (await gw('GET', `/api/vehicles/${tkt015VehicleId}/devices/${invisibleId}`, grantReaderJwt))
+          .status,
+        404,
+      );
+    }
+
+    // Base diagnostic reader (OWNER or MEMBER with base device:read/vehicle:manage) CAN inspect degraded D
+    const ownerDiag = await gw('GET', `/api/devices/${activeDegradedD}`, ownerJwt);
+    assert.equal(ownerDiag.status, 200);
+    assert.equal(ownerDiag.body.status, 'ACTIVE');
+    assert.equal(ownerDiag.body.operational, false);
+    const ownerDiagCred = ownerDiag.body.credential as Record<string, unknown>;
+    assert.equal(ownerDiagCred.status, 'EXPIRED');
+    assert.equal(ownerDiagCred.usable, false);
+
+    // Interleaved cursor pagination for grantReader with limit=2:
+    // Stored order: [primaryDeviceId(REVOKED), lostPermDeviceId(REVOKED), activeGrantA(VISIBLE),
+    // ownPendingId(REVOKED), ownerPendingId(PENDING), activeNoGrantB(BLE_OFFLINE),
+    // activeGrantC(VISIBLE), activeDegradedD(DEGRADED), activeGrantE(VISIBLE)]
+    const grantPage1 = await gw(
+      'GET',
+      `/api/vehicles/${tkt015VehicleId}/devices?limit=2`,
+      grantReaderJwt,
+    );
+    assert.equal(grantPage1.status, 200);
+    assertNoDeviceSecretsOrAudit(grantPage1.body);
+    assert.deepEqual(
+      (grantPage1.body.devices as Array<Record<string, unknown>>).map((d) => d.deviceId),
+      [activeGrantA, activeGrantC],
+    );
+    const grantCursor = (grantPage1.body.page as { nextCursor: string | null }).nextCursor;
+    assert.ok(grantCursor);
+
+    // Cursor bound to actor, vehicle and status filter
+    assert.equal(
+      (
+        await gw(
+          'GET',
+          `/api/vehicles/${tkt015VehicleId}/devices?limit=2&cursor=${encodeURIComponent(grantCursor)}`,
+          ownerJwt,
+        )
+      ).status,
+      400,
+    );
+    assert.equal(
+      (
+        await gw(
+          'GET',
+          `/api/vehicles/${tkt015VehicleId}/devices?limit=2&status=ACTIVE&cursor=${encodeURIComponent(grantCursor)}`,
+          grantReaderJwt,
+        )
+      ).status,
+      400,
+    );
+
+    const grantPage2 = await gw(
+      'GET',
+      `/api/vehicles/${tkt015VehicleId}/devices?limit=2&cursor=${encodeURIComponent(grantCursor)}`,
+      grantReaderJwt,
+    );
+    assert.equal(grantPage2.status, 200);
+    assert.deepEqual(
+      (grantPage2.body.devices as Array<Record<string, unknown>>).map((d) => d.deviceId),
+      [activeGrantE],
+    );
+    assert.equal((grantPage2.body.page as { nextCursor: string | null }).nextCursor, null);
+
+    // Repeated self-cancel preserves original audit, and MUST fail once authority or original membership is lost
+    assert.equal(
+      (
+        await gw('PATCH', `/api/vehicles/${tkt015VehicleId}/members/${m2Id}`, ownerJwt, {
+          permissions: ['vehicle:read'],
+        })
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${ownPendingId}/revoke`,
+          inviteeJwt,
+          { reason: 'REGISTRATION_CANCELLED' },
+        )
+      ).status,
+      404,
+    );
+    const storedOwnCancelled = await deviceDb
+      .collection('devices')
+      .findOne({ _id: new Types.ObjectId(ownPendingId) });
+    assert.equal(storedOwnCancelled?.status, 'REVOKED');
+    assert.equal((storedOwnCancelled?.revokedAt as Date | undefined)?.toISOString(), cancelFirstAt);
+    const storedOwnRevocation = await deviceDb
+      .collection('device_revocations')
+      .findOne({ _id: storedOwnCancelled?.revocationId });
+    assert.equal(storedOwnRevocation?.reason, 'REGISTRATION_CANCELLED');
+    assert.equal(
+      (await gw('DELETE', `/api/vehicles/${tkt015VehicleId}/members/${m2Id}`, ownerJwt, {})).status,
+      200,
+    );
+    const invM3 = await gw('POST', `/api/vehicles/${tkt015VehicleId}/invitations`, ownerJwt, {
+      inviteeUserId: inviteeId,
+      permissions: ['vehicle:manage'],
+    });
+    assert.equal(invM3.status, 201);
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/invitations/${String(invM3.body.invitationId)}/accept`,
+          inviteeJwt,
+          {},
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${ownPendingId}/revoke`,
+          inviteeJwt,
+          { reason: 'REGISTRATION_CANCELLED' },
+        )
+      ).status,
+      403,
+    );
+
+    // Dedicated vehicle verifying TKT-013 authorization matrix + >5-batch empty-page pagination
+    const matrixVehicleCreate = await gw('POST', '/api/vehicles', ownerJwt, {
+      name: 'TKT-015 Matrix & Pagination',
+      make: 'Mazda',
+      model: '3',
+      year: 2011,
+    });
+    assert.equal(matrixVehicleCreate.status, 201);
+    const matrixVehicleId = String(matrixVehicleCreate.body.vehicleId);
+    const matrixVehicleObjId = new Types.ObjectId(matrixVehicleId);
+
+    const invMatrix = await gw('POST', `/api/vehicles/${matrixVehicleId}/invitations`, ownerJwt, {
+      inviteeUserId: grantReaderId,
+      permissions: ['vehicle:read'],
+    });
+    assert.equal(invMatrix.status, 201);
+    const accMatrix = await gw(
+      'POST',
+      `/api/invitations/${String(invMatrix.body.invitationId)}/accept`,
+      grantReaderJwt,
+      {},
+    );
+    assert.equal(accMatrix.status, 200);
+    const matrixMembershipId = String(
+      (accMatrix.body.data as Record<string, unknown>).membershipId,
+    );
+
+    // Seed 130 older hidden ACTIVE devices (with ACTIVE credentials, no DEVICE grant)
+    // before the granted ACTIVE devices (>5 batches of 25)
+    const hiddenBaseTime = new Date(Date.now() - 3_600_000);
+    const hiddenSharedPem = generateKeyPairSync('ed25519')
+      .publicKey.export({ type: 'spki', format: 'pem' })
+      .toString()
+      .trim();
+    const hiddenDocs = Array.from({ length: 130 }, (_, index) => {
+      const id = new Types.ObjectId();
+      const ts = new Date(hiddenBaseTime.getTime() + index * 1_000);
+      return {
+        _id: id,
+        vehicleId: matrixVehicleObjId,
+        identifier: `tkt015-hidden-${String(index).padStart(3, '0')}-${randomUUID().slice(0, 6)}`,
+        status: 'ACTIVE',
+        requestedByUserId: new Types.ObjectId(ownerId),
+        requestedByMembershipId: null,
+        linkedByUserId: new Types.ObjectId(ownerId),
+        linkedAt: ts,
+        revokedAt: null,
+        revocationId: null,
+        lastSeenAt: null,
+        metadata: null,
+        createdAt: ts,
+        updatedAt: ts,
+      };
+    });
+    const hiddenCredentialDocs = hiddenDocs.map((doc, index) => ({
+      _id: new Types.ObjectId(),
+      deviceId: doc._id,
+      vehicleId: matrixVehicleObjId,
+      keyId: `dk_${randomUUID().replaceAll('-', '').slice(0, 22)}`,
+      algorithm: 'Ed25519',
+      publicKey: hiddenSharedPem,
+      fingerprint: `sha256:${String(index).padStart(64, 'a')}`,
+      status: 'ACTIVE',
+      activatedAt: doc.createdAt,
+      expiresAt: null,
+      revokedAt: null,
+      revocationId: null,
+      createdAt: doc.createdAt,
+      updatedAt: doc.createdAt,
+    }));
+    await deviceDb.collection('devices').insertMany(hiddenDocs);
+    await deviceDb.collection('device_credentials').insertMany(hiddenCredentialDocs);
+
+    const matrixPendingReg = await gw(
+      'POST',
+      `/api/vehicles/${matrixVehicleId}/devices`,
+      ownerJwt,
+      {
+        identifier: `tkt015-matrix-pending-${randomUUID().slice(0, 8)}`,
+        publicKey: generateKeyPairSync('ed25519')
+          .publicKey.export({ type: 'spki', format: 'pem' })
+          .toString(),
+      },
+    );
+    assert.equal(matrixPendingReg.status, 201);
+    const matrixPendingId = String(matrixPendingReg.body.deviceId);
+
+    const registerAndEnrollInMatrixVehicle = async (label: string) => {
+      const kp = generateKeyPairSync('ed25519');
+      const reg = await gw('POST', `/api/vehicles/${matrixVehicleId}/devices`, ownerJwt, {
+        identifier: `tkt015-${label}-${randomUUID().slice(0, 8)}`,
+        publicKey: kp.publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+      });
+      assert.equal(reg.status, 201);
+      const devId = String(reg.body.deviceId);
+      const chal = await gw(
+        'POST',
+        `/api/vehicles/${matrixVehicleId}/devices/${devId}/challenge`,
+        ownerJwt,
+        {},
+      );
+      assert.equal(chal.status, 201);
+      const c = chal.body.data as Record<string, string>;
+      const msg = [
+        c.protocol,
+        c.deviceId,
+        c.vehicleId,
+        c.credentialId,
+        c.requestedByUserId,
+        c.challengeId,
+        c.challenge,
+      ].join('\n');
+      const linked = await gw(
+        'POST',
+        `/api/vehicles/${matrixVehicleId}/devices/${devId}/link`,
+        ownerJwt,
+        {
+          challengeId: c.challengeId,
+          challenge: c.challenge,
+          signature: signDetached(null, Buffer.from(msg, 'utf8'), kp.privateKey).toString(
+            'base64url',
+          ),
+        },
+      );
+      assert.equal(linked.status, 200);
+      return devId;
+    };
+
+    const deepAuthA = await registerAndEnrollInMatrixVehicle('deep-a');
+    const deepAuthB = await registerAndEnrollInMatrixVehicle('deep-b');
+    const deepDegradedC = await registerAndEnrollInMatrixVehicle('deep-degraded-c');
+    await deviceDb
+      .collection('device_credentials')
+      .updateOne(
+        { deviceId: new Types.ObjectId(deepDegradedC), status: 'ACTIVE' },
+        { $set: { expiresAt: new Date(Date.now() - 60_000) } },
+      );
+
+    // Historical VEHICLE-scoped grant with `device:read` MUST NEVER grant device access
+    const legacyGrantNow = new Date();
+    const legacyVehicleGrantId = new Types.ObjectId();
+    await AccessGrantModel.collection.insertOne({
+      _id: legacyVehicleGrantId,
+      vehicleId: matrixVehicleObjId,
+      membershipId: new Types.ObjectId(matrixMembershipId),
+      subjectUserId: new Types.ObjectId(grantReaderId),
+      scopeType: 'VEHICLE',
+      scopeResourceId: null,
+      channel: 'ONLINE',
+      permissions: ['device:read'],
+      status: 'ACTIVE',
+      startsAt: legacyGrantNow,
+      expiresAt: null,
+      grantedByUserId: new Types.ObjectId(ownerId),
+      revokedAt: null,
+      revokedByUserId: null,
+      revokeReason: null,
+      expiredAt: null,
+      createdAt: legacyGrantNow,
+      updatedAt: legacyGrantNow,
+    });
+    assert.equal((await gw('GET', `/api/devices/${deepAuthA}`, grantReaderJwt)).status, 404);
+    assert.equal(
+      (await gw('GET', `/api/vehicles/${matrixVehicleId}/devices/${deepAuthA}`, grantReaderJwt))
+        .status,
+      404,
+    );
+    assert.equal(
+      (await gw('GET', `/api/vehicles/${matrixVehicleId}/devices`, grantReaderJwt)).status,
+      403,
+    );
+
+    // Base `device:read` permission (without `vehicle:read`) retains approved behavior
+    assert.equal(
+      (
+        await gw(
+          'PATCH',
+          `/api/vehicles/${matrixVehicleId}/members/${matrixMembershipId}`,
+          ownerJwt,
+          { permissions: ['device:read'] },
+        )
+      ).status,
+      200,
+    );
+    assert.equal((await gw('GET', `/api/devices/${deepAuthA}`, grantReaderJwt)).status, 200);
+    const baseDegradedRead = await gw(
+      'GET',
+      `/api/vehicles/${matrixVehicleId}/devices/${deepDegradedC}`,
+      grantReaderJwt,
+    );
+    assert.equal(baseDegradedRead.status, 200);
+    assert.equal(baseDegradedRead.body.operational, false);
+    assert.equal(
+      (
+        await gw(
+          'GET',
+          `/api/vehicles/${matrixVehicleId}/devices/${matrixPendingId}`,
+          grantReaderJwt,
+        )
+      ).status,
+      404,
+    );
+    assert.equal(
+      (
+        await gw('PATCH', `/api/vehicles/${matrixVehicleId}/devices/${deepAuthA}`, grantReaderJwt, {
+          name: 'Base read cannot patch',
+        })
+      ).status,
+      403,
+    );
+
+    // Restore `vehicle:read` only, then grant DEVICE ONLINE `device:read` on deepAuthA & deepAuthB
+    assert.equal(
+      (
+        await gw(
+          'PATCH',
+          `/api/vehicles/${matrixVehicleId}/members/${matrixMembershipId}`,
+          ownerJwt,
+          { permissions: ['vehicle:read'] },
+        )
+      ).status,
+      200,
+    );
+    for (const targetId of [deepAuthA, deepAuthB]) {
+      const targetObjId = new Types.ObjectId(targetId);
+      await createAccessGrant({
+        vehicleId: matrixVehicleObjId,
+        membershipId: new Types.ObjectId(matrixMembershipId),
+        subjectUserId: new Types.ObjectId(grantReaderId),
+        actorUserId: new Types.ObjectId(ownerId),
+        scopeType: 'DEVICE',
+        scopeResourceId: targetObjId,
+        verifiedResourceBinding: createVerifiedExternalResourceBinding({
+          scopeType: 'DEVICE',
+          resourceId: targetObjId,
+          vehicleId: matrixVehicleObjId,
+          isActive: true,
+        }),
+        channel: 'ONLINE',
+        permissions: ['device:read'],
+        expiresAt: new Date(Date.now() + 600_000),
+      });
+    }
+
+    // Real E2E >5-batch pagination: page 1 returns empty `devices: []` + encrypted `nextCursor`, page 2 yields [deepAuthA, deepAuthB]
+    const deepPage1 = await gw(
+      'GET',
+      `/api/vehicles/${matrixVehicleId}/devices?limit=2`,
+      grantReaderJwt,
+    );
+    assert.equal(deepPage1.status, 200);
+    assert.deepEqual(deepPage1.body.devices, []);
+    const deepCursor = (deepPage1.body.page as { nextCursor: string | null }).nextCursor;
+    assert.ok(deepCursor, 'empty page across 5 unauthorized batches must still expose nextCursor');
+    const decodedDeepCursor = Buffer.from(deepCursor, 'base64url').toString('latin1');
+    for (const hiddenDoc of hiddenDocs) {
+      const hiddenHex = String(hiddenDoc._id);
+      assert.equal(deepCursor.includes(hiddenHex), false);
+      assert.equal(decodedDeepCursor.includes(hiddenHex), false);
+    }
+
+    const deepPage2 = await gw(
+      'GET',
+      `/api/vehicles/${matrixVehicleId}/devices?limit=2&cursor=${encodeURIComponent(deepCursor)}`,
+      grantReaderJwt,
+    );
+    assert.equal(deepPage2.status, 200);
+    assert.deepEqual(
+      (deepPage2.body.devices as Array<Record<string, unknown>>).map((d) => d.deviceId),
+      [deepAuthA, deepAuthB],
+    );
+    assert.equal((deepPage2.body.page as { nextCursor: string | null }).nextCursor, null);
+
+    // Archived vehicle blocks device reads and administrative operations via API (404)
+    assert.equal((await gw('DELETE', `/api/vehicles/${tkt015VehicleId}`, ownerJwt)).status, 200);
+    assert.equal((await gw('GET', `/api/devices/${activeGrantA}`, ownerJwt)).status, 404);
+    assert.equal(
+      (await gw('GET', `/api/vehicles/${tkt015VehicleId}/devices`, ownerJwt)).status,
+      404,
+    );
+    assert.equal(
+      (
+        await gw(
+          'POST',
+          `/api/vehicles/${tkt015VehicleId}/devices/${activeGrantA}/revoke`,
+          ownerJwt,
+          { reason: 'ADMINISTRATIVE' },
+        )
+      ).status,
+      404,
+    );
 
     // Also verify MongoNonceStore.assertReady() passes against the real vehicle_db
     const nonceStore = new MongoNonceStore(() => mongoose.connection.db as never);
@@ -6066,4 +7215,217 @@ test('35. TKT-013 single and batch read authorization agree for every actor kind
     permissions: ['device:read'],
   });
   assert.equal(await compare('after permission change'), 1);
+});
+
+test('36. TKT-015 controlled cross-service TOCTOU race and concurrent PATCH vs revoke', async () => {
+  await resetVehicleCollections();
+  const ownerId = new Types.ObjectId();
+  const memberId = new Types.ObjectId();
+  const vehicle = await createVehicle(ownerId, { name: 'TKT-015 Race Mazda 3' });
+  const invitation = await inviteMember(vehicle._id, ownerId, memberId, [
+    'vehicle:read',
+    'vehicle:manage',
+  ]);
+  assert.ok(invitation);
+  const membership = await acceptInvitation(invitation._id, memberId);
+  assert.ok(membership);
+
+  const remoteDeviceObjectId = new Types.ObjectId();
+  const remoteDeviceId = String(remoteDeviceObjectId);
+  const remoteCredentialId = String(new Types.ObjectId());
+  const baseRecord: InternalDeviceRecord = {
+    deviceId: remoteDeviceId,
+    vehicleId: String(vehicle._id),
+    identifier: 'esp32-race-01',
+    status: 'ACTIVE',
+    operational: true,
+    credential: {
+      credentialId: remoteCredentialId,
+      keyId: 'dk_0123456789abcdefghijkl',
+      algorithm: 'Ed25519',
+      fingerprint: `sha256:${'a'.repeat(64)}`,
+      status: 'ACTIVE',
+      usable: true,
+      activatedAt: '2026-04-20T00:00:00.000Z',
+      expiresAt: null,
+      revokedAt: null,
+    },
+    connectivity: { lastSeenAt: null },
+    metadata: {
+      name: 'Initial Name',
+      manufacturer: null,
+      hardwareModel: null,
+      hardwareRevision: null,
+      firmwareVersion: null,
+      serialNumber: null,
+    },
+    requestedByUserId: String(memberId),
+    requestedByMembershipId: String(membership._id),
+    linkedAt: '2026-04-20T00:00:00.000Z',
+    revokedAt: null,
+    revokedByUserId: null,
+    revocationReason: null,
+    createdAt: '2026-04-20T00:00:00.000Z',
+    updatedAt: '2026-04-20T00:00:00.000Z',
+  };
+
+  let storedState: InternalDeviceRecord = structuredClone(baseRecord);
+  const toSnapshot = (record: InternalDeviceRecord): VerifiedDeviceSnapshot => ({
+    record: structuredClone(record),
+    publicDetail: toPublicDeviceDetail(record),
+    activeBinding:
+      record.status === 'ACTIVE' && record.operational
+        ? createVerifiedExternalResourceBinding({
+            scopeType: 'DEVICE',
+            resourceId: remoteDeviceObjectId,
+            vehicleId: vehicle._id,
+            isActive: true,
+          })
+        : null,
+  });
+
+  let releaseRemoteMutation!: () => void;
+  let notifyAuthorizedAndEnteredRemote!: () => void;
+  const authorizedAndEnteredRemote = new Promise<void>((resolve) => {
+    notifyAuthorizedAndEnteredRemote = resolve;
+  });
+  const remoteBarrier = new Promise<void>((resolve) => {
+    releaseRemoteMutation = resolve;
+  });
+  let holdNextPatch = true;
+
+  const stubClient: DeviceServiceClient = {
+    async registerDevice() {
+      throw new Error('unexpected call');
+    },
+    async getDeviceById(deviceId) {
+      if (deviceId !== storedState.deviceId) return null;
+      return toSnapshot(storedState);
+    },
+    async listVehicleDevicesBatch() {
+      return { items: [toSnapshot(storedState)], hasMore: false };
+    },
+    async updateDeviceMetadata(input) {
+      if (holdNextPatch) {
+        holdNextPatch = false;
+        notifyAuthorizedAndEnteredRemote();
+        await remoteBarrier;
+      }
+      if (storedState.status === 'REVOKED') {
+        throw new DeviceUpstreamDomainError(409, 'DEVICE_REVOKED');
+      }
+      storedState = {
+        ...storedState,
+        metadata: {
+          ...storedState.metadata,
+          ...(input.metadata.name !== undefined ? { name: input.metadata.name } : {}),
+        },
+      };
+      return toSnapshot(storedState);
+    },
+    async createChallenge() {
+      throw new Error('unexpected call');
+    },
+    async completeLink() {
+      throw new Error('unexpected call');
+    },
+    async revokeDevice(input) {
+      if (storedState.status !== 'REVOKED') {
+        storedState = {
+          ...storedState,
+          status: 'REVOKED',
+          operational: false,
+          credential: {
+            ...storedState.credential,
+            status: 'REVOKED',
+            usable: false,
+            revokedAt: '2026-04-20T00:05:00.000Z',
+          },
+          revokedAt: '2026-04-20T00:05:00.000Z',
+          revokedByUserId: input.userId,
+          revocationReason: input.reason,
+        };
+      }
+      return toSnapshot(storedState);
+    },
+  };
+
+  const ctx = {
+    deviceClient: stubClient,
+    confirmActorVerified: async () => undefined,
+  };
+
+  // 1. Controlled TOCTOU race: member passes Vehicle authorization and enters remote HTTP call;
+  //    no MongoDB transaction is held open in Vehicle, so owner revokes membership cleanly in parallel.
+  const inFlightPatch = updateVehicleDeviceMetadata(
+    vehicle._id,
+    remoteDeviceObjectId,
+    memberId,
+    { name: 'Completed After Permission Loss' },
+    ctx,
+  );
+
+  await authorizedAndEnteredRemote;
+
+  // Membership revocation commits immediately in MongoDB without lock/WriteConflict contention
+  const revokeResult = await revokeMembership({
+    vehicleId: vehicle._id,
+    membershipId: membership._id,
+    actorUserId: ownerId,
+    reason: 'Revoked during in-flight remote call',
+  });
+  assert.equal(revokeResult.membership.status, 'REVOKED');
+
+  // Release remote mutation: demonstrates documented residual cross-service window
+  releaseRemoteMutation();
+  const completedInFlight = await inFlightPatch;
+  assert.equal(completedInFlight.metadata.name, 'Completed After Permission Loss');
+
+  // Immediately afterwards, the revoked member has ZERO subsequent access (uniform 404 NOT_FOUND)
+  const expectNotFound = (err: unknown) =>
+    err instanceof VehicleServiceError && err.code === 'NOT_FOUND';
+  await assert.rejects(
+    () => getVehicleScopedDeviceDetail(vehicle._id, remoteDeviceObjectId, memberId, ctx),
+    expectNotFound,
+  );
+  await assert.rejects(
+    () => getDirectDeviceDetail(remoteDeviceObjectId, memberId, ctx),
+    expectNotFound,
+  );
+  await assert.rejects(() => listVehicleDevices(vehicle._id, memberId, {}, ctx), expectNotFound);
+  await assert.rejects(
+    () =>
+      updateVehicleDeviceMetadata(
+        vehicle._id,
+        remoteDeviceObjectId,
+        memberId,
+        { name: 'Blocked' },
+        ctx,
+      ),
+    expectNotFound,
+  );
+
+  // 2. Concurrent PATCH vs OWNER revoke: once revoked, terminal REVOKED state is preserved
+  const [revokeSettled, latePatchSettled] = await Promise.allSettled([
+    revokeVehicleDevice(vehicle._id, remoteDeviceObjectId, ownerId, 'SECURITY_COMPROMISE', ctx),
+    (async () => {
+      await Promise.resolve();
+      return updateVehicleDeviceMetadata(
+        vehicle._id,
+        remoteDeviceObjectId,
+        ownerId,
+        { name: 'After Revoke' },
+        ctx,
+      );
+    })(),
+  ]);
+  assert.equal(revokeSettled.status, 'fulfilled');
+  if (latePatchSettled.status === 'rejected') {
+    assert.equal(
+      latePatchSettled.reason instanceof VehicleServiceError &&
+        latePatchSettled.reason.code === 'CONFLICT',
+      true,
+    );
+  }
+  assert.equal(storedState.status, 'REVOKED');
 });

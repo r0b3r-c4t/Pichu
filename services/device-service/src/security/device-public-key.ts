@@ -1,4 +1,5 @@
 import { createHash, createPublicKey, verify, type KeyObject } from 'node:crypto';
+import { DEVICE_LINK_PROTOCOL_VERSION } from '@pichu/contracts';
 
 /**
  * DER prefix of an Ed25519 SubjectPublicKeyInfo (RFC 8410): SEQUENCE { SEQUENCE { OID 1.3.101.112 },
@@ -11,7 +12,11 @@ const ED25519_SIGNATURE_LENGTH = 64;
 /** An Ed25519 SPKI is always 44 DER bytes, i.e. exactly one 60-character base64 line. */
 const SPKI_PEM_PATTERN =
   /^-----BEGIN PUBLIC KEY-----\n([A-Za-z0-9+/]{59}=)\n-----END PUBLIC KEY-----\n?$/;
-const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
+/** Canonical 64-byte unpadded base64url signature (86 chars, zero tail padding bits). */
+const CANONICAL_SIGNATURE_PATTERN = /^[A-Za-z0-9_-]{85}[AQgw]$/;
+/** Canonical 32-byte unpadded base64url challenge nonce (43 chars, zero tail padding bits). */
+export const CANONICAL_CHALLENGE_NONCE_PATTERN = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
+const OBJECT_ID_HEX_PATTERN = /^[a-f0-9]{24}$/;
 
 export const DEVICE_KEY_FINGERPRINT_PATTERN = /^sha256:[0-9a-f]{64}$/;
 
@@ -29,8 +34,54 @@ export interface CanonicalDevicePublicKey {
   readonly fingerprint: string;
 }
 
+export interface DeviceLinkProofMessageFields {
+  readonly deviceId: string;
+  readonly vehicleId: string;
+  readonly credentialId: string;
+  readonly requestedByUserId: string;
+  readonly challengeId: string;
+  readonly challenge: string;
+}
+
 export function fingerprintSpkiDer(der: Buffer): string {
   return `sha256:${createHash('sha256').update(der).digest('hex')}`;
+}
+
+/**
+ * Reconstructs the canonical UTF-8 domain-separated proof-of-possession message:
+ *
+ *   pichu-device-link-v1
+ *   <deviceId>
+ *   <vehicleId>
+ *   <credentialId>
+ *   <requestedByUserId>
+ *   <challengeId>
+ *   <challenge>
+ *
+ * Lines are joined with LF (`\n`, 0x0A) with no trailing newline. Every field is checked for its
+ * canonical wire format so newline injection or ambiguous encodings are impossible.
+ */
+export function buildDeviceLinkProofMessage(fields: DeviceLinkProofMessageFields): Buffer {
+  if (
+    !OBJECT_ID_HEX_PATTERN.test(fields.deviceId) ||
+    !OBJECT_ID_HEX_PATTERN.test(fields.vehicleId) ||
+    !OBJECT_ID_HEX_PATTERN.test(fields.credentialId) ||
+    !OBJECT_ID_HEX_PATTERN.test(fields.requestedByUserId) ||
+    !OBJECT_ID_HEX_PATTERN.test(fields.challengeId) ||
+    !CANONICAL_CHALLENGE_NONCE_PATTERN.test(fields.challenge)
+  ) {
+    throw new Error('Invalid canonical device link proof fields');
+  }
+  const canonical = [
+    DEVICE_LINK_PROTOCOL_VERSION,
+    fields.deviceId,
+    fields.vehicleId,
+    fields.credentialId,
+    fields.requestedByUserId,
+    fields.challengeId,
+    fields.challenge,
+  ].join('\n');
+  return Buffer.from(canonical, 'utf8');
 }
 
 /**
@@ -78,7 +129,7 @@ export function verifyDeviceSignature(
   message: Buffer,
   signatureBase64Url: string,
 ): boolean {
-  if (!BASE64URL_PATTERN.test(signatureBase64Url)) return false;
+  if (!CANONICAL_SIGNATURE_PATTERN.test(signatureBase64Url)) return false;
   const signature = Buffer.from(signatureBase64Url, 'base64url');
   if (
     signature.length !== ED25519_SIGNATURE_LENGTH ||

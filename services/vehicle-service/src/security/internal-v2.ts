@@ -121,7 +121,8 @@ function parseRetryAfterMs(headers: Record<string, string>): number {
 
 /**
  * Executes a signed v2 outbound call preserving TKT-009 deadlines, cancellation signals,
- * and retry rules (GET: up to 2 attempts on network/502/503/504 if budget permits; POST: 1 attempt).
+ * and retry rules (GET: up to 2 attempts on network/502/503/504 if budget permits;
+ * POST/PATCH mutations: 1 attempt, never retried).
  */
 export async function executeSignedInternalRequest(
   request: FastifyRequest,
@@ -129,7 +130,7 @@ export async function executeSignedInternalRequest(
   input: {
     audience: 'identity-service' | 'device-service';
     baseUrl: string;
-    method: 'GET' | 'POST';
+    method: 'GET' | 'POST' | 'PATCH';
     path: string;
     body?: Buffer;
   },

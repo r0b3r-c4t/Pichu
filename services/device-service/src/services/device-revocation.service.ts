@@ -1,7 +1,9 @@
 import { Types, type ClientSession } from 'mongoose';
+import type { InternalDeviceRecord } from '@pichu/contracts';
 import type { InternalPrincipal } from '@pichu/internal-auth-adapters/types';
 import { runInDeviceTransaction } from '../database/transaction.js';
 import { DeviceCredentialModel } from '../models/device-credential.model.js';
+import { DeviceLinkChallengeModel } from '../models/device-link-challenge.model.js';
 import {
   DEVICE_REVOCATION_REASONS,
   DEVICE_REVOCATION_REQUEST_ID_PATTERN,
@@ -13,6 +15,7 @@ import {
 } from '../models/device-revocation.model.js';
 import { DeviceModel } from '../models/device.model.js';
 import { DeviceServiceError, duplicateKeyIndexName, isDuplicateKeyError } from './device-errors.js';
+import { loadInternalDeviceInSession } from './device-query.service.js';
 
 const OBJECT_ID_PATTERN = /^[a-f0-9]{24}$/;
 
@@ -68,6 +71,7 @@ export interface DeviceRevocationOutcome {
   revocation: DeviceRevocation & { _id: Types.ObjectId };
   /** false when an earlier revocation already covered the target; its audit is preserved. */
   created: boolean;
+  record?: InternalDeviceRecord;
 }
 
 interface RevocationCommon {
@@ -114,23 +118,45 @@ async function findRevocation(filter: Record<string, unknown>, session?: ClientS
 
 /**
  * Revokes the device and every ACTIVE credential atomically. REVOKED is terminal; repeating the
- * call returns the original record unchanged. There is no reactivation path.
+ * call returns the original record unchanged. `REGISTRATION_CANCELLED` cannot be applied for the
+ * first time to an already ACTIVE device.
  */
 export async function revokeDevice(
-  input: RevocationCommon & { deviceId: string },
+  input: RevocationCommon & { deviceId: string; expectedVehicleId?: string },
   options: { now?: Date } = {},
 ): Promise<DeviceRevocationOutcome> {
   validateCommon(input);
   const deviceId = parseObjectId(input.deviceId, 'DEVICE_NOT_FOUND');
+  const expectedVehicleId =
+    input.expectedVehicleId === undefined
+      ? null
+      : parseObjectId(input.expectedVehicleId, 'DEVICE_NOT_FOUND');
   const now = options.now ?? new Date();
   try {
     return await runInDeviceTransaction(async (session) => {
       const existing = await findRevocation({ targetType: 'DEVICE', deviceId }, session);
-      if (existing) return { revocation: existing, created: false };
+      if (existing) {
+        const record = await loadInternalDeviceInSession(deviceId, session, now);
+        if (!record || (expectedVehicleId && record.vehicleId !== String(expectedVehicleId))) {
+          throw new DeviceServiceError('DEVICE_NOT_FOUND', 'Device not found');
+        }
+        if (existing.vehicleId && record.vehicleId !== String(existing.vehicleId)) {
+          throw inconsistent();
+        }
+        return { revocation: existing, created: false, record };
+      }
 
       const device = await DeviceModel.findById(deviceId).session(session);
-      if (!device) throw new DeviceServiceError('DEVICE_NOT_FOUND', 'Device not found');
+      if (!device || (expectedVehicleId && !device.vehicleId?.equals(expectedVehicleId))) {
+        throw new DeviceServiceError('DEVICE_NOT_FOUND', 'Device not found');
+      }
       if (device.status === 'REVOKED') throw inconsistent();
+      if (input.reason === 'REGISTRATION_CANCELLED' && device.status !== 'PENDING') {
+        throw new DeviceServiceError(
+          'INVALID_REVOCATION_STATE',
+          'REGISTRATION_CANCELLED is only valid for PENDING devices',
+        );
+      }
       const active = await DeviceCredentialModel.findOne({ deviceId, status: 'ACTIVE' }).session(
         session,
       );
@@ -154,7 +180,12 @@ export async function revokeDevice(
         { session },
       );
       const updated = await DeviceModel.updateOne(
-        { _id: deviceId, status: { $in: ['PENDING', 'ACTIVE'] }, revocationId: null },
+        {
+          _id: deviceId,
+          ...(expectedVehicleId ? { vehicleId: expectedVehicleId } : {}),
+          status: { $in: ['PENDING', 'ACTIVE'] },
+          revocationId: null,
+        },
         { $set: { status: 'REVOKED', revokedAt: now, revocationId } },
         { session },
       );
@@ -164,15 +195,32 @@ export async function revokeDevice(
         { $set: { status: 'REVOKED', revokedAt: now, revocationId } },
         { session },
       );
-      return { revocation: record!.toObject(), created: true };
+      await DeviceLinkChallengeModel.updateMany(
+        { deviceId, usedAt: null },
+        { $set: { usedAt: now } },
+        { session },
+      );
+      const internalRecord = await loadInternalDeviceInSession(deviceId, session, now);
+      if (!internalRecord) throw inconsistent();
+      return { revocation: record!.toObject(), created: true, record: internalRecord };
     });
   } catch (error) {
     if (
       isDuplicateKeyError(error) &&
       duplicateKeyIndexName(error) === 'device_revocation_device_target_unique'
     ) {
-      const existing = await findRevocation({ targetType: 'DEVICE', deviceId });
-      if (existing) return { revocation: existing, created: false };
+      return runInDeviceTransaction(async (session) => {
+        const existing = await findRevocation({ targetType: 'DEVICE', deviceId }, session);
+        if (!existing) throw error;
+        const record = await loadInternalDeviceInSession(deviceId, session, now);
+        if (!record || (expectedVehicleId && record.vehicleId !== String(expectedVehicleId))) {
+          throw new DeviceServiceError('DEVICE_NOT_FOUND', 'Device not found');
+        }
+        if (existing.vehicleId && record.vehicleId !== String(existing.vehicleId)) {
+          throw inconsistent();
+        }
+        return { revocation: existing, created: false, record };
+      });
     }
     throw error;
   }
